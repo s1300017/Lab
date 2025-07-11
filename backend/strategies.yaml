@@ -1,0 +1,7 @@
+strategies:
+  - name: fixed-1000
+    display_name: "Fixed-1000"
+  - name: recursive-1000
+    display_name: "Recursive-1000"
+  - name: semantic-1000
+    display_name: "Semantic-1000"

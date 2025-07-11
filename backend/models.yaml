@@ -1,0 +1,7 @@
+models:
+  - name: mistral
+    type: ollama
+    display_name: "Mistral (Ollama)"
+  - name: gpt-4o-mini
+    type: openai
+    display_name: "GPT-4o-mini (OpenAI)"

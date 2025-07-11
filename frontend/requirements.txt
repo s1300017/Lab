@@ -1,0 +1,5 @@
+streamlit
+requests
+plotly
+fpdf
+kaleido>=0.2.1

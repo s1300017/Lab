@@ -1,0 +1,93 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: rag_db
+    ports:
+      - "55332:5432"
+    volumes:
+      - ./docker_lab_pgdata:/var/lib/postgresql/data
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf # JST用設定ファイルをマウント
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TZ: Asia/Tokyo # JST化
+    restart: always
+    healthcheck:
+      test:
+        ["CMD-SHELL", "psql -U ${POSTGRES_USER} -d ${POSTGRES_DB} -l || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    # 自作ビルドした最新版Ollamaイメージを使用
+    image: ollama-custom:latest
+    build: ./ollama-custom
+    container_name: rag_ollama
+    ports:
+      - "11435:11434"
+    volumes:
+      - ./ollama_data:/root/.ollama
+    # Ollamaサーバーのみ常時起動
+    command: serve
+    pull_policy: always
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/version"]
+      interval: 60s  # ← ログ頻度を下げるため60秒に変更
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # ↑Ollama APIのバージョンエンドポイントでヘルスチェック（interval=60sでログ激減）
+    environment:
+      - OLLAMA_NUM_THREADS=2
+      - OLLAMA_HOST=0.0.0.0
+      - TZ=Asia/Tokyo # JST化
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+
+  backend:
+    build: ./backend
+    container_name: rag_backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./backend/models.yaml:/app/models.yaml
+      - ./backend/strategies.yaml:/app/strategies.yaml
+      - ./models:/app/models # ホストのmodelsディレクトリをコンテナにマウント
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - TRANSFORMERS_CACHE=/app/models
+      - HF_HOME=/app/models
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - TZ=Asia/Tokyo # JST化
+    restart: always
+
+  frontend:
+    build: ./frontend
+    container_name: rag_frontend
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./frontend:/app
+    depends_on:
+      - backend
+    environment:
+      - TZ=Asia/Tokyo # JST化
+    restart: always
+
+volumes:
+  data:
+  ollama_data:
