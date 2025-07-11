@@ -9,6 +9,7 @@ langchain
 langchain-openai
 langchain-community
 langchain-ollama
+langchain-huggingface
 pgvector
 PyPDF2
 ragas

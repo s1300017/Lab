@@ -453,8 +453,10 @@ else:
                 if invalid_combinations:
                     st.warning(f"chunk_size <= overlap となる不正な組み合わせは自動的に除外しました: {invalid_combinations}")
                 
-                # 進捗バーの設定
+                # 進捗バー、テキスト表示、ステータス表示の設定
                 progress_bar = st.progress(0)
+                progress_text = st.empty()
+                status_display = st.empty()
                 total_tasks = len(selected_embeddings) * len(valid_combinations)
                 
                 # 完了タスク数を追跡するためのリスト（ミュータブルなオブジェクト）

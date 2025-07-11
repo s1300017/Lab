@@ -262,8 +262,9 @@ def semantic_chunk_text(text, chunk_size=1000, chunk_overlap=200, embedding_mode
     return chunks
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_ollama import OllamaLLM
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.embeddings import OllamaEmbeddings, HuggingFaceEmbeddings
-from langchain_community.llms import Ollama
 from langchain_community.vectorstores.pgvector import PGVector
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -318,7 +319,7 @@ def get_llm(model_name: str):
         return ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=openai_api_key)
     elif model_name in ["ollama_llama2", "mistral"]:
         # mistral も ollama_llama2 もOllamaで返す
-        return Ollama(model="mistral", base_url="http://ollama:11434")
+        return OllamaLLM(model="mistral", base_url="http://ollama:11434")
     else:
         # 日本語で詳細も返す
         raise ValueError(f"未対応のLLMモデルが指定されました: {model_name}")
@@ -352,7 +353,7 @@ def get_embeddings(model_name: str):
                 "Please make sure the model is correctly downloaded and mounted."
             )
         return HuggingFaceEmbeddings(
-            model_name=str(LOCAL_MODEL_PATH),
+            model_name="BAAI/bge-small-en-v1.5",
             model_kwargs={
                 'device': device,  # 自動判定したデバイスを指定
                 'trust_remote_code': True
