@@ -1,13 +1,45 @@
 from datetime import datetime
 from pytz import timezone
+import os
 
 def jst_now_str():
     return datetime.now(timezone('Asia/Tokyo')).strftime('%Y-%m-%d %H:%M:%S JST')
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+
 print(f"[{jst_now_str()}] === FastAPI main.py 起動開始 ===")
 
-app = FastAPI() # ← ここだけ残す（ファイル先頭付近）
+# データベース接続設定
+DB_URL = os.environ.get("DATABASE_URL", "postgresql://rag_user:rag_password@db:5432/rag_db")
+engine = create_engine(DB_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def init_db():
+    try:
+        with engine.connect() as conn:
+            # 必要なテーブルを作成
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    id SERIAL PRIMARY KEY,
+                    text TEXT NOT NULL,
+                    embedding_model TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """))
+            conn.commit()
+            print(f"[{jst_now_str()}] データベース初期化成功: embeddingsテーブルを作成しました")
+    except Exception as e:
+        print(f"[{jst_now_str()}] データベース初期化失敗: {str(e)}")
+        raise
+
+app = FastAPI()
+
+# サーバー起動時にデータベースを初期化
+@app.on_event("startup")
+async def startup_event():
+    init_db()
 
 # サーバ起動時にルート一覧を出力
 import threading
@@ -848,7 +880,6 @@ async def bulk_evaluate(request: Request):
 # --- PDFアップロード＆QA自動生成API ---
 from fastapi import UploadFile, File
 
-
 @app.post("/uploadfile/")
 async def uploadfile(file: UploadFile = File(...)):
     """
@@ -860,32 +891,38 @@ async def uploadfile(file: UploadFile = File(...)):
     print(f"[重要] ファイル情報: {file=}, タイプ={type(file)}")
     import io
     try:
-        # 1. PDFからテキスト抽出
-        contents = await file.read()
-        print(f"[重要] ファイル読み込み完了: {len(contents)}バイト")
-        
-        # BytesIOでラップして再利用可能なストリームを作成
-        pdf_stream = io.BytesIO(contents)
-        print(f"[重要] BytesIOストリーム作成完了: {pdf_stream.getbuffer().nbytes}バイト")
-        
-        # PyPDF2でPDF読み込み
         try:
-            reader = PdfReader(pdf_stream)
-            print(f"[重要] PdfReader初期化成功: {len(reader.pages)}ページ")
-            
-            text = ""
-            for page in reader.pages:
-                page_text = page.extract_text() or ""
-                text += page_text
-                print(f"[重要] ページ抽出: {len(page_text)}文字")
-            
-            # テキストの一部をサンプリング
-            sample_text = text[:3000] if len(text) > 3000 else text
-            print(f"[重要] PDF抽出完了: 合計{len(text)}文字, サンプル={sample_text[:100]}...")
-        except Exception as pdf_error:
-            print(f"[重要] PDF処理エラー: {pdf_error}")
-            # エラーでもdict形式で返す
-            return {"error": f"PDF処理エラー: {str(pdf_error)}"}
+            try:
+                # 1. PDFからテキスト抽出
+                contents = await file.read()
+                print(f"[重要] ファイル読み込み完了: {len(contents)}バイト")
+                
+                # BytesIOでラップして再利用可能なストリームを作成
+                pdf_stream = io.BytesIO(contents)
+                print(f"[重要] BytesIOストリーム作成完了: {pdf_stream.getbuffer().nbytes}バイト")
+                
+                # PyPDF2でPDF読み込み
+                try:
+                    reader = PdfReader(pdf_stream)
+                    print(f"[重要] PdfReader初期化成功: {len(reader.pages)}ページ")
+                    
+                    text = ""
+                    for page in reader.pages:
+                        page_text = page.extract_text() or ""
+                        text += page_text
+                        print(f"[重要] ページ抽出: {len(page_text)}文字")
+                    sample_text = text[:3000] if len(text) > 3000 else text
+                    print(f"[重要] PDF抽出完了: 合計{len(text)}文字, サンプル={sample_text[:100]}...")
+                except Exception as pdf_error:
+                    print(f"[重要] PDF処理エラー: {pdf_error}")
+                    # エラーでもdict形式で返す
+                    return {"error": f"PDF処理エラー: {str(pdf_error)}"}
+            except Exception as e:
+                print(f"[重要] PDF処理エラー: {e}")
+                return {"error": f"PDF処理エラー: {str(e)}"}
+        except Exception as e:
+            print(f"[重要] PDF処理エラー: {e}")
+            return {"error": f"PDF処理エラー: {str(e)}"}
 
         # 2. LLMで質問セット自動生成
         print("[重要] LLM質問生成開始")

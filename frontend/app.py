@@ -520,7 +520,6 @@ else:
                 
                 # デバッグ用: 並列処理を一時的に無効化
                 bulk_results = []
-                status_display = st.empty()  # ステータス表示用の空の要素
                 
                 try:
                     for emb in selected_embeddings:
@@ -540,6 +539,9 @@ else:
                             # 少し待機（UIの更新のため）
                             import time
                             time.sleep(0.1)
+                    
+                    # 最終的な進捗表示
+                    progress_text.success(f"完了: {total_tasks} / {total_tasks} 件")
                     
                     # 進捗バーを100%に
                     progress_bar.progress(1.0)
