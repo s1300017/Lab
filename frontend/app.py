@@ -496,6 +496,7 @@ else:
                         
                         completed_tasks[0] += 1
                         progress_bar.progress(min(completed_tasks[0] / total_tasks, 1.0))
+                        progress_text.text(f"完了: {completed_tasks[0]} / {total_tasks} 件")
                         
                         if response.status_code == 200:
                             return response.json()
