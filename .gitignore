@@ -1,3 +1,6 @@
 .env
 models/
 chunk-cache/
+
+# PostgreSQL data
+docker_lab_pgdata/
