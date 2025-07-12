@@ -1022,175 +1022,182 @@ with tab4:
                 else:
                     results_df['label'] = results_df['chunk_strategy']
                 
-                # バブルチャートの作成（色をパフォーマンススコアに基づいて設定）
-                # バブルのサイズを調整するためのスケーリングファクター
-                size_scale = 20  # バブルのサイズを調整するためのスケーリングファクター
-                
-                fig_bubble = px.scatter(
-                    results_df,
-                    x="num_chunks",  # カラム名をnum_chunksに修正
-                    y="avg_chunk_len",
-                    size=[min(s * size_scale, 50) for s in results_df["overall_score"]],  # バブルの最大サイズを制限
-                    color="overall_score",  # 色をパフォーマンススコアに基づいて設定
-                    hover_name="label",
-                    text="label",
-                    title="Chunk Distribution vs Performance (Bulk Evaluation)",
-                    labels={
-                        "num_chunks": "Number of Chunks",
-                        "avg_chunk_len": "Average Chunk Size (characters)",
-                        "overall_score": "Performance Score"
-                    },
-                    color_continuous_scale=px.colors.sequential.Viridis,
-                    color_continuous_midpoint=0.5,  # 色の中心値を0.5に設定
-                )
-                
-                # バブルチャートのスタイルを更新
-                fig_bubble.update_traces(
-                    textposition='middle center',  # テキストをバブルの中央に配置
-                    textfont=dict(
-                        size=12,  # フォントサイズを大きく
-                        color='white',  # テキストの色を白に
-                        family='Arial',  # フォントファミリーを指定
-                    ),
-                    marker=dict(
-                        line=dict(width=1, color='DarkSlateGrey'),
-                        opacity=0.8  # バブルの透明度を調整
-                    ),
-                    textfont_size=12,  # テキストのフォントサイズ
-                    textfont_color='white',  # テキストの色
-                    textfont_family='Arial',  # テキストのフォント
-                    texttemplate='%{text}<br>Score: %{marker.color:.2f}',  # テキストのフォーマット
-                    hovertemplate=
-                    '<b>%{hovertext}</b><br>' +
-                    'Chunks: %{x}<br>' +
-                    'Avg Size: %{y}<br>' +
-                    'Score: %{marker.color:.2f}<extra></extra>',  # ホバーテキストのフォーマット
-                )
-                
-                fig_bubble.update_layout(
-                    title={
-                        'text': "Chunk Distribution vs Performance (Bulk Evaluation)<br><sup>Bubble size = performance</sup>",
-                        'x': 0.5,
-                        'xanchor': 'center'
-                    },
-                    coloraxis_colorbar=dict(title="Performance Score"),
-                    font=dict(size=16),
-                    height=600,
-                    margin=dict(l=40, r=40, t=80, b=40)
-                )
-                
-                # バブルチャートを表示
-                st.plotly_chart(fig_bubble, use_container_width=True)
-                st.markdown('<br>', unsafe_allow_html=True)
-                
-                # レーダーチャートの表示
-                fig_radar = go.Figure()
-                
                 # メトリクスとその日本語ラベルを定義
                 metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
                 metrics_jp = ["信頼性", "回答の関連性", "コンテキストの再現性", "コンテキストの正確性", "回答の正確性"]
                 
-                # モデルが1つの場合でもレーダーチャートを表示
-                models = results_df['embedding_model'].unique() if 'embedding_model' in results_df.columns else ["default"]
+                # モデルごとにデータをグループ化
+                if 'embedding_model' in results_df.columns:
+                    model_groups = list(results_df.groupby('embedding_model'))
+                else:
+                    model_groups = [('default', results_df)]
+
+                # モデルごとにバブルチャートを表示
+                for model_name, model_data in model_groups:
+                    if not model_data.empty and 'chunk_size' in model_data.columns and 'overall_score' in model_data.columns:
+                        # バブルチャートの作成
+                        fig_bubble = px.scatter(
+                            model_data,
+                            x="num_chunks",
+                            y="avg_chunk_len",
+                            size=[min(s * 20, 50) for s in model_data["overall_score"]],
+                            color="overall_score",
+                            hover_name=model_data['chunk_strategy'] + '-' + model_data['chunk_size'].astype(str),
+                            text=model_data['chunk_strategy'],
+                            title=f"{model_name} - チャンク分布とパフォーマンス",
+                            labels={
+                                "num_chunks": "チャンク数",
+                                "avg_chunk_len": "平均チャンクサイズ (文字数)",
+                                "overall_score": "総合スコア"
+                            },
+                            color_continuous_scale=px.colors.sequential.Viridis,
+                            color_continuous_midpoint=0.5,
+                        )
+                        
+                        # バブルチャートのスタイルを更新
+                        fig_bubble.update_traces(
+                            textposition='middle center',
+                            textfont=dict(size=12, color='white', family='Arial'),
+                            marker=dict(line=dict(width=1, color='DarkSlateGrey'), opacity=0.8),
+                            hovertemplate=
+                            '<b>%{hovertext}</b><br>' +
+                            'チャンク数: %{x}<br>' +
+                            '平均サイズ: %{y}文字<br>' +
+                            'スコア: %{marker.color:.2f}<extra></extra>',
+                        )
+                        
+                        fig_bubble.update_layout(
+                            title={
+                                'text': f"{model_name} - チャンク分布とパフォーマンス",
+                                'x': 0.5,
+                                'xanchor': 'center'
+                            },
+                            coloraxis_colorbar=dict(title="スコア"),
+                            font=dict(size=14),
+                            height=500,
+                            margin=dict(l=40, r=40, t=80, b=40)
+                        )
+                        
+                        st.plotly_chart(fig_bubble, use_container_width=True)
+                        st.markdown('<br>', unsafe_allow_html=True)
                 
-                for model in models:
-                    model_data = results_df[results_df['embedding_model'] == model] if 'embedding_model' in results_df.columns else results_df
+                # モデルごとにバーチャートを表示
+                for model_name, model_data in model_groups:
+                    if not model_data.empty and 'chunk_strategy' in model_data.columns and 'overall_score' in model_data.columns:
+                        # チャンク戦略ごとのパフォーマンスを集計
+                        strategy_scores = model_data.groupby('chunk_strategy')['overall_score'].mean().sort_values(ascending=False)
+                        
+                        # バーチャートの作成
+                        fig_bar = px.bar(
+                            x=strategy_scores.values,
+                            y=strategy_scores.index,
+                            orientation='h',
+                            title=f"{model_name} - チャンク戦略別パフォーマンス",
+                            labels={'x': '平均スコア', 'y': 'チャンク戦略'},
+                            color=strategy_scores.values,
+                            color_continuous_scale=px.colors.sequential.Viridis,
+                        )
+                        
+                        # バーの上にスコアを表示
+                        fig_bar.update_traces(
+                            texttemplate='%{x:.3f}',
+                            textposition='outside',
+                            hovertemplate='<b>%{y}</b><br>スコア: %{x:.3f}<extra></extra>',
+                        )
+                        
+                        # レイアウトの調整
+                        fig_bar.update_layout(
+                            title={
+                                'text': f"{model_name} - チャンク戦略別パフォーマンス",
+                                'x': 0.5,
+                                'xanchor': 'center',
+                                'font': {'size': 18}
+                            },
+                            xaxis=dict(range=[0, 1.1]),
+                            coloraxis_showscale=False,
+                            height=400,
+                            margin=dict(l=100, r=40, t=100, b=40),
+                            yaxis=dict(autorange="reversed"),
+                            font=dict(size=14)
+                        )
+                        
+                        # バーチャートを表示
+                        st.plotly_chart(fig_bar, use_container_width=True)
+                        st.markdown('<br>', unsafe_allow_html=True)
+                
+                # チャンク戦略ごとにレーダーチャートを表示
+                if 'chunk_strategy' in results_df.columns:
+                    chunk_strategies = results_df['chunk_strategy'].unique()
                     
-                    # 各メトリクスの平均値を計算（データがない場合は0.5で補完）
-                    r_values = [model_data[m].mean() if m in model_data.columns else 0.5 for m in metrics]
-                    
-                    fig_radar.add_trace(go.Scatterpolar(
-                        r=r_values,
-                        theta=metrics_jp,  # 日本語ラベルを使用
-                        fill='toself',
-                        name=f"{model}-{model_data['chunk_size'].iloc[0] if 'chunk_size' in model_data.columns else ''}" if len(models) > 1 else "評価結果",
-                        hovertemplate='%{theta}: %{r:.2f}<extra></extra>',
-                        line=dict(width=2)
-                    ))
-                
-                # レイアウトの調整
-                fig_radar.update_layout(
-                    title={
-                        'text': "評価メトリクスの比較",
-                        'x': 0.5,
-                        'xanchor': 'center',
-                        'y': 0.95,
-                        'font': {'size': 18}
-                    },
-                    polar=dict(
-                        radialaxis=dict(
-                            visible=True,
-                            range=[0, 1],
-                            tickfont=dict(size=10),
-                            tickangle=0,
-                            tickformat='.1f',
-                            gridwidth=1
-                        ),
-                        angularaxis=dict(
-                            rotation=90,
-                            direction='clockwise',
-                            tickfont=dict(size=12),
-                            gridwidth=1
-                        ),
-                        bgcolor='rgba(0,0,0,0.02)'
-                    ),
-                    showlegend=len(models) > 1,
-                    legend=dict(
-                        orientation='h',
-                        yanchor='bottom',
-                        y=1.15,
-                        xanchor='center',
-                        x=0.5,
-                        font=dict(size=12)
-                    ),
-                    margin=dict(l=60, r=60, t=100, b=60),
-                    height=600,
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    plot_bgcolor='rgba(0,0,0,0)'
-                )
-                
-                st.plotly_chart(fig_radar, use_container_width=True)
-                st.markdown('<br>', unsafe_allow_html=True)
+                    for strategy in chunk_strategies:
+                        strategy_data = results_df[results_df['chunk_strategy'] == strategy]
+                        
+                        if not strategy_data.empty:
+                            fig_radar = go.Figure()
+                            
+                            # 各モデルのデータを追加
+                            for model_name, model_data in model_groups:
+                                model_strategy_data = strategy_data[strategy_data['embedding_model'] == model_name] if 'embedding_model' in strategy_data.columns else strategy_data
+                                
+                                if not model_strategy_data.empty:
+                                    # 各メトリクスの平均値を計算
+                                    r_values = [model_strategy_data[m].mean() if m in model_strategy_data.columns else 0.5 for m in metrics]
+                                    
+                                    fig_radar.add_trace(go.Scatterpolar(
+                                        r=r_values,
+                                        theta=metrics_jp,
+                                        fill='toself',
+                                        name=model_name,
+                                        hovertemplate='%{theta}: %{r:.2f}<extra></extra>',
+                                        line=dict(width=2)
+                                    ))
+                            
+                            # レイアウトの調整
+                            fig_radar.update_layout(
+                                title={
+                                    'text': f"{strategy} - 評価メトリクスの比較",
+                                    'x': 0.5,
+                                    'xanchor': 'center',
+                                    'y': 0.95,
+                                    'font': {'size': 18}
+                                },
+                                polar=dict(
+                                    radialaxis=dict(
+                                        visible=True,
+                                        range=[0, 1],
+                                        tickfont=dict(size=10),
+                                        tickangle=0,
+                                        tickformat='.1f',
+                                        gridwidth=1
+                                    ),
+                                    angularaxis=dict(
+                                        rotation=90,
+                                        direction='clockwise',
+                                        tickfont=dict(size=12),
+                                        gridwidth=1
+                                    ),
+                                    bgcolor='rgba(0,0,0,0.02)'
+                                ),
+                                showlegend=True,
+                                legend=dict(
+                                    orientation='h',
+                                    yanchor='bottom',
+                                    y=1.15,
+                                    xanchor='center',
+                                    x=0.5,
+                                    font=dict(size=12)
+                                ),
+                                margin=dict(l=60, r=60, t=100, b=60),
+                                height=500,
+                                paper_bgcolor='rgba(0,0,0,0)',
+                                plot_bgcolor='rgba(0,0,0,0)'
+                            )
+                            
+                            st.plotly_chart(fig_radar, use_container_width=True)
+                            st.markdown('<br>', unsafe_allow_html=True)
                 
                 # 結果をDataFrameに変換
             results_df = pd.DataFrame(st.session_state.bulk_evaluation_results)
-
-            import plotly.graph_objects as go  # レーダーチャート用
-            # --- 評価方法（チャンク方式）ごとの違いをまとめて可視化 ---
-            st.subheader("評価方法ごとの比較（チャンク戦略単位で集約）")
-            # バックエンドの返却値カラム名に合わせて修正
-            agg_cols = ["overall_score", "faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness", "avg_chunk_len", "num_chunks"]
-            missing_cols = [col for col in agg_cols if col not in results_df.columns]
-            if missing_cols:
-                st.warning(f"集約グラフ描画に必要なカラムが不足しています: {missing_cols}。バックエンドの返却値・バージョンを確認してください。")
-            else:
-                agg_df = results_df.groupby("chunk_strategy")[agg_cols].mean().reset_index()
-
-                # 1. 水平棒グラフ（総合スコア）
-                fig_bar = px.bar(
-                    agg_df,
-                    y="chunk_strategy",
-                    x="overall_score",
-                    orientation="h",
-                    text="overall_score",
-                    title="Performance Ranking",
-                    labels={"chunk_strategy": "Chunking Strategy", "overall_score": "Overall Performance Score"},
-                )
-                fig_bar.update_traces(texttemplate='%{x:.3f}', textposition='outside')
-                fig_bar.update_layout(
-                    title={
-                        'text': "RAG Strategy Performance Ranking<br><sup>Error bars show standard deviation • * indicates statistical significance</sup>",
-                        'x':0.5,
-                        'xanchor': 'center'
-                    },
-                    font=dict(size=16),
-                    height=550,
-                    margin=dict(l=40, r=40, t=80, b=40),
-                    showlegend=False
-                )
-                st.plotly_chart(fig_bar, use_container_width=True)
-                if 'eval_figs' not in st.session_state:
-                    st.session_state['eval_figs'] = []
 
 # --- モデルごとの比較 ---
 if 'evaluation_results' in st.session_state and st.session_state.evaluation_results:
