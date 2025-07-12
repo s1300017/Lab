@@ -1085,32 +1085,68 @@ with tab4:
                 
                 # レーダーチャートの表示
                 fig_radar = go.Figure()
+                
+                # メトリクスとその日本語ラベルを定義
                 metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
-                metrics_labels = ["Faithfulness", "Answer Relevancy", "Context Recall", "Context Precision", "Answer Correctness"]
+                metrics_jp = ["信頼性", "回答の関連性", "コンテキストの再現性", "コンテキストの正確性", "回答の正確性"]
                 
                 # モデルが1つの場合でもレーダーチャートを表示
                 models = results_df['embedding_model'].unique() if 'embedding_model' in results_df.columns else ["default"]
                 
                 for model in models:
                     model_data = results_df[results_df['embedding_model'] == model] if 'embedding_model' in results_df.columns else results_df
+                    
+                    # 各メトリクスの平均値を計算（データがない場合は0.5で補完）
+                    r_values = [model_data[m].mean() if m in model_data.columns else 0.5 for m in metrics]
+                    
                     fig_radar.add_trace(go.Scatterpolar(
-                        r=[model_data[m].mean() if m in model_data.columns else 0.5 for m in metrics],
-                        theta=metrics_labels,
+                        r=r_values,
+                        theta=metrics_jp,  # 日本語ラベルを使用
                         fill='toself',
-                        name=f"{model}-{model_data['chunk_size'].iloc[0] if 'chunk_size' in model_data.columns else ''}" if len(models) > 1 else "Bulk Evaluation"
+                        name=f"{model}-{model_data['chunk_size'].iloc[0] if 'chunk_size' in model_data.columns else ''}" if len(models) > 1 else "評価結果",
+                        hovertemplate='%{theta}: %{r:.2f}<extra></extra>',
+                        line=dict(width=2)
                     ))
                 
+                # レイアウトの調整
                 fig_radar.update_layout(
                     title={
-                        'text': "RAGAS Metrics Comparison (Bulk Evaluation)<br><sup>All metrics normalized to 0-1 scale</sup>",
+                        'text': "評価メトリクスの比較",
                         'x': 0.5,
-                        'xanchor': 'center'
+                        'xanchor': 'center',
+                        'y': 0.95,
+                        'font': {'size': 18}
                     },
-                    polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+                    polar=dict(
+                        radialaxis=dict(
+                            visible=True,
+                            range=[0, 1],
+                            tickfont=dict(size=10),
+                            tickangle=0,
+                            tickformat='.1f',
+                            gridwidth=1
+                        ),
+                        angularaxis=dict(
+                            rotation=90,
+                            direction='clockwise',
+                            tickfont=dict(size=12),
+                            gridwidth=1
+                        ),
+                        bgcolor='rgba(0,0,0,0.02)'
+                    ),
                     showlegend=len(models) > 1,
-                    font=dict(size=16),
+                    legend=dict(
+                        orientation='h',
+                        yanchor='bottom',
+                        y=1.15,
+                        xanchor='center',
+                        x=0.5,
+                        font=dict(size=12)
+                    ),
+                    margin=dict(l=60, r=60, t=100, b=60),
                     height=600,
-                    margin=dict(l=40, r=40, t=80, b=40)
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)'
                 )
                 
                 st.plotly_chart(fig_radar, use_container_width=True)
