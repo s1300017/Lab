@@ -3,3 +3,4 @@ requests
 plotly
 fpdf
 kaleido>=0.2.1
+streamlit-js-eval

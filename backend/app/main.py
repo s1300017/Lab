@@ -9,6 +9,17 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+# --- PDF・抽出データ保存用ディレクトリのグローバル定義 ---
+import uuid
+import json
+from pathlib import Path
+
+DATA_DIR = Path(__file__).parent.parent / "data"
+PDF_DIR = DATA_DIR / "pdf"
+EXTRACTED_DIR = DATA_DIR / "extracted"
+PDF_DIR.mkdir(parents=True, exist_ok=True)
+EXTRACTED_DIR.mkdir(parents=True, exist_ok=True)
+
 print(f"[{jst_now_str()}] === FastAPI main.py 起動開始 ===")
 
 # データベース接続設定
@@ -66,6 +77,7 @@ async def uploadfile(file: UploadFile = File(...)):
     print(f"[{jst_now_str()}][重要] ファイル情報: {file=}, タイプ={type(file)}")
     import io
     try:
+        file_id = str(uuid.uuid4())  # ← ここで必ずfile_idを発行
         # 1. PDFからテキスト抽出
         contents = await file.read()
         print(f"[{jst_now_str()}][重要] ファイル読み込み完了: {len(contents)}バイト")
@@ -131,14 +143,53 @@ async def uploadfile(file: UploadFile = File(...)):
             questions = ["この文書の主題は何ですか？"]
             answers = ["本文を要約してください。"]
         print(f"[重要] API返却直前: questions={questions}, answers={answers}")
+        # 4. 抽出データ保存
+        extracted_path = EXTRACTED_DIR / f"{file_id}.json"
+        with open(extracted_path, "w", encoding="utf-8") as f_json:
+            json.dump({
+                "text": sample_text,
+                "questions": questions,
+                "answers": answers,
+                "file_name": file.filename,  # ←file_nameで統一
+            }, f_json, ensure_ascii=False)
+        # PDFファイル保存
+        pdf_path = PDF_DIR / f"{file_id}.pdf"
+        with open(pdf_path, "wb") as f_pdf:
+            f_pdf.write(contents)
+        # 5. file_id付きで返却
         return {
+            "file_id": file_id,
             "text": sample_text,
             "questions": questions,
-            "answers": answers
+            "answers": answers,
+            "file_name": file.filename,  # ←file_nameで統一
         }
     except Exception as e:
         print(f"[重要] uploadfile全体例外: {e}")
         return {"error": str(e)}
+
+# --- 新規: file_idで抽出済みデータ取得API ---
+from fastapi import HTTPException
+@app.get("/get_extracted/{file_id}")
+def get_extracted(file_id: str):
+    """
+    指定file_idの抽出テキスト・QA・ファイル名を返すAPI。
+    """
+    extracted_path = EXTRACTED_DIR / f"{file_id}.json"
+    if not extracted_path.exists():
+        raise HTTPException(status_code=404, detail=f"file_id={file_id}の抽出データが見つかりません")
+    with open(extracted_path, "r", encoding="utf-8") as f_json:
+        data = json.load(f_json)
+    # PDF本体もbase64で必ず返す
+    pdf_path = PDF_DIR / f"{file_id}.pdf"
+    if pdf_path.exists():
+        import base64
+        with open(pdf_path, "rb") as f_pdf:
+            data["pdf_bytes_base64"] = base64.b64encode(f_pdf.read()).decode('utf-8')
+    # file_nameがなければfile_id.pdfをセット（後方互換）
+    if "file_name" not in data:
+        data["file_name"] = f"{file_id}.pdf"
+    return data
 
 
 from pydantic import BaseModel

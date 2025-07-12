@@ -7,6 +7,9 @@ def jst_now_str():
 import os
 import json
 import streamlit as st
+import streamlit.components.v1 as components
+import base64
+import json
 import pandas as pd
 import plotly.express as px
 import requests
@@ -64,8 +67,120 @@ def clear_database():
     except requests.exceptions.RequestException as e:
         st.error(f"バックエンドに接続できませんでした: {e}")
 
+# --- localStorageユーティリティ ---
+def save_state_to_localstorage():
+    state_keys = [
+        "file_id", "text", "qa_questions", "qa_answers", "uploaded_file_name", "uploaded_file_bytes",
+        "evaluation_results", "bulk_evaluation_results", "chunks", "chat_history",
+        "current_evaluation", "evaluation_history", "active_tab",
+        "tab1_content", "tab2_content", "tab3_content", "tab4_content"
+    ]
+    state = {}
+    for k in state_keys:
+        v = st.session_state.get(k)
+        if v is not None:
+            # バイト列はbase64で保存
+            if k == "uploaded_file_bytes" and isinstance(v, bytes):
+                state[k] = base64.b64encode(v).decode('utf-8')
+            # 評価履歴とタブ内容はJSON文字列として保存
+            elif k in ["evaluation_history", "bulk_evaluation_results", "tab1_content", "tab2_content", "tab3_content", "tab4_content"]:
+                state[k] = json.dumps(v)
+            else:
+                state[k] = v
+    # JSON文字列をUTF-8でエンコードしてからbase64エンコード
+    js = json.dumps(state, ensure_ascii=False)
+    encoded_js = base64.b64encode(js.encode('utf-8')).decode('utf-8')
+    components.html(f"""
+    <script>
+    localStorage.setItem('rag_app_state', '{encoded_js}');
+    window.parent.postMessage({{streamlitMessage: 'localStorageSaved'}}, '*');
+    </script>
+    """, height=0)
+
+# --- session_stateの初期化 ---
+def init_session_state():
+    default_state = {
+        "file_id": None,
+        "text": "",
+        "qa_questions": [],
+        "qa_answers": [],
+        "uploaded_file_name": "",
+        "uploaded_file_bytes": None,
+        "evaluation_results": {},  # 評価結果
+        "bulk_evaluation_results": {},  # バルク評価結果
+        "chunks": [],  # チャンクデータ
+        "chat_history": [],  # チャット履歴
+        "current_evaluation": None,  # 現在の評価セッション
+        "evaluation_history": [],  # 評価履歴
+        "active_tab": "tab1",  # 現在のアクティブタブ
+        "tab1_content": {"chat_history": []},  # タブ1の表示内容
+        "tab2_content": {},  # タブ2の表示内容
+        "tab3_content": {},  # タブ3の表示内容
+        "tab4_content": {},  # タブ4の表示内容
+        "_localstorage_loaded": False
+    }
+    for k, v in default_state.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
 # --- UI Layout ---
 with st.sidebar:
+    # --- リセットボタン ---
+    # ローカルストレージやセッション状態にデータがある場合のみ表示
+    from streamlit_js_eval import streamlit_js_eval
+    local_state = streamlit_js_eval(js_expressions="localStorage.getItem('rag_app_state')", key="check_localstorage")
+    has_data = local_state is not None or any(
+        st.session_state.get(k) not in [None, "", [], {}]
+        for k in ["text", "qa_questions", "qa_answers", "uploaded_file_name", "uploaded_file_bytes"]
+    )
+    
+    if has_data:
+        if st.button("リセット（すべてクリア）"):
+            # 1. localStorageをクリア
+            components.html("""
+            <script>
+            localStorage.removeItem('rag_app_state');
+            window.parent.postMessage({streamlitMessage: 'localStorageCleared'}, '*');
+            </script>
+            """, height=0)
+            
+            # 2. session_stateを初期化
+            init_session_state()
+            
+            # 3. バックエンドのデータベースをクリア
+            try:
+                response = requests.post(f"{BACKEND_URL}/clear_db/")
+                if response.status_code == 200:
+                    st.success("すべてのデータを正常にクリアしました！")
+                else:
+                    st.error(f"データベースのクリアに失敗しました: {response.text}")
+            except requests.exceptions.RequestException as e:
+                st.error(f"バックエンドに接続できませんでした: {e}")
+            
+            # 4. ページを再読み込み
+            st.rerun()
+    else:
+        st.warning("""
+        📝 データがありません
+        
+        PDFをアップロードしてからリセットできます。
+        """)
+
+    # --- データベース初期化ボタン ---
+    if st.button("データベースのみ初期化"):
+        try:
+            response = requests.post(f"{BACKEND_URL}/clear_db/")
+            if response.status_code == 200:
+                st.success("データベースを正常にクリアしました！")
+                st.session_state.text = ""
+                st.session_state.chunks = []
+                st.session_state.evaluation_results = None
+                st.session_state.chat_history = []
+            else:
+                st.error(f"データベースのクリアに失敗しました: {response.text}")
+        except requests.exceptions.RequestException as e:
+            st.error(f"バックエンドに接続できませんでした: {e}")
+
     st.header("設定")
     
     # モデル・エンベディングモデルリストをAPI経由で取得
@@ -110,21 +225,84 @@ with st.sidebar:
         index=emb_default_idx
     )
 
-    uploaded_file = st.file_uploader("PDFをアップロード", type=["pdf"])
-    if uploaded_file is not None:
-        # 多重アップロード防止: ファイル名・サイズで判定
-        if (
-            "last_uploaded_filename" not in st.session_state
-            or st.session_state.last_uploaded_filename != uploaded_file.name
-            or st.session_state.last_uploaded_filesize != uploaded_file.size
-        ):
+    import io
+    # --- file_idがセッションにあれば状態を復元 ---
+    # --- localStorageから復元 ---
+    def load_state_from_localstorage():
+        from streamlit_js_eval import streamlit_js_eval
+        local_state = streamlit_js_eval(js_expressions="localStorage.getItem('rag_app_state')", key="load_localstorage")
+        if local_state and not st.session_state.get("_localstorage_loaded", False):
+            try:
+                # 文字エンコーディングを確認
+                if isinstance(local_state, str):
+                    local_state = local_state.encode('utf-8')
+                # base64デコードしてJSON文字列を復元
+                js_bytes = base64.b64decode(local_state)
+                js = js_bytes.decode("utf-8")
+                state = json.loads(js)
+                for k, v in state.items():
+                    if k == "uploaded_file_bytes":
+                        st.session_state[k] = base64.b64decode(v)
+                    elif k in ["evaluation_history", "bulk_evaluation_results", "tab1_content", "tab2_content", "tab3_content", "tab4_content"]:
+                        # 評価履歴とタブ内容はJSON文字列として保存されているので、デコード
+                        st.session_state[k] = json.loads(v)
+                    else:
+                        st.session_state[k] = v
+                st.session_state["_localstorage_loaded"] = True
+            except Exception as e:
+                st.warning(f"localStorage復元エラー: {e}")
+                init_session_state()    # エラーが発生した場合でもsession_stateをクリア
+                init_session_state()
+        # localStorage取得時はwindow.postMessageで値が返るが、Streamlit標準では直接受け取れないため、
+        # ここでは「アップロードや復元のたびにsave_state_to_localstorage()」を呼ぶことで永続化する
+
+    load_state_from_localstorage()
+
+    if "file_id" in st.session_state and not st.session_state.get("text"):
+        try:
+            resp = requests.get(f"{BACKEND_URL}/get_extracted/{st.session_state['file_id']}")
+            if resp.status_code == 200:
+                data = resp.json()
+                st.session_state["text"] = data.get("text", "")
+                st.session_state["qa_questions"] = data.get("questions", [])
+                st.session_state["qa_answers"] = data.get("answers", [])
+                # --- ファイル名とバイト列も必ず復元 ---
+                st.session_state["uploaded_file_name"] = data.get("file_name", f"{st.session_state['file_id']}.pdf")
+                if "pdf_bytes_base64" in data:
+                    st.session_state["uploaded_file_bytes"] = base64.b64decode(data["pdf_bytes_base64"])
+                st.success(f"前回アップロード済みファイルID: {st.session_state['file_id']} のデータを復元しました")
+                save_state_to_localstorage()
+            else:
+                st.warning("保存済みデータの復元に失敗しました。file_idをクリアします。")
+                del st.session_state["file_id"]
+        except Exception as e:
+            st.warning(f"保存済みデータの復元に失敗: {e}")
+            del st.session_state["file_id"]
+    # すでにアップロード済みかどうかでUIを分岐
+    if "uploaded_file_bytes" in st.session_state and "uploaded_file_name" in st.session_state:
+        st.info(f"アップロード済: {st.session_state['uploaded_file_name']}")
+        # 再アップロードしたい場合のリセットボタン
+        if st.button("アップロードをやり直す"):
+            for key in ["uploaded_file_bytes", "uploaded_file_name", "uploaded_file_size", "text", "qa_questions", "qa_answers", "file_id"]:
+                if key in st.session_state:
+                    del st.session_state[key]
+            components.html("""
+            <script>localStorage.removeItem('rag_app_state');</script>
+            """, height=0)
+            st.rerun()
+        # ファイル内容をBytesIOで復元
+        uploaded_file = io.BytesIO(st.session_state["uploaded_file_bytes"])
+        uploaded_file.name = st.session_state["uploaded_file_name"]
+        # まだテキストやQAがセッションに無ければPDF処理を実行
+        if not st.session_state.get("text"):
             with st.spinner('PDFを処理中...'):
-                import io
-                files = {'file': ('uploaded.pdf', io.BytesIO(uploaded_file.getvalue()), 'application/pdf')}
+                files = {'file': (uploaded_file.name, uploaded_file, 'application/pdf')}
                 try:
                     response = requests.post(f"{BACKEND_URL}/uploadfile/", files=files)
                     if response.status_code == 200:
                         data = response.json()
+                        if "file_id" in data:
+                            st.session_state["file_id"] = data["file_id"]
                         if 'questions' in data and 'answers' in data:
                             st.session_state.text = data['text']
                             st.session_state.qa_questions = data['questions']
@@ -138,20 +316,36 @@ with st.sidebar:
                                 st.write(f"A{i+1}: {a}")
                         else:
                             st.error(f"PDF処理APIの返却内容にquestions/answersが含まれていません: {data}")
+                        save_state_to_localstorage()
                     else:
                         st.error(f"ファイル処理エラー: {response.text}")
                 except requests.exceptions.RequestException as e:
                     st.error(f"接続エラー: {e}")
-            st.session_state.last_uploaded_filename = uploaded_file.name
-            st.session_state.last_uploaded_filesize = uploaded_file.size
         else:
-            st.info("同じファイルは再アップロードされません。")
+            # 既にテキスト・QAがある場合は表示のみ
+            st.success("PDFからテキスト・質問・回答セットは既に抽出済みです。")
+            st.write("### 自動生成された質問:")
+            for i, q in enumerate(st.session_state.qa_questions):
+                st.write(f"Q{i+1}: {q}")
+            st.write("### 自動生成された回答:")
+            for i, a in enumerate(st.session_state.qa_answers):
+                st.write(f"A{i+1}: {a}")
+        save_state_to_localstorage()
+    else:
+        # まだアップロードされていない場合はfile_uploaderを表示
+        uploaded_file = st.file_uploader("PDFをアップロード", type=["pdf"])
+        if uploaded_file is not None:
+            st.session_state["uploaded_file_bytes"] = uploaded_file.getvalue()
+            st.session_state["uploaded_file_name"] = uploaded_file.name
+            st.session_state["uploaded_file_size"] = uploaded_file.size
+            save_state_to_localstorage()
+            st.rerun()
 
-    if st.button("データベースを初期化してやり直す"):
-        clear_database()
-        st.rerun()
+# メインコンテンツのタブ定義
+tab1, tab2, tab3, tab4 = st.tabs(["チャンキング設定", "評価", "一括評価", "比較"])
 
-    # 以降の処理は正常なインデントで記述
+# タブ1: チャンキング設定
+with tab1:
     if st.session_state.text:
         st.subheader("チャンキング設定")
         chunk_method = st.radio("チャンク化方式", ["recursive", "semantic"], index=0, help="recursive: 文字数ベース, semantic: 意味ベース")
@@ -178,49 +372,159 @@ with st.sidebar:
                     embed_response = requests.post(f"{BACKEND_URL}/embed_and_store/", json=embed_payload)
                     if embed_response.status_code == 200:
                         st.success(f"{len(st.session_state.chunks)}個のチャンクを生成し、ベクトル化しました。")
-                    else:
-                        st.error(f"ベクトル化失敗: {embed_response.text}")
+                        # --- メインコンテンツ ---
+                        if not st.session_state.text:
+                            st.info("サイドバーでPDFファイルをアップロードし、設定を行ってください。")
+
+# タブ2: 評価
+with tab2:
+    st.header("評価の実行と結果")
+    
+    # 評価実行セクション
+    with st.expander("評価を実行", expanded=True):
+        st.subheader("評価の実行")
+        
+        # 質問と回答の入力
+        questions = st.text_area("評価する質問を入力（1行に1つ）", 
+                              value="\n".join(st.session_state.get('qa_questions', [])), 
+                              height=150,
+                              help="評価したい質問を1行ずつ入力してください")
+        
+        answers = st.text_area("回答を入力（1行に1つ、質問と順番を合わせてください）", 
+                             value="\n".join(st.session_state.get('qa_answers', [])), 
+                             height=150,
+                             help="質問に対する回答を1行ずつ入力してください")
+        
+        # 評価実行ボタン
+        if st.button("評価を実行", key="evaluate_button_evaluation_tab"):
+            questions = [q.strip() for q in questions.split('\n') if q.strip()]
+            answers = [a.strip() for a in answers.split('\n') if a.strip()]
+            
+            if not questions:
+                st.warning("評価する質問を入力してください。")
+            elif len(questions) != len(answers):
+                st.warning("質問と回答の数が一致しません。")
+            else:
+                with st.spinner("評価を実行中... しばらくお待ちください。"):
+                    try:
+                        evaluation_payload = {
+                            "questions": questions,
+                            "answers": answers,
+                            "contexts": ["" for _ in questions],
+                            "model": st.session_state.llm_model
+                        }
+                        
+                        response = requests.post(
+                            f"{BACKEND_URL}/evaluate/", 
+                            json=evaluation_payload
+                        )
+                        
+                        if response.status_code == 200:
+                            st.session_state.evaluation_results = response.json()
+                            st.session_state.qa_questions = questions
+                            st.session_state.qa_answers = answers
+                            st.success("評価が完了しました！")
+                            st.rerun()
+                        else:
+                            st.error(f"評価の実行中にエラーが発生しました: {response.text}")
+                    except Exception as e:
+                        st.error(f"評価の実行中にエラーが発生しました: {str(e)}")
+    
+    # 評価結果表示セクション
+    st.subheader("評価結果")
+    if 'evaluation_results' in st.session_state and st.session_state.evaluation_results:
+        eval_results = st.session_state.evaluation_results
+        
+        # 評価結果を表形式で表示
+        st.subheader("評価結果サマリー")
+        
+        # スコアの表示
+        if 'scores' in eval_results:
+            scores = eval_results['scores']
+            st.write("### スコア")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("ファクト整合性", f"{scores.get('faithfulness', 0):.2f}")
+            with col2:
+                st.metric("回答関連性", f"{scores.get('answer_relevancy', 0):.2f}")
+            with col3:
+                st.metric("文脈再現率", f"{scores.get('context_recall', 0):.2f}")
+            with col4:
+                st.metric("文脈適合率", f"{scores.get('context_precision', 0):.2f}")
+        
+        # 詳細な評価結果を表示
+        if 'results' in eval_results:
+            st.write("### 質問ごとの詳細")
+            for i, result in enumerate(eval_results['results']):
+                with st.expander(f"質問 {i+1}: {result.get('question', '')}"):
+                    st.write(f"**質問**: {result.get('question', '')}")
+                    st.write(f"**回答**: {result.get('answer', '')}")
+                    st.write(f"**スコア**: {result.get('score', 'N/A')}")
+                    if 'details' in result:
+                        st.json(result['details'])
+    else:
+        st.info("評価結果がありません。上記のフォームから評価を実行してください。")
+
+# タブ3: 一括評価
+with tab3:
+    st.header("一括評価")
+    
+    if 'bulk_evaluation_results' in st.session_state and st.session_state.bulk_evaluation_results:
+        st.subheader("一括評価結果")
+        st.json(st.session_state.bulk_evaluation_results)
+    else:
+        st.info("一括評価結果がありません。一括評価を実行してください。")
+    
+    if st.button("一括評価を実行", key="bulk_evaluate_button_1"):
+        with st.spinner("一括評価を実行中... これには数分かかる場合があります。"):
+            try:
+                response = requests.post(f"{BACKEND_URL}/bulk_evaluate/")
+                if response.status_code == 200:
+                    st.session_state.bulk_evaluation_results = response.json()
+                    st.success("一括評価が完了しました！")
+                    st.rerun()
                 else:
-                    st.error(f"チャンキング失敗: {chunk_response.text}")
+                    st.error(f"一括評価の実行中にエラーが発生しました: {response.text}")
+            except Exception as e:
+                st.error(f"一括評価の実行中にエラーが発生しました: {str(e)}")
 
-
-# --- Main Content ---
-if not st.session_state.text:
-    st.info("サイドバーでPDFファイルをアップロードし、設定を行ってください。")
-else:
-    tab1, tab2, tab3, tab4 = st.tabs(["チャット", "評価", "一括評価", "比較"])
-
-    with tab1:
-        st.header("ドキュメントとチャット")
-
-        for author, message in st.session_state.chat_history:
-            with st.chat_message(author):
-                st.markdown(message)
-
-        if prompt := st.chat_input("ドキュメントについて質問を入力してください"):
-            st.session_state.chat_history.append(("user", prompt))
-            with st.chat_message("user"):
-                st.markdown(prompt)
-
-            with st.spinner("考え中..."):
-                payload = {"query": prompt, "llm_model": st.session_state.llm_model, "embedding_model": st.session_state.embedding_model}
-                try:
-                    response = requests.post(f"{BACKEND_URL}/query/", json=payload)
-                    if response.status_code == 200:
-                        result = response.json()
-                        answer = result['answer']
-                        st.session_state.chat_history.append(("assistant", answer))
-                        with st.chat_message("assistant"):
-                            st.markdown(answer)
-                    else:
-                        st.error(f"クエリ失敗: {response.text}")
-                except requests.exceptions.RequestException as e:
-                    st.error(f"接続エラー: {e}")
-
-    with tab2:
-        st.header("RAG評価")
-        st.markdown("RAGパイプラインの性能を評価するための質問セットを定義します。")
-
+# タブ4: 比較
+with tab4:
+    st.header("評価結果の比較")
+    
+    if 'evaluation_results' in st.session_state and st.session_state.evaluation_results:
+        st.subheader("評価結果の比較")
+        
+        # 評価結果をDataFrameに変換
+        eval_results = st.session_state.evaluation_results
+        if 'results' in eval_results:
+            df_data = []
+            for i, result in enumerate(eval_results['results']):
+                row = {
+                    '質問番号': i+1,
+                    '質問': result.get('question', ''),
+                    '回答': result.get('answer', '')
+                }
+                if 'details' in result:
+                    for k, v in result['details'].items():
+                        if isinstance(v, (int, float)):
+                            row[k] = v
+                df_data.append(row)
+            
+            if df_data:
+                df = pd.DataFrame(df_data)
+                st.dataframe(df)
+                
+                # スコアの可視化
+                score_cols = [col for col in df.columns if col not in ['質問番号', '質問', '回答']]
+                if score_cols:
+                    st.subheader("スコアの比較")
+                    fig = px.bar(df, x='質問番号', y=score_cols, 
+                                title="質問ごとのスコア比較",
+                                labels={'value': 'スコア', 'variable': '評価項目', '質問番号': '質問番号'})
+                    st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("比較する評価結果がありません。評価または一括評価を実行してください。")
         # --- 自動生成QAセット優先で利用 ---
         auto_questions = st.session_state.get('qa_questions', None)
         auto_answers = st.session_state.get('qa_answers', None)
@@ -233,59 +537,58 @@ else:
                                            value="主なチャンキング技術には何がありますか？\nセマンティックチャンキングと再帰的文字分割の違いは何ですか？")
             questions = [q.strip() for q in questions_input.split('\n') if q.strip()]
 
-        if st.button("評価を実行"):
+        if st.button("評価を実行", key="evaluate_button_evaluation"):
             if not questions:
                 st.warning("最低1つの質問を入力してください。")
             else:
                 with st.spinner("評価を実行中... これには数分かかる場合があります。"):
                     try:
-                        # 1. Get answers and contexts for all questions
+                        # 1. 質問に対する回答とコンテキストを取得
                         answers = []
                         contexts = []
                         # --- アップロードPDFから自動生成された回答セットがあれば利用 ---
                         if auto_answers and len(auto_answers) == len(questions):
-                            import concurrent.futures
-                            from concurrent.futures import ThreadPoolExecutor
-                            
-                            # 評価用のヘルパー関数
-                            def evaluate_combination(params):
-                                embedding, strategy, size, overlap = params
-                                try:
-                                    response = requests.post(f"{BACKEND_URL}/evaluate/", json={"embedding_model": embedding, "strategy": strategy, "chunk_size": size, "chunk_overlap": overlap})
-                                    return response.json()
-                                except requests.exceptions.RequestException as e:
-                                    st.error(f"接続エラー: {e}")
-                                    return None
-                            
-                            # ここに並列処理の実装を追加
-                            with ThreadPoolExecutor(max_workers=4) as executor:
-                                futures = []
-                                for embedding in ["huggingface_bge_small", "openai"]:
-                                    for strategy in ["recursive", "semantic"]:
-                                        for size in [500, 1000]:
-                                            for overlap in [0, 100, 200]:
-                                                if size > overlap:
-                                                    futures.append(executor.submit(evaluate_combination, (embedding, strategy, size, overlap)))
-                                                else:
-                                                    st.warning(f"chunk_size <= overlap となる不正な組み合わせは自動的に除外しました: ({embedding}, {strategy}, {size}, {overlap})")
-                                                # 進捗バーの設定
-                                                progress_bar = st.progress(0)
-                                                total_tasks = len(futures)
-                                                completed_tasks = 0
-                                                for future in concurrent.futures.as_completed(futures):
-                                                    result = future.result()
-                                                    if result is not None:
-                                                        answers.append(result['answer'])
-                                                        contexts.append(result['context'])
-                                                    completed_tasks += 1
-                                                    progress_bar.progress(min(completed_tasks / total_tasks, 1.0))
-                                                progress_bar.empty()
-                                                st.session_state.evaluation_results = {"answers": answers, "contexts": contexts}
-                                                st.success("評価が完了しました！")
+                            answers = auto_answers
+                            st.success("自動生成された回答セットを使用します。")
                         else:
-                            st.warning("自動生成された回答が見つからないか、質問数と回答数が一致しません。")
+                            # 回答を生成するコードをここに追加
+                            st.warning("自動生成された回答セットがありません。")
+                            st.stop()
+
+                        # 2. 評価を実行
+                        evaluation_payload = {
+                            "questions": questions,
+                            "answers": answers,
+                            "contexts": ["" for _ in questions],  # コンテキストは空で仮設定
+                            "model": st.session_state.llm_model
+                        }
+                        
+                        eval_response = requests.post(f"{BACKEND_URL}/evaluate/", json=evaluation_payload)
+                        if eval_response.status_code == 200:
+                            st.session_state.evaluation_results = eval_response.json()
+                            st.success("評価が完了しました！")
+                            # 評価結果を表示するタブに移動
+                            st.session_state.active_tab = "評価"
+                            st.rerun()
+                        else:
+                            st.error(f"評価の実行中にエラーが発生しました: {eval_response.text}")
                     except Exception as e:
-                        st.error(f"評価中にエラーが発生しました: {str(e)}")
+                        st.error(f"評価の実行中にエラーが発生しました: {str(e)}")
+                    st.warning(f"chunk_size <= overlap となる不正な組み合わせは自動的に除外しました: ({embedding}, {strategy}, {size}, {overlap})")
+                    # 進捗バーの設定
+                    progress_bar = st.progress(0)
+                    total_tasks = len(futures)
+                    completed_tasks = 0
+                    for future in concurrent.futures.as_completed(futures):
+                        result = future.result()
+                        if result is not None:
+                            answers.append(result['answer'])
+                            contexts.append(result['context'])
+                        completed_tasks += 1
+                        progress_bar.progress(min(completed_tasks / total_tasks, 1.0))
+                    progress_bar.empty()
+                    st.session_state.evaluation_results = {"answers": answers, "contexts": contexts}
+                    st.success("評価が完了しました！")
 
         if st.session_state.evaluation_results:
             st.subheader("評価指標")
@@ -418,7 +721,7 @@ else:
         )
         st.caption("※Embeddingモデル・チャンク分割方式・サイズ・オーバーラップの全組み合わせで自動一括評価を実行します")
 
-        if st.button("一括評価を実行"):
+        if st.button("一括評価を実行", key="bulk_evaluate_button_2"):
             # テキストがアップロードされているか確認
             if not st.session_state.get("text"):
                 st.error("評価を実行するには、まずドキュメントをアップロードしてください。")
@@ -1025,7 +1328,7 @@ if 'evaluation_results' in st.session_state and st.session_state.evaluation_resu
         col_btn1, col_btn2, col_btn3 = st.columns(3)
         with col_btn1:
             if st.button("再評価・グラフ再描画", help="最新のデータでグラフを再描画します"):
-                st.experimental_rerun()
+                st.rerun()
         with col_btn2:
             if st.button("全結果をPDF出力（比較レイアウト）", help="全グラフ・比較表をPDFで一括ダウンロード"):
                 st.session_state['pdf_export'] = True
@@ -1111,8 +1414,8 @@ if 'evaluation_results' in st.session_state and st.session_state.evaluation_resu
         selected_models = st.multiselect("モデルを選択", models, key="compare_models_tab4")
         selected_strategies = st.multiselect("戦略を選択", strategies, key="compare_strategies_tab4")
 
-        if st.button("比較を実行"):
-            with st.spinner("比較を実行中..."):
+        if st.button("評価を実行", key="evaluate_button_compare"):
+            with st.spinner("評価を実行中..."):
                 # QAセット必須チェック
                 if st.session_state.get("text") and st.session_state.get("qa_questions") and st.session_state.get("qa_answers"):
                     payload = {"models": selected_models, "strategies": selected_strategies,
