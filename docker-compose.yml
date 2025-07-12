@@ -49,6 +49,23 @@ services:
         limits:
           cpus: "1.0"
 
+  frontend:
+    build: ./frontend
+    container_name: rag_frontend
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./frontend:/app
+      - ./.env:/app/.env  # .envファイルをマウント
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}  # ホストの環境変数から取得
+      - TZ=Asia/Tokyo # JST化
+    depends_on:
+      - db
+      - ollama
+      - backend
+    restart: always
+
   backend:
     build: ./backend
     container_name: rag_backend
@@ -72,19 +89,6 @@ services:
       - TRANSFORMERS_CACHE=/app/models
       - HF_HOME=/app/models
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      - TZ=Asia/Tokyo # JST化
-    restart: always
-
-  frontend:
-    build: ./frontend
-    container_name: rag_frontend
-    ports:
-      - "8501:8501"
-    volumes:
-      - ./frontend:/app
-    depends_on:
-      - backend
-    environment:
       - TZ=Asia/Tokyo # JST化
     restart: always
 

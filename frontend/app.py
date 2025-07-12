@@ -13,10 +13,15 @@ import json
 import pandas as pd
 import plotly.express as px
 import requests
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Literal
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import plotly.graph_objects as go  # レーダーチャート等で使用
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# 環境変数を読み込み
+load_dotenv()
 
 st.set_page_config(layout="wide")
 st.title("RAG評価システム")
@@ -202,16 +207,30 @@ with st.sidebar:
     default_idx = 0
     if 'llm_model' in st.session_state and st.session_state.llm_model in model_names:
         default_idx = model_names.index(st.session_state.llm_model)
-
-    st.session_state.llm_model = st.selectbox(
+    # モデル設定
+    st.subheader("モデル設定")
+    
+    # 環境変数の読み込みを確認
+    if not os.getenv("OPENAI_API_KEY"):
+        st.warning("警告: OPENAI_API_KEY が設定されていません。")
+    else:
+        st.sidebar.success("APIキーが設定されています")
+        
+    llm_model = st.selectbox(
         "LLMモデル",
-        model_options,
-        index=default_idx
+        options=model_options,
+        index=model_options.index(st.session_state.llm_model) if st.session_state.llm_model in model_options else 0,
+        key="llm_model_select"
     )
-    # 内部的にはnameで管理
-    if models:
-        st.session_state.llm_model = model_names[model_options.index(st.session_state.llm_model)]
-
+    
+    chat_model_options = ["gpt-4o-mini", "gpt-3.5-turbo", "llama3-70b-8192"]
+    chat_model = st.selectbox(
+        "チャットボットモデル",
+        options=chat_model_options,
+        index=0,
+        key="chat_model_select"
+    )
+    
     # Embeddingモデルも同様にAPI化（必要に応じて拡張可）
     embedding_options = {
         "OpenAI": "openai",
@@ -342,7 +361,7 @@ with st.sidebar:
             st.rerun()
 
 # メインコンテンツのタブ定義
-tab1, tab2, tab3, tab4 = st.tabs(["チャンキング設定", "評価", "一括評価", "比較"])
+tab1, tab2, tab3, tab4, tab_chatbot = st.tabs(["チャンキング設定", "評価", "一括評価", "比較", "チャットボット"])
 
 # タブ1: チャンキング設定
 with tab1:
@@ -377,6 +396,11 @@ with tab1:
                             st.info("サイドバーでPDFファイルをアップロードし、設定を行ってください。")
 
 # タブ2: 評価
+# PDFがアップロードされていない場合はチャット画面のみ表示
+if 'uploaded_file_bytes' not in st.session_state:
+    st.warning("PDFをアップロードしてください。")
+    st.stop()
+
 with tab2:
     st.header("評価の実行と結果")
     
@@ -467,6 +491,10 @@ with tab2:
 
 # タブ3: 一括評価
 with tab3:
+    if 'uploaded_file_bytes' not in st.session_state:
+        st.warning("PDFをアップロードしてください。")
+        st.stop()
+        
     st.header("一括評価")
     
     if 'bulk_evaluation_results' in st.session_state and st.session_state.bulk_evaluation_results:
@@ -489,7 +517,78 @@ with tab3:
                 st.error(f"一括評価の実行中にエラーが発生しました: {str(e)}")
 
 # タブ4: 比較
+# チャットボットタブ
+with tab_chatbot:
+    st.header("チャットボット")
+    
+    # チャット履歴の初期化
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+    
+    # チャットメッセージの表示
+    for message in st.session_state.chat_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # チャット入力
+    if prompt := st.chat_input("メッセージを入力..."):
+        # ユーザーメッセージを表示
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # 選択されたモデルで応答を生成
+        response_text = ""
+        with st.chat_message("assistant"):
+            try:
+                if not os.getenv("OPENAI_API_KEY"):
+                    st.error("APIキーが設定されていません。.envファイルにOPENAI_API_KEYを設定してください。")
+                    response_text = "APIキーが設定されていません。設定を確認してください。"
+                
+                # プロンプトを準備
+                messages = [{"role": "system", "content": "あなたは親切で役立つアシスタントです。"}]
+                messages.extend([{"role": m["role"], "content": m["content"]} for m in st.session_state.chat_messages])
+                
+                # モデルに応じてAPIを呼び出し
+                if st.session_state.chat_model in ["gpt-4o-mini", "gpt-3.5-turbo"]:
+                    # OpenAI APIを使用
+                    api_key = os.getenv("OPENAI_API_KEY")
+                    if not api_key:
+                        response_text = "エラー: APIキーが設定されていません。"
+                    else:
+                        try:
+                            client = OpenAI(api_key=api_key)
+                            response = client.chat.completions.create(
+                                model=st.session_state.chat_model,
+                                messages=messages,
+                                temperature=0.7,
+                                max_tokens=1000
+                            )
+                            response_text = response.choices[0].message.content
+                        except Exception as e:
+                            response_text = f"APIエラーが発生しました: {str(e)}"
+                else:
+                    # 無料モデルの場合（例としての実装）
+                    response_text = f"{st.session_state.chat_model} からの応答: あなたのメッセージ「{prompt}」を受け取りました。\n\n（注: 無料モデルの場合はダミー応答です）"
+                
+                st.markdown(response_text)
+                
+                # アシスタントのメッセージを履歴に追加
+                st.session_state.chat_messages.append({"role": "assistant", "content": response_text})
+                
+            except Exception as e:
+                error_msg = f"エラーが発生しました: {str(e)}"
+                st.error(error_msg)
+                st.session_state.chat_messages.append({"role": "assistant", "content": error_msg})
+        
+        # 画面を更新
+        st.rerun()
+
 with tab4:
+    if 'uploaded_file_bytes' not in st.session_state:
+        st.warning("PDFをアップロードしてください。")
+        st.stop()
+        
     st.header("評価結果の比較")
     
     if 'evaluation_results' in st.session_state and st.session_state.evaluation_results:
