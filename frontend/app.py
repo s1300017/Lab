@@ -1133,6 +1133,7 @@ with tab4:
                         strategy_data = results_df[results_df['chunk_strategy'] == strategy]
                         
                         if not strategy_data.empty:
+                            st.subheader(f"{strategy} - 評価メトリクスの比較")
                             fig_radar = go.Figure()
                             
                             # 各モデルのデータを追加
@@ -1154,13 +1155,6 @@ with tab4:
                             
                             # レイアウトの調整
                             fig_radar.update_layout(
-                                title={
-                                    'text': f"{strategy} - 評価メトリクスの比較",
-                                    'x': 0.5,
-                                    'xanchor': 'center',
-                                    'y': 0.95,
-                                    'font': {'size': 18}
-                                },
                                 polar=dict(
                                     radialaxis=dict(
                                         visible=True,
@@ -1187,7 +1181,7 @@ with tab4:
                                     x=0.5,
                                     font=dict(size=12)
                                 ),
-                                margin=dict(l=60, r=60, t=100, b=60),
+                                margin=dict(l=60, r=60, t=30, b=60),  # 上部マージンを小さく調整
                                 height=500,
                                 paper_bgcolor='rgba(0,0,0,0)',
                                 plot_bgcolor='rgba(0,0,0,0)'
