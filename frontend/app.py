@@ -148,7 +148,7 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                     model_data,
                     x="num_chunks",
                     y="avg_chunk_len",
-                    size=[min(s * 20, 50) for s in model_data["overall_score"]],
+                    size=[min(s * 8, 20) for s in model_data["overall_score"]],  # バブルのサイズをさらに小さく調整
                     color="overall_score",
                     hover_name=model_data['chunk_strategy'] + '-' + model_data['chunk_size'].astype(str),
                     text=model_data['chunk_strategy'],
@@ -164,27 +164,120 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                 
                 # バブルチャートのスタイルを更新
                 fig_bubble.update_traces(
-                    textposition='middle center',
-                    textfont=dict(size=12, color='white', family='Arial'),
-                    marker=dict(line=dict(width=1, color='DarkSlateGrey'), opacity=0.8),
+                    # テキストは別途注釈として配置するため、バブル内のテキストは非表示に
+                    texttemplate='',  # 空のテンプレートでテキストを非表示に
+                    marker=dict(
+                        line=dict(width=1.5, color='rgba(0,0,0,0.7)'),
+                        opacity=0.8,
+                        sizemode='diameter',
+                        sizemin=6,  # 最小サイズをさらに小さく
+                        sizeref=0.1  # サイズの感度を調整
+                    ),
                     hovertemplate=
-                    '<b>%{hovertext}</b><br>' +
-                    'チャンク数: %{x}<br>' +
-                    '平均サイズ: %{y}文字<br>' +
-                    'スコア: %{marker.color:.2f}<extra></extra>',
+                    '<b>%{hovertext}</b><br><br>' +
+                    'チャンク数: <b>%{x}</b><br>' +
+                    '平均サイズ: <b>%{y}文字</b><br>' +
+                    'スコア: <b>%{marker.color:.2f}</b><extra></extra>',
+                    hoverlabel=dict(
+                        font_size=14,
+                        font_family=japanese_font,
+                        bgcolor='white',
+                        bordercolor='#333',
+                        font_color='#333'
+                    )
                 )
                 
+                # レイアウトの調整
                 fig_bubble.update_layout(
                     title={
                         'text': f"{model_name} - チャンク分布とパフォーマンス",
                         'x': 0.5,
-                        'xanchor': 'center'
+                        'xanchor': 'center',
+                        'font': {
+                            'size': 20,
+                            'family': japanese_font,
+                            'color': '#333'
+                        },
+                        'y': 0.95,
+                        'yanchor': 'top'
                     },
-                    coloraxis_colorbar=dict(title="スコア"),
-                    font=dict(size=14, family="IPAexGothic"),
-                    height=500,
-                    margin=dict(l=40, r=40, t=80, b=40)
+                    coloraxis_colorbar=dict(
+                        title=dict(
+                            text='スコア',
+                            font=dict(
+                                size=14,
+                                family=japanese_font
+                            )
+                        ),
+                        tickfont=dict(
+                            family=japanese_font,
+                            size=12
+                        )
+                    ),
+                    font=dict(
+                        size=14,
+                        family=japanese_font,
+                        color='#333'
+                    ),
+                    height=600,
+                    margin=dict(l=80, r=50, t=100, b=120),  # 下部の余裕を増やして注釈用のスペースを確保
+                    plot_bgcolor='white',
+                    paper_bgcolor='white',
+                    xaxis=dict(
+                        title=dict(
+                            text='チャンク数',
+                            font=dict(
+                                size=14,
+                                family=japanese_font
+                            )
+                        ),
+                        tickfont=dict(
+                            size=12,
+                            family=japanese_font
+                        ),
+                        gridcolor='rgba(0,0,0,0.1)',
+                        showline=True,
+                        linewidth=1,
+                        linecolor='#ddd',
+                        mirror=True
+                    ),
+                    yaxis=dict(
+                        title=dict(
+                            text='平均チャンクサイズ (文字数)',
+                            font=dict(
+                                size=14,
+                                family=japanese_font
+                            )
+                        ),
+                        tickfont=dict(
+                            size=12,
+                            family=japanese_font
+                        ),
+                        gridcolor='rgba(0,0,0,0.1)',
+                        showline=True,
+                        linewidth=1,
+                        linecolor='#ddd',
+                        mirror=True
+                    )
                 )
+                
+                # バブルに注釈を追加（テキストをバブルの外側に配置）
+                for i, row in model_data.iterrows():
+                    fig_bubble.add_annotation(
+                        x=row['num_chunks'],
+                        y=row['avg_chunk_len'],
+                        text=row['chunk_strategy'],
+                        showarrow=False,
+                        yshift=10,  # バブルの上に配置
+                        font=dict(
+                            size=10,
+                            family=japanese_font,
+                            color='#333333'
+                        ),
+                        xanchor='center',
+                        yanchor='bottom',
+                        opacity=0.9
+                    )
                 
                 # 画像として保存
                 img_data = save_plotly_figure(fig_bubble, f"bubble_chart_{model_name}")
