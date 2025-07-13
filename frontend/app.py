@@ -56,8 +56,7 @@ japanese_font = get_japanese_font()
 
 # --- グラフ保存用ユーティリティ関数 ---
 
-
-def save_plotly_figure(fig, filename: str, width: int = 800, height: int = 600, scale: float = 2.0) -> bytes:
+def save_plotly_figure(fig, filename: str, width: int = 1200, height: int = 800, scale: float = 3.0) -> bytes:
     """
     Plotlyの図を画像データとして保存する
     
@@ -92,7 +91,7 @@ def save_plotly_figure(fig, filename: str, width: int = 800, height: int = 600, 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "graphs") -> bytes:
+def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "graphs") -> Optional[bytes]:
     """
     一括評価結果からグラフを生成し、ZIPファイルとして返す
     
@@ -101,44 +100,70 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
         filename: 生成するZIPファイルのベース名（拡張子は不要）
         
     Returns:
-        bytes: ZIPファイルのバイナリデータ
+        Optional[bytes]: 生成されたZIPファイルのバイナリデータ。エラー時はNoneを返す
     """
-    # 結果をDataFrameに変換
-    if isinstance(bulk_results, list):
-        results_df = pd.DataFrame(bulk_results)
-    else:
-        results_df = pd.DataFrame([bulk_results])
+    # 進捗表示用のプレースホルダーを作成
+    progress_bar = st.progress(0)
+    status_text = st.empty()
     
-    # 必要なカラムが存在するか確認し、不足している場合はデフォルト値を設定
-    required_cols = {
-        'avg_chunk_len', 'num_chunks', 'overall_score', 'chunk_strategy', 'embedding_model',
-        'faithfulness', 'answer_relevancy', 'context_recall', 'context_precision', 'answer_correctness'
-    }
-    
-    # 不足カラムの補完
-    for col in required_cols:
-        if col not in results_df.columns:
-            if col == 'chunk_strategy':
-                results_df[col] = 'unknown'
-            else:
-                results_df[col] = 0.5
-    
-    # メトリクスとその日本語ラベルを定義
-    metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
-    metrics_jp = ["信頼性", "回答の関連性", "コンテキストの再現性", "コンテキストの正確性", "回答の正確性"]
-    
-    # モデルごとにデータをグループ化
-    if 'embedding_model' in results_df.columns:
-        model_groups = list(results_df.groupby('embedding_model'))
-    else:
-        model_groups = [('default', results_df)]
-    
+    # 進捗状況を更新する関数
+    def update_progress(current: int, total: int, message: str) -> None:
+        """進捗状況を更新する"""
+        progress = int((current / total) * 100) if total > 0 else 0
+        progress_bar.progress(progress)
+        status_text.text(f"進捗: {current}/{total} - {message}")
+
     # 一時ディレクトリを作成
     temp_dir = tempfile.mkdtemp()
+    saved_files = []
     
     try:
+        # 結果をDataFrameに変換
+        if isinstance(bulk_results, list):
+            results_df = pd.DataFrame(bulk_results)
+        else:
+            results_df = pd.DataFrame([bulk_results])
+            
+        # 処理するグラフの総数を計算
+        total_graphs = 0
+        if not results_df.empty:
+            # バブルチャートとバーチャートの数
+            total_graphs += len(results_df['embedding_model'].unique()) * 2
+            # レーダーチャートの数
+            if 'chunk_strategy' in results_df.columns:
+                total_graphs += len(results_df['chunk_strategy'].unique())
+                
+        if total_graphs == 0:
+            status_text.warning("生成するグラフが見つかりませんでした。")
+            return None
+            
+        current_graph = 0
+    
+        # 必要なカラムが存在するか確認し、不足している場合はデフォルト値を設定
+        required_cols = {
+            'avg_chunk_len', 'num_chunks', 'overall_score', 'chunk_strategy', 'embedding_model',
+            'faithfulness', 'answer_relevancy', 'context_recall', 'context_precision', 'answer_correctness'
+        }
+        
+        # 不足カラムの補完
+        for col in required_cols:
+            if col not in results_df.columns:
+                if col == 'chunk_strategy':
+                    results_df[col] = 'unknown'
+                else:
+                    results_df[col] = 0.5
+    
+        # メトリクスとその日本語ラベルを定義
+        metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
+        metrics_jp = ["信頼性", "回答の関連性", "コンテキストの再現性", "コンテキストの正確性", "回答の正確性"]
+        
+        # モデルごとにデータをグループ化
+        if 'embedding_model' in results_df.columns:
+            model_groups = list(results_df.groupby('embedding_model'))
+        else:
+            model_groups = [('default', results_df)]
+    
         # 各グラフを一時ディレクトリに保存
-        saved_files = []
         
         # 1. バブルチャートを保存
         for model_name, model_data in model_groups:
@@ -279,8 +304,10 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                         opacity=0.9
                     )
                 
-                # 画像として保存
-                img_data = save_plotly_figure(fig_bubble, f"bubble_chart_{model_name}")
+                # 画像として保存（高解像度で）
+                current_graph += 1
+                update_progress(current_graph, total_graphs, f"バブルチャートを生成中: {model_name}")
+                img_data = save_plotly_figure(fig_bubble, f"bubble_chart_{model_name}", width=1200, height=800, scale=3.0)
                 if img_data:
                     filepath = os.path.join(temp_dir, f"bubble_chart_{model_name}.png")
                     with open(filepath, 'wb') as f:
@@ -381,8 +408,10 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                     )
                 )
                 
-                # 画像として保存
-                img_data = save_plotly_figure(fig_bar, f"bar_chart_{model_name}")
+                # 画像として保存（高解像度で）
+                current_graph += 1
+                update_progress(current_graph, total_graphs, f"バーチャートを生成中: {model_name}")
+                img_data = save_plotly_figure(fig_bar, f"bar_chart_{model_name}", width=1200, height=800, scale=3.0)
                 if img_data:
                     filepath = os.path.join(temp_dir, f"bar_chart_{model_name}.png")
                     with open(filepath, 'wb') as f:
@@ -569,8 +598,10 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                         )
                     )
                     
-                    # 画像として保存
-                    img_data = save_plotly_figure(fig_radar, f"radar_chart_{strategy}")
+                    # 画像として保存（高解像度で）
+                    current_graph += 1
+                    update_progress(current_graph, total_graphs, f"レーダーチャートを生成中: {strategy}")
+                    img_data = save_plotly_figure(fig_radar, f"radar_chart_{strategy}", width=1200, height=800, scale=3.0)
                     if img_data:
                         filepath = os.path.join(temp_dir, f"radar_chart_{strategy}.png".replace("/", "_"))
                         with open(filepath, 'wb') as f:
@@ -579,31 +610,47 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
         
         # ZIPファイルを作成
         if saved_files:
+            update_progress(total_graphs, total_graphs, "ZIPファイルを作成中...")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             zip_filename = f"{filename}_{timestamp}.zip"
             zip_path = os.path.join(temp_dir, zip_filename)
             
-            with zipfile.ZipFile(zip_path, 'w') as zipf:
-                for file in saved_files:
-                    arcname = os.path.basename(file)
-                    zipf.write(file, arcname=arcname)
-            
-            # ZIPファイルを読み込んで返す
-            with open(zip_path, 'rb') as f:
-                zip_data = f.read()
-            
-            return zip_data
+            try:
+                with zipfile.ZipFile(zip_path, 'w') as zipf:
+                    for i, file in enumerate(saved_files, 1):
+                        zipf.write(file, os.path.basename(file))
+                        update_progress(total_graphs, total_graphs, f"ZIPに追加中: {i}/{len(saved_files)}")
+                
+                # ZIPファイルを読み込んで返す
+                with open(zip_path, 'rb') as f:
+                    zip_data = f.read()
+                
+                if 'status_text' in locals():
+                    status_text.success(f"完了！ {len(saved_files)}個のファイルをZIPに保存しました。")
+                progress_bar.empty()  # 完了したらプログレスバーを消す
+                return zip_data
+                
+            except Exception as e:
+                if 'status_text' in locals():
+                    status_text.error(f"ZIPファイルの作成中にエラーが発生しました: {str(e)}")
+                return None
         else:
+            if 'status_text' in locals():
+                status_text.warning("保存するグラフがありませんでした。")
             return None
             
     except Exception as e:
-        st.error(f"ZIPファイルの作成中にエラーが発生しました: {e}")
+        if 'status_text' in locals():
+            status_text.error(f"グラフの生成中にエラーが発生しました: {str(e)}")
         return None
         
     finally:
-        # 一時ディレクトリを削除
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
+        # 一時ファイルを削除
+        if 'temp_dir' in locals() and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception as e:
+                print(f"一時ファイルの削除中にエラーが発生しました: {e}")
 # 環境変数を読み込み
 load_dotenv()
 
@@ -1264,18 +1311,18 @@ with tab3:
                             flat_results.append(result)
                     
                     st.session_state.bulk_evaluation_results = flat_results
+                    
+                    # 結果の詳細をデバッグ用にコンソールに出力
+                    if bulk_results:
+                        print("\n=== 評価結果サマリ ===")
+                        print(f"成功: {len(bulk_results)}件")
+                        for i, result in enumerate(bulk_results, 1):
+                            print(f"\n--- 結果 {i} ---")
+                            print(json.dumps(result, ensure_ascii=False, indent=2))
                 except Exception as e:
-                    status_display.error(f"結果の処理中にエラーが発生しました: {str(e)}")
-            else:
-                status_display.error("一括評価に失敗しました。APIレスポンスをご確認ください。")
-                
-            # 結果の詳細はデバッグ用にコンソールに出力
-            if bulk_results:
-                print("\n=== 評価結果サマリ ===")
-                print(f"成功: {len(bulk_results)}件")
-                for i, result in enumerate(bulk_results, 1):
-                    print(f"\n--- 結果 {i} ---")
-                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                    if 'status_text' in locals():
+                        status_text.error(f"結果の処理中にエラーが発生しました: {str(e)}")
+
 
     if st.session_state.bulk_evaluation_results:
         st.subheader("一括評価結果")
@@ -1340,10 +1387,12 @@ with tab3:
                         title=f"{model_name} - チャンク分布とパフォーマンス",
                         labels={
                             "num_chunks": "チャンク数",
-                            "avg_chunk_len": "平均チャンクサイズ (文字数)",
+                            "avg_chunk_len": "平均チャンク長",
                             "overall_score": "総合スコア"
                         },
                         color_continuous_scale=px.colors.sequential.Viridis,
+                        width=1200,  # グラフの幅を拡大
+                        height=800,  # グラフの高さを拡大
                         color_continuous_midpoint=0.5,
                     )
                     
@@ -1389,6 +1438,8 @@ with tab3:
                         labels={'x': '平均スコア', 'y': 'チャンク戦略'},
                         color=strategy_scores.values,
                         color_continuous_scale=px.colors.sequential.Viridis,
+                        width=1200,  # グラフの幅を拡大
+                        height=800,  # グラフの高さを拡大
                     )
                     
                     # バーの上にスコアを表示
