@@ -13,12 +13,334 @@ import json
 import pandas as pd
 import plotly.express as px
 import requests
-from typing import List, Dict, Any, Optional, Tuple, Literal
+from typing import List, Dict, Any, Optional, Tuple, Literal, Union
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import plotly.graph_objects as go  # レーダーチャート等で使用
 from openai import OpenAI
 from dotenv import load_dotenv
+import io
+import zipfile
+from datetime import datetime
+import tempfile
+import shutil
+
+# --- グラフ保存用ユーティリティ関数 ---
+def get_system_fonts():
+    """利用可能なシステムフォントを検出して返す"""
+    try:
+        # 一般的な日本語対応フォントの優先順位
+        font_preferences = [
+            'IPAexGothic', 'IPAGothic', 'Noto Sans CJK JP', 'Noto Sans JP',
+            'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Meiryo', 'MS Gothic',
+            'Yu Gothic', 'TakaoGothic', 'VL Gothic', 'Arial Unicode MS', 'sans-serif'
+        ]
+        
+        # 利用可能なフォントを取得
+        import matplotlib.font_manager as fm
+        available_fonts = [f.name for f in fm.fontManager.ttflist]
+        
+        # 利用可能なフォントから優先順に選択
+        for font in font_preferences:
+            if any(font.lower() in f.lower() for f in available_fonts):
+                return font
+        
+        # デフォルトのサンセリフフォント
+        return 'sans-serif'
+    except Exception as e:
+        print(f"フォント検出エラー: {e}")
+        return 'sans-serif'
+
+def save_plotly_figure(fig, filename: str, width: int = 800, height: int = 600, scale: float = 2.0) -> bytes:
+    """
+    Plotlyの図を画像データとして保存する
+    
+    Args:
+        fig: Plotlyの図オブジェクト
+        filename: 保存するファイル名（拡張子は不要）
+        width: 画像の幅（ピクセル）
+        height: 画像の高さ（ピクセル）
+        scale: スケールファクター（解像度を上げる場合）
+        
+    Returns:
+        bytes: 画像データ（PNG形式）
+    """
+    # システムの日本語フォントを自動検出
+    japanese_font = get_system_fonts()
+    
+    # 日本語フォントが正しく表示されるように設定
+    fig.update_layout(
+        font_family=japanese_font,
+        title_font_family=japanese_font,
+        font=dict(family=f"{japanese_font}, Arial, sans-serif")
+    )
+    
+    # 一時ファイルに保存してから読み込む（日本語文字化け対策）
+    temp_dir = tempfile.mkdtemp()
+    try:
+        temp_file = os.path.join(temp_dir, f"{filename}.png")
+        fig.write_image(temp_file, width=width, height=height, scale=scale)
+        with open(temp_file, 'rb') as f:
+            img_data = f.read()
+        return img_data
+    except Exception as e:
+        st.error(f"画像の保存中にエラーが発生しました: {e}")
+        return None
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "graphs") -> bytes:
+    """
+    一括評価結果からグラフを生成し、ZIPファイルとして返す
+    
+    Args:
+        bulk_results: 一括評価結果（辞書またはリスト）
+        filename: 生成するZIPファイルのベース名（拡張子は不要）
+        
+    Returns:
+        bytes: ZIPファイルのバイナリデータ
+    """
+    # 結果をDataFrameに変換
+    if isinstance(bulk_results, list):
+        results_df = pd.DataFrame(bulk_results)
+    else:
+        results_df = pd.DataFrame([bulk_results])
+    
+    # 必要なカラムが存在するか確認し、不足している場合はデフォルト値を設定
+    required_cols = {
+        'avg_chunk_len', 'num_chunks', 'overall_score', 'chunk_strategy', 'embedding_model',
+        'faithfulness', 'answer_relevancy', 'context_recall', 'context_precision', 'answer_correctness'
+    }
+    
+    # 不足カラムの補完
+    for col in required_cols:
+        if col not in results_df.columns:
+            if col == 'chunk_strategy':
+                results_df[col] = 'unknown'
+            else:
+                results_df[col] = 0.5
+    
+    # メトリクスとその日本語ラベルを定義
+    metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
+    metrics_jp = ["信頼性", "回答の関連性", "コンテキストの再現性", "コンテキストの正確性", "回答の正確性"]
+    
+    # モデルごとにデータをグループ化
+    if 'embedding_model' in results_df.columns:
+        model_groups = list(results_df.groupby('embedding_model'))
+    else:
+        model_groups = [('default', results_df)]
+    
+    # 一時ディレクトリを作成
+    temp_dir = tempfile.mkdtemp()
+    
+    try:
+        # 各グラフを一時ディレクトリに保存
+        saved_files = []
+        
+        # 1. バブルチャートを保存
+        for model_name, model_data in model_groups:
+            if not model_data.empty and 'chunk_size' in model_data.columns and 'overall_score' in model_data.columns:
+                # バブルチャートの作成
+                fig_bubble = px.scatter(
+                    model_data,
+                    x="num_chunks",
+                    y="avg_chunk_len",
+                    size=[min(s * 20, 50) for s in model_data["overall_score"]],
+                    color="overall_score",
+                    hover_name=model_data['chunk_strategy'] + '-' + model_data['chunk_size'].astype(str),
+                    text=model_data['chunk_strategy'],
+                    title=f"{model_name} - チャンク分布とパフォーマンス",
+                    labels={
+                        "num_chunks": "チャンク数",
+                        "avg_chunk_len": "平均チャンクサイズ (文字数)",
+                        "overall_score": "総合スコア"
+                    },
+                    color_continuous_scale=px.colors.sequential.Viridis,
+                    color_continuous_midpoint=0.5,
+                )
+                
+                # バブルチャートのスタイルを更新
+                fig_bubble.update_traces(
+                    textposition='middle center',
+                    textfont=dict(size=12, color='white', family='Arial'),
+                    marker=dict(line=dict(width=1, color='DarkSlateGrey'), opacity=0.8),
+                    hovertemplate=
+                    '<b>%{hovertext}</b><br>' +
+                    'チャンク数: %{x}<br>' +
+                    '平均サイズ: %{y}文字<br>' +
+                    'スコア: %{marker.color:.2f}<extra></extra>',
+                )
+                
+                fig_bubble.update_layout(
+                    title={
+                        'text': f"{model_name} - チャンク分布とパフォーマンス",
+                        'x': 0.5,
+                        'xanchor': 'center'
+                    },
+                    coloraxis_colorbar=dict(title="スコア"),
+                    font=dict(size=14, family="IPAexGothic"),
+                    height=500,
+                    margin=dict(l=40, r=40, t=80, b=40)
+                )
+                
+                # 画像として保存
+                img_data = save_plotly_figure(fig_bubble, f"bubble_chart_{model_name}")
+                if img_data:
+                    filepath = os.path.join(temp_dir, f"bubble_chart_{model_name}.png")
+                    with open(filepath, 'wb') as f:
+                        f.write(img_data)
+                    saved_files.append(filepath)
+        
+        # 2. バーチャートを保存
+        for model_name, model_data in model_groups:
+            if not model_data.empty and 'chunk_strategy' in model_data.columns and 'overall_score' in model_data.columns:
+                # チャンク戦略ごとのパフォーマンスを集計
+                strategy_scores = model_data.groupby('chunk_strategy')['overall_score'].mean().sort_values(ascending=False)
+                
+                # バーチャートの作成
+                fig_bar = px.bar(
+                    x=strategy_scores.values,
+                    y=strategy_scores.index,
+                    orientation='h',
+                    title=f"{model_name} - チャンク戦略別パフォーマンス",
+                    labels={'x': '平均スコア', 'y': 'チャンク戦略'},
+                    color=strategy_scores.values,
+                    color_continuous_scale=px.colors.sequential.Viridis,
+                )
+                
+                # バーの上にスコアを表示
+                fig_bar.update_traces(
+                    texttemplate='%{x:.3f}',
+                    textposition='outside',
+                    hovertemplate='<b>%{y}</b><br>スコア: %{x:.3f}<extra></extra>',
+                )
+                
+                # レイアウトの調整
+                fig_bar.update_layout(
+                    title={
+                        'text': f"{model_name} - チャンク戦略別パフォーマンス",
+                        'x': 0.5,
+                        'xanchor': 'center',
+                        'font': {'size': 18}
+                    },
+                    xaxis=dict(range=[0, 1.1]),
+                    coloraxis_showscale=False,
+                    height=400,
+                    margin=dict(l=100, r=40, t=100, b=40),
+                    yaxis=dict(autorange="reversed"),
+                    font=dict(size=14, family="IPAexGothic")
+                )
+                
+                # 画像として保存
+                img_data = save_plotly_figure(fig_bar, f"bar_chart_{model_name}")
+                if img_data:
+                    filepath = os.path.join(temp_dir, f"bar_chart_{model_name}.png")
+                    with open(filepath, 'wb') as f:
+                        f.write(img_data)
+                    saved_files.append(filepath)
+        
+        # 3. レーダーチャートを保存
+        if 'chunk_strategy' in results_df.columns:
+            chunk_strategies = results_df['chunk_strategy'].unique()
+            
+            for strategy in chunk_strategies:
+                strategy_data = results_df[results_df['chunk_strategy'] == strategy]
+                
+                if not strategy_data.empty:
+                    fig_radar = go.Figure()
+                    
+                    # 各モデルのデータを追加
+                    for model_name, model_data in model_groups:
+                        model_strategy_data = strategy_data[strategy_data['embedding_model'] == model_name] if 'embedding_model' in strategy_data.columns else strategy_data
+                        
+                        if not model_strategy_data.empty:
+                            # 各メトリクスの平均値を計算
+                            r_values = [model_strategy_data[m].mean() if m in model_strategy_data.columns else 0.5 for m in metrics]
+                            
+                            fig_radar.add_trace(go.Scatterpolar(
+                                r=r_values,
+                                theta=metrics_jp,
+                                fill='toself',
+                                name=model_name,
+                                hovertemplate='%{theta}: %{r:.2f}<extra></extra>',
+                                line=dict(width=2)
+                            ))
+                    
+                    # レイアウトの調整
+                    fig_radar.update_layout(
+                        title={
+                            'text': f"{strategy} - 評価メトリクスの比較",
+                            'x': 0.5,
+                            'xanchor': 'center',
+                            'font': {'size': 18, 'family': 'IPAexGothic'}
+                        },
+                        polar=dict(
+                            radialaxis=dict(
+                                visible=True,
+                                range=[0, 1],
+                                tickfont=dict(size=10, family='IPAexGothic'),
+                                tickangle=0,
+                                tickformat='.1f',
+                                gridwidth=1
+                            ),
+                            angularaxis=dict(
+                                rotation=90,
+                                direction='clockwise',
+                                tickfont=dict(size=12, family='IPAexGothic'),
+                                gridwidth=1
+                            ),
+                            bgcolor='rgba(0,0,0,0.02)'
+                        ),
+                        showlegend=True,
+                        legend=dict(
+                            orientation='h',
+                            yanchor='bottom',
+                            y=1.15,
+                            xanchor='center',
+                            x=0.5,
+                            font=dict(size=12, family='IPAexGothic')
+                        ),
+                        margin=dict(l=60, r=60, t=100, b=60),
+                        height=500,
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        font=dict(family='IPAexGothic')
+                    )
+                    
+                    # 画像として保存
+                    img_data = save_plotly_figure(fig_radar, f"radar_chart_{strategy}")
+                    if img_data:
+                        filepath = os.path.join(temp_dir, f"radar_chart_{strategy}.png".replace("/", "_"))
+                        with open(filepath, 'wb') as f:
+                            f.write(img_data)
+                        saved_files.append(filepath)
+        
+        # ZIPファイルを作成
+        if saved_files:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            zip_filename = f"{filename}_{timestamp}.zip"
+            zip_path = os.path.join(temp_dir, zip_filename)
+            
+            with zipfile.ZipFile(zip_path, 'w') as zipf:
+                for file in saved_files:
+                    arcname = os.path.basename(file)
+                    zipf.write(file, arcname=arcname)
+            
+            # ZIPファイルを読み込んで返す
+            with open(zip_path, 'rb') as f:
+                zip_data = f.read()
+            
+            return zip_data
+        else:
+            return None
+            
+    except Exception as e:
+        st.error(f"ZIPファイルの作成中にエラーが発生しました: {e}")
+        return None
+        
+    finally:
+        # 一時ディレクトリを削除
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 # 環境変数を読み込み
 load_dotenv()
@@ -901,6 +1223,47 @@ with tab3:
             
             # 結果をDataFrameに変換
         results_df = pd.DataFrame(st.session_state.bulk_evaluation_results)
+        
+        # グラフをZIPファイルとしてダウンロードするボタンを追加
+        st.markdown("---")
+        st.subheader("グラフのエクスポート")
+        
+        # ダウンロードボタンのスタイルをカスタマイズ
+        st.markdown("""
+        <style>
+            .stDownloadButton button {
+                width: 100%;
+                height: 3em;
+                font-size: 1.2em !important;
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                cursor: pointer;
+                transition: background-color 0.3s;
+            }
+            .stDownloadButton button:hover {
+                background-color: #45a049;
+            }
+            .stDownloadButton button:active {
+                background-color: #3e8e41;
+            }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        # ダウンロードボタン
+        if st.button("📥 すべてのグラフをZIPファイルでダウンロード", key="download_all_graphs"):
+            with st.spinner("グラフを生成してZIPファイルを作成中..."):
+                zip_data = create_zip_with_graphs(st.session_state.bulk_evaluation_results, "rag_evaluation_graphs")
+                
+                if zip_data:
+                    # ダウンロード用のリンクを生成
+                    b64 = base64.b64encode(zip_data).decode()
+                    href = f'<a href="data:application/zip;base64,{b64}" download="rag_evaluation_graphs.zip" class="download-link">ZIPファイルをダウンロード</a>'
+                    st.markdown(href, unsafe_allow_html=True)
+                    st.success("グラフのZIPファイルを生成しました。上記のリンクをクリックしてダウンロードしてください。")
+                else:
+                    st.error("グラフの生成中にエラーが発生しました。もう一度お試しください。")
 
 with tab4:
     if 'uploaded_file_bytes' not in st.session_state:
