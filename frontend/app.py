@@ -25,9 +25,9 @@ from datetime import datetime
 import tempfile
 import shutil
 
-# --- グラフ保存用ユーティリティ関数 ---
-def get_system_fonts():
-    """利用可能なシステムフォントを検出して返す"""
+# ---# 日本語フォントの設定
+def get_japanese_font():
+    """利用可能な日本語フォントを検出して返す"""
     try:
         # 一般的な日本語対応フォントの優先順位
         font_preferences = [
@@ -51,6 +51,12 @@ def get_system_fonts():
         print(f"フォント検出エラー: {e}")
         return 'sans-serif'
 
+# グローバルな日本語フォントを設定
+japanese_font = get_japanese_font()
+
+# --- グラフ保存用ユーティリティ関数 ---
+
+
 def save_plotly_figure(fig, filename: str, width: int = 800, height: int = 600, scale: float = 2.0) -> bytes:
     """
     Plotlyの図を画像データとして保存する
@@ -65,10 +71,7 @@ def save_plotly_figure(fig, filename: str, width: int = 800, height: int = 600, 
     Returns:
         bytes: 画像データ（PNG形式）
     """
-    # システムの日本語フォントを自動検出
-    japanese_font = get_system_fonts()
-    
-    # 日本語フォントが正しく表示されるように設定
+    # グローバルな日本語フォントを使用して設定
     fig.update_layout(
         font_family=japanese_font,
         title_font_family=japanese_font,
@@ -266,45 +269,117 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                                 line=dict(width=2)
                             ))
                     
+                        # カラーパレットを定義（視認性の高い色を選択）
+                    colors = [
+                        '#1f77b4',  # 青
+                        '#ff7f0e',  # オレンジ
+                        '#2ca02c',  # 緑
+                        '#d62728',  # 赤
+                        '#9467bd',  # 紫
+                        '#8c564b',  # 茶色
+                        '#e377c2',  # ピンク
+                        '#7f7f7f',  # グレー
+                        '#bcbd22',  # オリーブ
+                        '#17becf'   # シアン
+                    ]
+                    
+                    # 各トレースに色を適用
+                    for i, trace in enumerate(fig_radar.data):
+                        trace.update(
+                            line=dict(
+                                width=2.5,
+                                color=colors[i % len(colors)]
+                            ),
+                            marker=dict(
+                                size=6,
+                                color=colors[i % len(colors)],
+                                line=dict(width=1, color='black')
+                            ),
+                            opacity=0.8
+                        )
+                    
                     # レイアウトの調整
                     fig_radar.update_layout(
                         title={
                             'text': f"{strategy} - 評価メトリクスの比較",
                             'x': 0.5,
                             'xanchor': 'center',
-                            'font': {'size': 18, 'family': 'IPAexGothic'}
+                            'y': 0.95,  # 上部に余白を確保
+                            'yanchor': 'top',
+                            'font': {
+                                'size': 20,
+                                'family': japanese_font,
+                                'color': '#333333'
+                            }
                         },
                         polar=dict(
                             radialaxis=dict(
                                 visible=True,
                                 range=[0, 1],
-                                tickfont=dict(size=10, family='IPAexGothic'),
+                                tickfont=dict(size=11, family=japanese_font, color='#555555'),
                                 tickangle=0,
                                 tickformat='.1f',
-                                gridwidth=1
+                                gridwidth=1,
+                                gridcolor='lightgray',
+                                linecolor='gray',
+                                linewidth=1,
+                                showline=True
                             ),
                             angularaxis=dict(
                                 rotation=90,
                                 direction='clockwise',
-                                tickfont=dict(size=12, family='IPAexGothic'),
-                                gridwidth=1
+                                tickfont=dict(size=12, family=japanese_font, color='#333333'),
+                                gridwidth=1,
+                                gridcolor='lightgray',
+                                linecolor='gray',
+                                linewidth=1,
+                                showline=True
                             ),
-                            bgcolor='rgba(0,0,0,0.02)'
+                            bgcolor='rgba(250, 250, 250, 0.8)'
                         ),
                         showlegend=True,
                         legend=dict(
                             orientation='h',
-                            yanchor='bottom',
-                            y=1.15,
+                            yanchor='top',
+                            y=-0.15,  # 下側に配置
                             xanchor='center',
                             x=0.5,
-                            font=dict(size=12, family='IPAexGothic')
+                            font=dict(size=12, family=japanese_font, color='#333333'),
+                            bgcolor='rgba(255, 255, 255, 0.8)',
+                            bordercolor='#DDDDDD',
+                            borderwidth=1,
+                            itemclick=False,
+                            itemdoubleclick=False
                         ),
-                        margin=dict(l=60, r=60, t=100, b=60),
-                        height=500,
-                        paper_bgcolor='rgba(0,0,0,0)',
-                        plot_bgcolor='rgba(0,0,0,0)',
-                        font=dict(family='IPAexGothic')
+                        margin=dict(l=80, r=80, t=120, b=150),  # 下部の余白を増やして凡例用のスペースを確保
+                        height=600,  # 高さを少し増やして余裕を持たせる
+                        paper_bgcolor='white',
+                        plot_bgcolor='white',
+                        font=dict(family=japanese_font, color='#333333'),
+                        hoverlabel=dict(
+                            font_size=12,
+                            font_family=japanese_font
+                        )
+                    )
+                    
+                    # グリッド線を追加
+                    fig_radar.update_polars(
+                        radialaxis=dict(
+                            showgrid=True,
+                            gridcolor='lightgray',
+                            gridwidth=1,
+                            showline=True,
+                            linecolor='gray',
+                            linewidth=1
+                        ),
+                        angularaxis=dict(
+                            showgrid=True,
+                            gridcolor='lightgray',
+                            gridwidth=1,
+                            showline=True,
+                            linecolor='gray',
+                            linewidth=1
+                        )
                     )
                     
                     # 画像として保存
