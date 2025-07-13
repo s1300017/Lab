@@ -216,6 +216,7 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                     texttemplate='%{x:.3f}',
                     textposition='outside',
                     hovertemplate='<b>%{y}</b><br>スコア: %{x:.3f}<extra></extra>',
+                    textfont=dict(size=12, family=japanese_font, color='#333333'),
                 )
                 
                 # レイアウトの調整
@@ -224,14 +225,67 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                         'text': f"{model_name} - チャンク戦略別パフォーマンス",
                         'x': 0.5,
                         'xanchor': 'center',
-                        'font': {'size': 18}
+                        'y': 0.95,
+                        'yanchor': 'top',
+                        'font': {
+                            'size': 18,
+                            'family': japanese_font,
+                            'color': '#333333'
+                        }
                     },
-                    xaxis=dict(range=[0, 1.1]),
+                    xaxis=dict(
+                        range=[0, 1.1],
+                        title=dict(
+                            text='平均スコア',
+                            font=dict(
+                                size=14,
+                                family=japanese_font
+                            )
+                        ),
+                        tickfont=dict(
+                            size=12,
+                            family=japanese_font
+                        ),
+                        showgrid=True,
+                        gridwidth=1,
+                        gridcolor='rgba(0, 0, 0, 0.1)',
+                        showline=True,
+                        linewidth=1,
+                        linecolor='gray',
+                        automargin=True
+                    ),
+                    yaxis=dict(
+                        title=dict(
+                            text='チャンク戦略',
+                            font=dict(
+                                size=14,
+                                family=japanese_font
+                            )
+                        ),
+                        tickfont=dict(
+                            size=12,
+                            family=japanese_font
+                        ),
+                        autorange="reversed",
+                        automargin=True,
+                        showline=True,
+                        linewidth=1,
+                        linecolor='gray'
+                    ),
                     coloraxis_showscale=False,
-                    height=400,
-                    margin=dict(l=100, r=40, t=100, b=40),
-                    yaxis=dict(autorange="reversed"),
-                    font=dict(size=14, family="IPAexGothic")
+                    height=500,
+                    margin=dict(l=120, r=50, t=120, b=80),  # 左マージンを増やして縦軸ラベルのため
+                    font=dict(
+                        size=14,
+                        family=japanese_font,
+                        color='#333333'
+                    ),
+                    plot_bgcolor='white',
+                    paper_bgcolor='white',
+                    hoverlabel=dict(
+                        font_size=12,
+                        font_family=japanese_font
+                    )
                 )
                 
                 # 画像として保存
