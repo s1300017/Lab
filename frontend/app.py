@@ -407,13 +407,29 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                             # 各メトリクスの平均値を計算
                             r_values = [model_strategy_data[m].mean() if m in model_strategy_data.columns else 0.5 for m in metrics]
                             
+                            # 各点に表示するテキストを準備（値とパーセンテージ）
+                            text_values = [f'{v:.2f}' for v in r_values]
+                            
+                            # レーダーチャートにトレースを追加
                             fig_radar.add_trace(go.Scatterpolar(
                                 r=r_values,
                                 theta=metrics_jp,
                                 fill='toself',
                                 name=model_name,
-                                hovertemplate='%{theta}: %{r:.2f}<extra></extra>',
-                                line=dict(width=2)
+                                text=text_values,
+                                textposition='top center',
+                                textfont=dict(
+                                    size=11,
+                                    color='black',
+                                    family=japanese_font
+                                ),
+                                hovertemplate='<b>%{theta}</b><br>スコア: %{r:.2f}<extra></extra>',
+                                line=dict(width=2),
+                                mode='lines+markers+text',
+                                marker=dict(
+                                    size=6,
+                                    opacity=0.8
+                                )
                             ))
                     
                         # カラーパレットを定義（視認性の高い色を選択）
@@ -430,18 +446,42 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                         '#17becf'   # シアン
                     ]
                     
-                    # 各トレースに色を適用
+                    # 各トレースに色を適用し、テキストの表示位置を調整
                     for i, trace in enumerate(fig_radar.data):
+                        # 各点の角度に基づいてテキストの位置をずらす
+                        text_positions = []
+                        for j, theta in enumerate(trace.theta):
+                            # 角度に基づいて位置を調整（0-360度を0-11のインデックスにマッピング）
+                            angle = (j * 30) % 360  # 30度刻みで配置（12方向）
+                            
+                            # 角度に応じた位置を設定
+                            if 15 <= angle < 165:  # 右側
+                                pos = 'top center'
+                            elif 195 <= angle < 345:  # 左側
+                                pos = 'bottom center'
+                            else:  # 上下
+                                pos = 'middle right' if angle < 180 else 'middle left'
+                                
+                            text_positions.append(pos)
+                        
                         trace.update(
                             line=dict(
                                 width=2.5,
                                 color=colors[i % len(colors)]
                             ),
                             marker=dict(
-                                size=6,
+                                size=8,  # マーカーを少し大きく
                                 color=colors[i % len(colors)],
-                                line=dict(width=1, color='black')
+                                line=dict(width=1, color='black'),
+                                opacity=0.9
                             ),
+                            textposition=text_positions,  # 動的に設定した位置を使用
+                            textfont=dict(
+                                size=10,  # テキストサイズを少し小さく
+                                color='black',
+                                family=japanese_font
+                            ),
+                            mode='lines+markers+text',
                             opacity=0.8
                         )
                     
