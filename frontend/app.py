@@ -489,100 +489,418 @@ with tab2:
     else:
         st.info("評価結果がありません。上記のフォームから評価を実行してください。")
 
-# タブ3: 一括評価
+# 一括評価タブ
 with tab3:
-    if 'uploaded_file_bytes' not in st.session_state:
-        st.warning("PDFをアップロードしてください。")
-        st.stop()
-        
     st.header("一括評価")
-    
-    if 'bulk_evaluation_results' in st.session_state and st.session_state.bulk_evaluation_results:
-        st.subheader("一括評価結果")
-        st.json(st.session_state.bulk_evaluation_results)
-    else:
-        st.info("一括評価結果がありません。一括評価を実行してください。")
-    
-    if st.button("一括評価を実行", key="bulk_evaluate_button_1"):
-        with st.spinner("一括評価を実行中... これには数分かかる場合があります。"):
-            try:
-                response = requests.post(f"{BACKEND_URL}/bulk_evaluate/")
-                if response.status_code == 200:
-                    st.session_state.bulk_evaluation_results = response.json()
-                    st.success("一括評価が完了しました！")
-                    st.rerun()
-                else:
-                    st.error(f"一括評価の実行中にエラーが発生しました: {response.text}")
-            except Exception as e:
-                st.error(f"一括評価の実行中にエラーが発生しました: {str(e)}")
+    st.markdown("Embeddingモデル・チャンク分割方式・サイズ・オーバーラップの全組み合わせで一括自動評価を行います。")
 
-# タブ4: 比較
-# チャットボットタブ
-with tab_chatbot:
-    st.header("チャットボット")
-    
-    # チャット履歴の初期化
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = []
-    
-    # チャットメッセージの表示
-    for message in st.session_state.chat_messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-    
-    # チャット入力
-    if prompt := st.chat_input("メッセージを入力..."):
-        # ユーザーメッセージを表示
-        st.session_state.chat_messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        
-        # 選択されたモデルで応答を生成
-        response_text = ""
-        with st.chat_message("assistant"):
-            try:
-                if not os.getenv("OPENAI_API_KEY"):
-                    st.error("APIキーが設定されていません。.envファイルにOPENAI_API_KEYを設定してください。")
-                    response_text = "APIキーが設定されていません。設定を確認してください。"
-                
-                # プロンプトを準備
-                messages = [{"role": "system", "content": "あなたは親切で役立つアシスタントです。"}]
-                messages.extend([{"role": m["role"], "content": m["content"]} for m in st.session_state.chat_messages])
-                
-                # モデルに応じてAPIを呼び出し
-                if st.session_state.chat_model in ["gpt-4o-mini", "gpt-3.5-turbo"]:
-                    # OpenAI APIを使用
-                    api_key = os.getenv("OPENAI_API_KEY")
-                    if not api_key:
-                        response_text = "エラー: APIキーが設定されていません。"
-                    else:
-                        try:
-                            client = OpenAI(api_key=api_key)
-                            response = client.chat.completions.create(
-                                model=st.session_state.chat_model,
-                                messages=messages,
-                                temperature=0.7,
-                                max_tokens=1000
-                            )
-                            response_text = response.choices[0].message.content
-                        except Exception as e:
-                            response_text = f"APIエラーが発生しました: {str(e)}"
+    # Embeddingモデルの複数選択
+    embedding_options = {
+        "bge-small（ローカル高速）": "huggingface_bge_small",
+        "MiniLM（軽量・多言語）": "huggingface_miniLM",
+        "OpenAI": "openai",
+    }
+    embedding_labels = list(embedding_options.keys())
+    embedding_values = list(embedding_options.values())
+    # デフォルトでbge-smallを選択
+    selected_labels = st.multiselect(
+        "Embeddingモデルを選択",
+        embedding_labels,
+        default=[embedding_labels[0]],
+        key="bulk_embeddings_tab3"
+    )
+    selected_embeddings = [embedding_options[label] for label in selected_labels]
+
+    # チャンク分割方式・パラメータ複数選択
+    chunk_methods = st.multiselect(
+        "チャンク分割方式を選択",
+        ["fixed", "recursive", "semantic", "sentence", "paragraph"],
+        default=["fixed", "recursive", "semantic"]
+    )
+    chunk_sizes = st.multiselect(
+        "チャンクサイズ（文字数）",
+        [128, 256, 500, 1000, 1500, 2000],
+        default=[500, 1000]
+    )
+    chunk_overlaps = st.multiselect(
+        "オーバーラップ（文字数）",
+        [0, 32, 64, 100, 200, 300],
+        default=[0, 100, 200]
+    )
+    st.caption("※Embeddingモデル・チャンク分割方式・サイズ・オーバーラップの全組み合わせで自動一括評価を実行します")
+
+    if st.button("一括評価を実行", key="bulk_evaluate_button_2"):
+        # テキストがアップロードされているか確認
+        if not st.session_state.get("text"):
+            st.error("評価を実行するには、まずドキュメントをアップロードしてください。")
+            st.stop()
+            
+        with st.spinner("一括評価を実行中..."):
+            import concurrent.futures
+            from concurrent.futures import ThreadPoolExecutor
+            import time
+            
+            bulk_results = []
+            invalid_combinations = []
+            valid_combinations = []
+            
+            # 有効な組み合わせのみ抽出
+            for method in chunk_methods:
+                if method in ["fixed", "recursive", "semantic"]:
+                    for size in chunk_sizes:
+                        for overlap in chunk_overlaps:
+                            if size > overlap:
+                                valid_combinations.append((method, size, overlap))
+                            else:
+                                invalid_combinations.append((method, size, overlap))
                 else:
-                    # 無料モデルの場合（例としての実装）
-                    response_text = f"{st.session_state.chat_model} からの応答: あなたのメッセージ「{prompt}」を受け取りました。\n\n（注: 無料モデルの場合はダミー応答です）"
+                    # size/overlapを使わない方式は一度だけNoneで追加
+                    valid_combinations.append((method, None, None))
+            
+            if not valid_combinations:
+                st.error("有効なチャンク戦略の組み合わせがありません。chunk_size > overlap となるように選択してください。")
+                st.stop()
+            
+            if invalid_combinations:
+                st.warning(f"chunk_size <= overlap となる不正な組み合わせは自動的に除外しました: {invalid_combinations}")
+            
+            # 進捗バー、テキスト表示、ステータス表示の設定
+            progress_bar = st.progress(0)
+            progress_text = st.empty()
+            status_display = st.empty()
+            total_tasks = len(selected_embeddings) * len(valid_combinations)
+            
+            # 完了タスク数を追跡するためのリスト（ミュータブルなオブジェクト）
+            completed_tasks = [0]
+            
+            # 評価用のヘルパー関数
+            def evaluate_single(emb, method, size, overlap):
+                try:
+                    # テキストの存在を再確認
+                    text = st.session_state.get("text")
+                    qa_questions = st.session_state.get("qa_questions", [])
+                    qa_answers = st.session_state.get("qa_answers", [])
+                    
+                    if not text:
+                        st.error("評価対象のテキストが見つかりません。")
+                        return None
+                        
+                    if not qa_questions or not qa_answers:
+                        st.error("評価を実行するには、Q&Aを設定してください。")
+                        return None
+                        
+                    payload = {
+                        "embedding_model": emb,
+                        "chunk_methods": [method],
+                        "chunk_sizes": [size] if size is not None else [1000],
+                        "chunk_overlaps": [overlap] if overlap is not None else [200],
+                        "text": text,
+                        "questions": qa_questions,
+                        "answers": qa_answers,
+                    }
+                    
+                    response = requests.post(
+                        f"{BACKEND_URL}/bulk_evaluate/", 
+                        json=payload, 
+                        timeout=300
+                    )
+                    
+                    completed_tasks[0] += 1
+                    progress_bar.progress(min(completed_tasks[0] / total_tasks, 1.0))
+                    progress_text.text(f"完了: {completed_tasks[0]} / {total_tasks} 件")
+                    
+                    if response.status_code == 200:
+                        return response.json()
+                    else:
+                        st.error("評価に失敗しました。詳細:")
+                        st.json({
+                            "status_code": response.status_code,
+                            "error": response.text,
+                            "request_payload": payload
+                        })
+                        return None
+                        
+                except requests.exceptions.RequestException as e:
+                    st.error(f"APIリクエストエラー: {str(e)}")
+                    return None
+                except json.JSONDecodeError as e:
+                    st.error(f"JSONデコードエラー: {str(e)}")
+                    return None
+                except Exception as e:
+                    st.error(f"予期せぬエラーが発生しました: {str(e)}")
+                    import traceback
+                    st.text(traceback.format_exc())
+                    return None
+            
+            # デバッグ用: 並列処理を一時的に無効化
+            bulk_results = []
+            
+            try:
+                for emb in selected_embeddings:
+                    for method, size, overlap in valid_combinations:
+                        # 現在の評価ステータスを表示
+                        status_display.info(f"評価中: {emb}, {method}, size={size}, overlap={overlap}")
+                        
+                        # 評価を実行
+                        result = evaluate_single(emb, method, size, overlap)
+                        
+                        if result:
+                            bulk_results.append(result)
+                            status_display.success(f"完了: {emb}, {method}, size={size}, overlap={overlap}")
+                        else:
+                            status_display.warning(f"スキップ: {emb}, {method}, size={size}, overlap={overlap}")
+                        
+                        # 少し待機（UIの更新のため）
+                        import time
+                        time.sleep(0.1)
                 
-                st.markdown(response_text)
+                # 最終的な進捗表示
+                progress_text.success(f"完了: {total_tasks} / {total_tasks} 件")
                 
-                # アシスタントのメッセージを履歴に追加
-                st.session_state.chat_messages.append({"role": "assistant", "content": response_text})
+                # 進捗バーを100%に
+                progress_bar.progress(1.0)
                 
+                # 最終的なサマリを表示
+                if bulk_results:
+                    status_display.success(f"評価が完了しました！ (成功: {len(bulk_results)}件)")
+                else:
+                    status_display.error("評価が完了しましたが、有効な結果は得られませんでした。")
             except Exception as e:
-                error_msg = f"エラーが発生しました: {str(e)}"
-                st.error(error_msg)
-                st.session_state.chat_messages.append({"role": "assistant", "content": error_msg})
+                status_display.error(f"評価中にエラーが発生しました: {str(e)}")
+            
+            # 結果をセッションに保存
+            if bulk_results:
+                try:
+                    # 結果がリストのリストの場合にフラット化
+                    flat_results = []
+                    for result in bulk_results:
+                        if isinstance(result, list):
+                            flat_results.extend(result)
+                        else:
+                            flat_results.append(result)
+                    
+                    st.session_state.bulk_evaluation_results = flat_results
+                except Exception as e:
+                    status_display.error(f"結果の処理中にエラーが発生しました: {str(e)}")
+            else:
+                status_display.error("一括評価に失敗しました。APIレスポンスをご確認ください。")
+                
+            # 結果の詳細はデバッグ用にコンソールに出力
+            if bulk_results:
+                print("\n=== 評価結果サマリ ===")
+                print(f"成功: {len(bulk_results)}件")
+                for i, result in enumerate(bulk_results, 1):
+                    print(f"\n--- 結果 {i} ---")
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    if st.session_state.bulk_evaluation_results:
+        st.subheader("一括評価結果")
+        st.write("一括評価APIの返却内容:", st.session_state.bulk_evaluation_results)  # 返却内容を確認用に表示
+
+        # 結果をDataFrameに変換
+        eval_results = st.session_state.bulk_evaluation_results
+        if isinstance(eval_results, list):
+            results_df = pd.DataFrame(eval_results)
+        else:
+            results_df = pd.DataFrame([eval_results])
         
-        # 画面を更新
-        st.rerun()
+        # 必要カラム補完・ラベル列追加
+        required_cols = {
+            'avg_chunk_len', 'num_chunks', 'overall_score', 'chunk_strategy', 'embedding_model',
+            'faithfulness', 'answer_relevancy', 'context_recall', 'context_precision', 'answer_correctness'
+        }
+        missing_cols = required_cols - set(results_df.columns)
+        
+        if 'chunk_method' in results_df.columns and 'chunk_strategy' not in results_df.columns:
+            results_df['chunk_strategy'] = results_df['chunk_method']
+            st.info('chunk_strategy列をchunk_methodから補完しました')
+        
+        if len(results_df) > 0:
+            # 不足カラムの補完
+            if missing_cols:
+                st.info(f'バブルチャート用のカラムが不足しています: {missing_cols}。自動で仮値を補完します。')
+                for col in missing_cols:
+                    if col == 'chunk_strategy':
+                        results_df[col] = 'unknown'
+                    else:
+                        results_df[col] = 0.0
+            
+            # ラベル列を追加（chunk_sizeがあれば含める）
+            if 'chunk_size' in results_df.columns:
+                results_df['label'] = results_df['chunk_strategy'] + '-' + results_df['chunk_size'].astype(str)
+            else:
+                results_df['label'] = results_df['chunk_strategy']
+            
+            # メトリクスとその日本語ラベルを定義
+            metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
+            metrics_jp = ["信頼性", "回答の関連性", "コンテキストの再現性", "コンテキストの正確性", "回答の正確性"]
+            
+            # モデルごとにデータをグループ化
+            if 'embedding_model' in results_df.columns:
+                model_groups = list(results_df.groupby('embedding_model'))
+            else:
+                model_groups = [('default', results_df)]
+
+            # モデルごとにバブルチャートを表示
+            for model_name, model_data in model_groups:
+                if not model_data.empty and 'chunk_size' in model_data.columns and 'overall_score' in model_data.columns:
+                    # バブルチャートの作成
+                    fig_bubble = px.scatter(
+                        model_data,
+                        x="num_chunks",
+                        y="avg_chunk_len",
+                        size=[min(s * 20, 50) for s in model_data["overall_score"]],
+                        color="overall_score",
+                        hover_name=model_data['chunk_strategy'] + '-' + model_data['chunk_size'].astype(str),
+                        text=model_data['chunk_strategy'],
+                        title=f"{model_name} - チャンク分布とパフォーマンス",
+                        labels={
+                            "num_chunks": "チャンク数",
+                            "avg_chunk_len": "平均チャンクサイズ (文字数)",
+                            "overall_score": "総合スコア"
+                        },
+                        color_continuous_scale=px.colors.sequential.Viridis,
+                        color_continuous_midpoint=0.5,
+                    )
+                    
+                    # バブルチャートのスタイルを更新
+                    fig_bubble.update_traces(
+                        textposition='middle center',
+                        textfont=dict(size=12, color='white', family='Arial'),
+                        marker=dict(line=dict(width=1, color='DarkSlateGrey'), opacity=0.8),
+                        hovertemplate=
+                        '<b>%{hovertext}</b><br>' +
+                        'チャンク数: %{x}<br>' +
+                        '平均サイズ: %{y}文字<br>' +
+                        'スコア: %{marker.color:.2f}<extra></extra>',
+                    )
+                    
+                    fig_bubble.update_layout(
+                        title={
+                            'text': f"{model_name} - チャンク分布とパフォーマンス",
+                            'x': 0.5,
+                            'xanchor': 'center'
+                        },
+                        coloraxis_colorbar=dict(title="スコア"),
+                        font=dict(size=14),
+                        height=500,
+                        margin=dict(l=40, r=40, t=80, b=40)
+                    )
+                    
+                    st.plotly_chart(fig_bubble, use_container_width=True)
+                    st.markdown('<br>', unsafe_allow_html=True)
+            
+            # モデルごとにバーチャートを表示
+            for model_name, model_data in model_groups:
+                if not model_data.empty and 'chunk_strategy' in model_data.columns and 'overall_score' in model_data.columns:
+                    # チャンク戦略ごとのパフォーマンスを集計
+                    strategy_scores = model_data.groupby('chunk_strategy')['overall_score'].mean().sort_values(ascending=False)
+                    
+                    # バーチャートの作成
+                    fig_bar = px.bar(
+                        x=strategy_scores.values,
+                        y=strategy_scores.index,
+                        orientation='h',
+                        title=f"{model_name} - チャンク戦略別パフォーマンス",
+                        labels={'x': '平均スコア', 'y': 'チャンク戦略'},
+                        color=strategy_scores.values,
+                        color_continuous_scale=px.colors.sequential.Viridis,
+                    )
+                    
+                    # バーの上にスコアを表示
+                    fig_bar.update_traces(
+                        texttemplate='%{x:.3f}',
+                        textposition='outside',
+                        hovertemplate='<b>%{y}</b><br>スコア: %{x:.3f}<extra></extra>',
+                    )
+                    
+                    # レイアウトの調整
+                    fig_bar.update_layout(
+                        title={
+                            'text': f"{model_name} - チャンク戦略別パフォーマンス",
+                            'x': 0.5,
+                            'xanchor': 'center',
+                            'font': {'size': 18}
+                        },
+                        xaxis=dict(range=[0, 1.1]),
+                        coloraxis_showscale=False,
+                        height=400,
+                        margin=dict(l=100, r=40, t=100, b=40),
+                        yaxis=dict(autorange="reversed"),
+                        font=dict(size=14)
+                    )
+                    
+                    # バーチャートを表示
+                    st.plotly_chart(fig_bar, use_container_width=True)
+                    st.markdown('<br>', unsafe_allow_html=True)
+            
+            # チャンク戦略ごとにレーダーチャートを表示
+            if 'chunk_strategy' in results_df.columns:
+                chunk_strategies = results_df['chunk_strategy'].unique()
+                
+                for strategy in chunk_strategies:
+                    strategy_data = results_df[results_df['chunk_strategy'] == strategy]
+                    
+                    if not strategy_data.empty:
+                        st.subheader(f"{strategy} - 評価メトリクスの比較")
+                        fig_radar = go.Figure()
+                        
+                        # 各モデルのデータを追加
+                        for model_name, model_data in model_groups:
+                            model_strategy_data = strategy_data[strategy_data['embedding_model'] == model_name] if 'embedding_model' in strategy_data.columns else strategy_data
+                            
+                            if not model_strategy_data.empty:
+                                # 各メトリクスの平均値を計算
+                                r_values = [model_strategy_data[m].mean() if m in model_strategy_data.columns else 0.5 for m in metrics]
+                                
+                                fig_radar.add_trace(go.Scatterpolar(
+                                    r=r_values,
+                                    theta=metrics_jp,
+                                    fill='toself',
+                                    name=model_name,
+                                    hovertemplate='%{theta}: %{r:.2f}<extra></extra>',
+                                    line=dict(width=2)
+                                ))
+                        
+                        # レイアウトの調整
+                        fig_radar.update_layout(
+                            polar=dict(
+                                radialaxis=dict(
+                                    visible=True,
+                                    range=[0, 1],
+                                    tickfont=dict(size=10),
+                                    tickangle=0,
+                                    tickformat='.1f',
+                                    gridwidth=1
+                                ),
+                                angularaxis=dict(
+                                    rotation=90,
+                                    direction='clockwise',
+                                    tickfont=dict(size=12),
+                                    gridwidth=1
+                                ),
+                                bgcolor='rgba(0,0,0,0.02)'
+                            ),
+                            showlegend=True,
+                            legend=dict(
+                                orientation='h',
+                                yanchor='bottom',
+                                y=1.15,
+                                xanchor='center',
+                                x=0.5,
+                                font=dict(size=12)
+                            ),
+                            margin=dict(l=60, r=60, t=30, b=60),  # 上部マージンを小さく調整
+                            height=500,
+                            paper_bgcolor='rgba(0,0,0,0)',
+                            plot_bgcolor='rgba(0,0,0,0)'
+                        )
+                        
+                        st.plotly_chart(fig_radar, use_container_width=True)
+                        st.markdown('<br>', unsafe_allow_html=True)
+            
+            # 結果をDataFrameに変換
+        results_df = pd.DataFrame(st.session_state.bulk_evaluation_results)
 
 with tab4:
     if 'uploaded_file_bytes' not in st.session_state:
@@ -781,789 +1099,69 @@ with tab4:
             else:
                 st.warning("評価指標が見つかりません。評価APIの返却内容をご確認ください。")
 
-    with tab3:
-        st.header("一括評価")
-        st.markdown("Embeddingモデル・チャンク分割方式・サイズ・オーバーラップの全組み合わせで一括自動評価を行います。")
-
-        # Embeddingモデルの複数選択
-        embedding_options = {
-            "bge-small（ローカル高速）": "huggingface_bge_small",
-            "MiniLM（軽量・多言語）": "huggingface_miniLM",
-            "OpenAI": "openai",
-        }
-        embedding_labels = list(embedding_options.keys())
-        embedding_values = list(embedding_options.values())
-        # デフォルトでbge-smallを選択
-        selected_labels = st.multiselect(
-            "Embeddingモデルを選択",
-            embedding_labels,
-            default=[embedding_labels[0]],
-            key="bulk_embeddings_tab3"
-        )
-        selected_embeddings = [embedding_options[label] for label in selected_labels]
-
-        # チャンク分割方式・パラメータ複数選択
-        chunk_methods = st.multiselect(
-            "チャンク分割方式を選択",
-            ["fixed", "recursive", "semantic", "sentence", "paragraph"],
-            default=["fixed", "recursive", "semantic"]
-        )
-        chunk_sizes = st.multiselect(
-            "チャンクサイズ（文字数）",
-            [128, 256, 500, 1000, 1500, 2000],
-            default=[500, 1000]
-        )
-        chunk_overlaps = st.multiselect(
-            "オーバーラップ（文字数）",
-            [0, 32, 64, 100, 200, 300],
-            default=[0, 100, 200]
-        )
-        st.caption("※Embeddingモデル・チャンク分割方式・サイズ・オーバーラップの全組み合わせで自動一括評価を実行します")
-
-        if st.button("一括評価を実行", key="bulk_evaluate_button_2"):
-            # テキストがアップロードされているか確認
-            if not st.session_state.get("text"):
-                st.error("評価を実行するには、まずドキュメントをアップロードしてください。")
-                st.stop()
-                
-            with st.spinner("一括評価を実行中..."):
-                import concurrent.futures
-                from concurrent.futures import ThreadPoolExecutor
-                import time
-                
-                bulk_results = []
-                invalid_combinations = []
-                valid_combinations = []
-                
-                # 有効な組み合わせのみ抽出
-                for method in chunk_methods:
-                    if method in ["fixed", "recursive", "semantic"]:
-                        for size in chunk_sizes:
-                            for overlap in chunk_overlaps:
-                                if size > overlap:
-                                    valid_combinations.append((method, size, overlap))
-                                else:
-                                    invalid_combinations.append((method, size, overlap))
-                    else:
-                        # size/overlapを使わない方式は一度だけNoneで追加
-                        valid_combinations.append((method, None, None))
-                
-                if not valid_combinations:
-                    st.error("有効なチャンク戦略の組み合わせがありません。chunk_size > overlap となるように選択してください。")
-                    st.stop()
-                
-                if invalid_combinations:
-                    st.warning(f"chunk_size <= overlap となる不正な組み合わせは自動的に除外しました: {invalid_combinations}")
-                
-                # 進捗バー、テキスト表示、ステータス表示の設定
-                progress_bar = st.progress(0)
-                progress_text = st.empty()
-                status_display = st.empty()
-                total_tasks = len(selected_embeddings) * len(valid_combinations)
-                
-                # 完了タスク数を追跡するためのリスト（ミュータブルなオブジェクト）
-                completed_tasks = [0]
-                
-                # 評価用のヘルパー関数
-                def evaluate_single(emb, method, size, overlap):
-                    try:
-                        # テキストの存在を再確認
-                        text = st.session_state.get("text")
-                        qa_questions = st.session_state.get("qa_questions", [])
-                        qa_answers = st.session_state.get("qa_answers", [])
-                        
-                        if not text:
-                            st.error("評価対象のテキストが見つかりません。")
-                            return None
-                            
-                        if not qa_questions or not qa_answers:
-                            st.error("評価を実行するには、Q&Aを設定してください。")
-                            return None
-                            
-                        payload = {
-                            "embedding_model": emb,
-                            "chunk_methods": [method],
-                            "chunk_sizes": [size] if size is not None else [1000],
-                            "chunk_overlaps": [overlap] if overlap is not None else [200],
-                            "text": text,
-                            "questions": qa_questions,
-                            "answers": qa_answers,
-                        }
-                        
-                        response = requests.post(
-                            f"{BACKEND_URL}/bulk_evaluate/", 
-                            json=payload, 
-                            timeout=300
-                        )
-                        
-                        completed_tasks[0] += 1
-                        progress_bar.progress(min(completed_tasks[0] / total_tasks, 1.0))
-                        progress_text.text(f"完了: {completed_tasks[0]} / {total_tasks} 件")
-                        
-                        if response.status_code == 200:
-                            return response.json()
-                        else:
-                            st.error("評価に失敗しました。詳細:")
-                            st.json({
-                                "status_code": response.status_code,
-                                "error": response.text,
-                                "request_payload": payload
-                            })
-                            return None
-                            
-                    except requests.exceptions.RequestException as e:
-                        st.error(f"APIリクエストエラー: {str(e)}")
-                        return None
-                    except json.JSONDecodeError as e:
-                        st.error(f"JSONデコードエラー: {str(e)}")
-                        return None
-                    except Exception as e:
-                        st.error(f"予期せぬエラーが発生しました: {str(e)}")
-                        import traceback
-                        st.text(traceback.format_exc())
-                        return None
-                
-                # デバッグ用: 並列処理を一時的に無効化
-                bulk_results = []
-                
-                try:
-                    for emb in selected_embeddings:
-                        for method, size, overlap in valid_combinations:
-                            # 現在の評価ステータスを表示
-                            status_display.info(f"評価中: {emb}, {method}, size={size}, overlap={overlap}")
-                            
-                            # 評価を実行
-                            result = evaluate_single(emb, method, size, overlap)
-                            
-                            if result:
-                                bulk_results.append(result)
-                                status_display.success(f"完了: {emb}, {method}, size={size}, overlap={overlap}")
-                            else:
-                                status_display.warning(f"スキップ: {emb}, {method}, size={size}, overlap={overlap}")
-                            
-                            # 少し待機（UIの更新のため）
-                            import time
-                            time.sleep(0.1)
-                    
-                    # 最終的な進捗表示
-                    progress_text.success(f"完了: {total_tasks} / {total_tasks} 件")
-                    
-                    # 進捗バーを100%に
-                    progress_bar.progress(1.0)
-                    
-                    # 最終的なサマリを表示
-                    if bulk_results:
-                        status_display.success(f"評価が完了しました！ (成功: {len(bulk_results)}件)")
-                    else:
-                        status_display.error("評価が完了しましたが、有効な結果は得られませんでした。")
-                except Exception as e:
-                    status_display.error(f"評価中にエラーが発生しました: {str(e)}")
-                
-                # 結果をセッションに保存
-                if bulk_results:
-                    try:
-                        # 結果がリストのリストの場合にフラット化
-                        flat_results = []
-                        for result in bulk_results:
-                            if isinstance(result, list):
-                                flat_results.extend(result)
-                            else:
-                                flat_results.append(result)
-                        
-                        st.session_state.bulk_evaluation_results = flat_results
-                    except Exception as e:
-                        status_display.error(f"結果の処理中にエラーが発生しました: {str(e)}")
-                else:
-                    status_display.error("一括評価に失敗しました。APIレスポンスをご確認ください。")
-                    
-                # 結果の詳細はデバッグ用にコンソールに出力
-                if bulk_results:
-                    print("\n=== 評価結果サマリ ===")
-                    print(f"成功: {len(bulk_results)}件")
-                    for i, result in enumerate(bulk_results, 1):
-                        print(f"\n--- 結果 {i} ---")
-                        print(json.dumps(result, ensure_ascii=False, indent=2))
-
-        if st.session_state.bulk_evaluation_results:
-            st.subheader("一括評価結果")
-            st.write("一括評価APIの返却内容:", st.session_state.bulk_evaluation_results)  # 返却内容を確認用に表示
-
-            # 結果をDataFrameに変換
-            eval_results = st.session_state.bulk_evaluation_results
-            if isinstance(eval_results, list):
-                results_df = pd.DataFrame(eval_results)
-            else:
-                results_df = pd.DataFrame([eval_results])
-            
-            # 必要カラム補完・ラベル列追加
-            required_cols = {
-                'avg_chunk_len', 'num_chunks', 'overall_score', 'chunk_strategy', 'embedding_model',
-                'faithfulness', 'answer_relevancy', 'context_recall', 'context_precision', 'answer_correctness'
-            }
-            missing_cols = required_cols - set(results_df.columns)
-            
-            if 'chunk_method' in results_df.columns and 'chunk_strategy' not in results_df.columns:
-                results_df['chunk_strategy'] = results_df['chunk_method']
-                st.info('chunk_strategy列をchunk_methodから補完しました')
-            
-            if len(results_df) > 0:
-                # 不足カラムの補完
-                if missing_cols:
-                    st.info(f'バブルチャート用のカラムが不足しています: {missing_cols}。自動で仮値を補完します。')
-                    for col in missing_cols:
-                        if col == 'chunk_strategy':
-                            results_df[col] = 'unknown'
-                        else:
-                            results_df[col] = 0.0
-                
-                # ラベル列を追加（chunk_sizeがあれば含める）
-                if 'chunk_size' in results_df.columns:
-                    results_df['label'] = results_df['chunk_strategy'] + '-' + results_df['chunk_size'].astype(str)
-                else:
-                    results_df['label'] = results_df['chunk_strategy']
-                
-                # メトリクスとその日本語ラベルを定義
-                metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
-                metrics_jp = ["信頼性", "回答の関連性", "コンテキストの再現性", "コンテキストの正確性", "回答の正確性"]
-                
-                # モデルごとにデータをグループ化
-                if 'embedding_model' in results_df.columns:
-                    model_groups = list(results_df.groupby('embedding_model'))
-                else:
-                    model_groups = [('default', results_df)]
-
-                # モデルごとにバブルチャートを表示
-                for model_name, model_data in model_groups:
-                    if not model_data.empty and 'chunk_size' in model_data.columns and 'overall_score' in model_data.columns:
-                        # バブルチャートの作成
-                        fig_bubble = px.scatter(
-                            model_data,
-                            x="num_chunks",
-                            y="avg_chunk_len",
-                            size=[min(s * 20, 50) for s in model_data["overall_score"]],
-                            color="overall_score",
-                            hover_name=model_data['chunk_strategy'] + '-' + model_data['chunk_size'].astype(str),
-                            text=model_data['chunk_strategy'],
-                            title=f"{model_name} - チャンク分布とパフォーマンス",
-                            labels={
-                                "num_chunks": "チャンク数",
-                                "avg_chunk_len": "平均チャンクサイズ (文字数)",
-                                "overall_score": "総合スコア"
-                            },
-                            color_continuous_scale=px.colors.sequential.Viridis,
-                            color_continuous_midpoint=0.5,
-                        )
-                        
-                        # バブルチャートのスタイルを更新
-                        fig_bubble.update_traces(
-                            textposition='middle center',
-                            textfont=dict(size=12, color='white', family='Arial'),
-                            marker=dict(line=dict(width=1, color='DarkSlateGrey'), opacity=0.8),
-                            hovertemplate=
-                            '<b>%{hovertext}</b><br>' +
-                            'チャンク数: %{x}<br>' +
-                            '平均サイズ: %{y}文字<br>' +
-                            'スコア: %{marker.color:.2f}<extra></extra>',
-                        )
-                        
-                        fig_bubble.update_layout(
-                            title={
-                                'text': f"{model_name} - チャンク分布とパフォーマンス",
-                                'x': 0.5,
-                                'xanchor': 'center'
-                            },
-                            coloraxis_colorbar=dict(title="スコア"),
-                            font=dict(size=14),
-                            height=500,
-                            margin=dict(l=40, r=40, t=80, b=40)
-                        )
-                        
-                        st.plotly_chart(fig_bubble, use_container_width=True)
-                        st.markdown('<br>', unsafe_allow_html=True)
-                
-                # モデルごとにバーチャートを表示
-                for model_name, model_data in model_groups:
-                    if not model_data.empty and 'chunk_strategy' in model_data.columns and 'overall_score' in model_data.columns:
-                        # チャンク戦略ごとのパフォーマンスを集計
-                        strategy_scores = model_data.groupby('chunk_strategy')['overall_score'].mean().sort_values(ascending=False)
-                        
-                        # バーチャートの作成
-                        fig_bar = px.bar(
-                            x=strategy_scores.values,
-                            y=strategy_scores.index,
-                            orientation='h',
-                            title=f"{model_name} - チャンク戦略別パフォーマンス",
-                            labels={'x': '平均スコア', 'y': 'チャンク戦略'},
-                            color=strategy_scores.values,
-                            color_continuous_scale=px.colors.sequential.Viridis,
-                        )
-                        
-                        # バーの上にスコアを表示
-                        fig_bar.update_traces(
-                            texttemplate='%{x:.3f}',
-                            textposition='outside',
-                            hovertemplate='<b>%{y}</b><br>スコア: %{x:.3f}<extra></extra>',
-                        )
-                        
-                        # レイアウトの調整
-                        fig_bar.update_layout(
-                            title={
-                                'text': f"{model_name} - チャンク戦略別パフォーマンス",
-                                'x': 0.5,
-                                'xanchor': 'center',
-                                'font': {'size': 18}
-                            },
-                            xaxis=dict(range=[0, 1.1]),
-                            coloraxis_showscale=False,
-                            height=400,
-                            margin=dict(l=100, r=40, t=100, b=40),
-                            yaxis=dict(autorange="reversed"),
-                            font=dict(size=14)
-                        )
-                        
-                        # バーチャートを表示
-                        st.plotly_chart(fig_bar, use_container_width=True)
-                        st.markdown('<br>', unsafe_allow_html=True)
-                
-                # チャンク戦略ごとにレーダーチャートを表示
-                if 'chunk_strategy' in results_df.columns:
-                    chunk_strategies = results_df['chunk_strategy'].unique()
-                    
-                    for strategy in chunk_strategies:
-                        strategy_data = results_df[results_df['chunk_strategy'] == strategy]
-                        
-                        if not strategy_data.empty:
-                            st.subheader(f"{strategy} - 評価メトリクスの比較")
-                            fig_radar = go.Figure()
-                            
-                            # 各モデルのデータを追加
-                            for model_name, model_data in model_groups:
-                                model_strategy_data = strategy_data[strategy_data['embedding_model'] == model_name] if 'embedding_model' in strategy_data.columns else strategy_data
-                                
-                                if not model_strategy_data.empty:
-                                    # 各メトリクスの平均値を計算
-                                    r_values = [model_strategy_data[m].mean() if m in model_strategy_data.columns else 0.5 for m in metrics]
-                                    
-                                    fig_radar.add_trace(go.Scatterpolar(
-                                        r=r_values,
-                                        theta=metrics_jp,
-                                        fill='toself',
-                                        name=model_name,
-                                        hovertemplate='%{theta}: %{r:.2f}<extra></extra>',
-                                        line=dict(width=2)
-                                    ))
-                            
-                            # レイアウトの調整
-                            fig_radar.update_layout(
-                                polar=dict(
-                                    radialaxis=dict(
-                                        visible=True,
-                                        range=[0, 1],
-                                        tickfont=dict(size=10),
-                                        tickangle=0,
-                                        tickformat='.1f',
-                                        gridwidth=1
-                                    ),
-                                    angularaxis=dict(
-                                        rotation=90,
-                                        direction='clockwise',
-                                        tickfont=dict(size=12),
-                                        gridwidth=1
-                                    ),
-                                    bgcolor='rgba(0,0,0,0.02)'
-                                ),
-                                showlegend=True,
-                                legend=dict(
-                                    orientation='h',
-                                    yanchor='bottom',
-                                    y=1.15,
-                                    xanchor='center',
-                                    x=0.5,
-                                    font=dict(size=12)
-                                ),
-                                margin=dict(l=60, r=60, t=30, b=60),  # 上部マージンを小さく調整
-                                height=500,
-                                paper_bgcolor='rgba(0,0,0,0)',
-                                plot_bgcolor='rgba(0,0,0,0)'
-                            )
-                            
-                            st.plotly_chart(fig_radar, use_container_width=True)
-                            st.markdown('<br>', unsafe_allow_html=True)
-                
-                # 結果をDataFrameに変換
-            results_df = pd.DataFrame(st.session_state.bulk_evaluation_results)
-
-# --- モデルごとの比較 ---
-if 'evaluation_results' in st.session_state and st.session_state.evaluation_results:
-    st.subheader("モデルごとの比較")
+# チャットボットタブ
+with tab_chatbot:
+    st.header("チャットボット")
     
-    # 評価結果をDataFrameに変換
-    eval_results = st.session_state.evaluation_results
-    if isinstance(eval_results, list):
-        results_df = pd.DataFrame(eval_results)
-    else:
-        results_df = pd.DataFrame([eval_results])
+    # チャット履歴の初期化
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
     
-    score_metrics = [
-        ("overall_score", "総合スコア(加重平均)"),
-        ("faithfulness", "ファクト整合性"),
-        ("answer_relevancy", "回答関連性"),
-        ("context_recall", "文脈再現率"),
-        ("context_precision", "文脈適合率"),
-        ("answer_correctness", "回答正確性")
-    ]
+    # チャットメッセージの表示
+    for message in st.session_state.chat_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
     
-    for metric, label in score_metrics:
-        if metric in results_df.columns:
-            st.markdown(f"#### {label}：モデル・チャンク戦略別の比較")
-            # 2カラムの幅比率を調整しグラフが広くなるように
-            col1, col2 = st.columns([3,2])  # 左を広めに
-            
-            with col1:
-                st.markdown(f"##### モデルごとに評価方法別の比較")
-                fig1 = px.bar(
-                    results_df,
-                    x="chunk_strategy",
-                    y=metric,
-                    color="embedding_model",
-                    barmode="group",
-                    title=f"{label}：モデルごとに評価方法別の比較",
-                    labels={"chunk_strategy": "評価方法（チャンク方式）", "embedding_model": "モデル", metric: label}
-                )
-                fig1.update_layout(height=600, margin=dict(l=40, r=40, t=80, b=40), legend=dict(font=dict(size=16)))
-                st.plotly_chart(fig1, use_container_width=True)
-                
-                if 'eval_figs' not in st.session_state:
-                    st.session_state['eval_figs'] = []
-                if len(st.session_state['eval_figs']) == 0 or st.session_state['eval_figs'][-1] != fig1:
-                    st.session_state['eval_figs'].append(fig1)
-                
-                st.markdown('<br>', unsafe_allow_html=True)
-            
-            with col2:
-                st.markdown(f"##### 評価方法ごとにモデル別の比較")
-                fig2 = px.bar(
-                    results_df,
-                    x="embedding_model",
-                    y=metric,
-                    color="chunk_strategy",
-                    barmode="group",
-                    title=f"{label}：評価方法ごとにモデル別の比較",
-                    labels={"embedding_model": "モデル", "chunk_strategy": "評価方法（チャンク方式）", metric: label}
-                )
-                # グラフ2も同様にゆとりを持たせる
-                fig2.update_layout(height=600, margin=dict(l=40, r=40, t=80, b=40), legend=dict(font=dict(size=16)))
-                st.plotly_chart(fig2, use_container_width=True)
-                if 'eval_figs' not in st.session_state:
-                    st.session_state['eval_figs'] = []
-                if len(st.session_state['eval_figs']) == 0 or st.session_state['eval_figs'][-1] != fig2:
-                    st.session_state['eval_figs'].append(fig2)
-                st.markdown('<br>', unsafe_allow_html=True)
-            # レーダーチャートや表も既存通り表示
-            fig = go.Figure()
-            for model in results_df['embedding_model'].unique():
-                model_data = results_df[results_df['embedding_model'] == model]
-                fig.add_trace(go.Scatterpolar(
-                    r=[model_data[m].mean() for m in score_metrics[1:]],
-                    theta=[label for _, label in score_metrics[1:]],
-                    fill='toself',
-                    name=model
-                ))
-            fig.update_layout(
-                polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
-                showlegend=True,
-                title=f"{label}：モデルごとのレーダーチャート"
-            )
-            # グラフが潰れないように高さ・マージン・凡例サイズを調整
-            fig.update_layout(height=600, margin=dict(l=40, r=40, t=80, b=40), legend=dict(font=dict(size=16)))
-            st.plotly_chart(fig, use_container_width=True)
-            st.markdown('<br>', unsafe_allow_html=True)
-            
-            # --- 比較表（全指標） ---
-            st.markdown("#### 全指標の比較表")
-            # 日本語ラベル変換用マッピング
-            METRIC_JA = {
-                "overall_score": "総合スコア(加重平均)",
-                "faithfulness": "ファクト整合性",
-                "answer_relevancy": "回答関連性",
-                "context_recall": "文脈再現率",
-                "context_precision": "文脈適合率",
-                "answer_correctness": "回答正確性",
-                "embedding_model": "Embeddingモデル",
-                "chunk_strategy": "チャンク戦略"
-            }
-            results_df_ja = results_df.rename(columns=METRIC_JA)
-            st.dataframe(results_df_ja, use_container_width=True)
-
-        # --- サイドバー：チャンク化のみ実行 ---
-        st.sidebar.markdown("## チャンク分割（プレビュー専用）")
-        chunk_method = st.sidebar.selectbox(
-            "チャンク分割方式を選択",
-            ["fixed", "recursive", "semantic", "sentence", "paragraph"],
-            index=0
-        )
-        chunk_size = st.sidebar.selectbox(
-            "チャンクサイズ（文字数）",
-            [128, 256, 500, 1000, 1500, 2000],
-            index=2
-        ) if chunk_method in ["fixed", "recursive", "semantic"] else None
-        chunk_overlap = st.sidebar.selectbox(
-            "オーバーラップ（文字数）",
-            [0, 32, 64, 100, 200, 300],
-            index=0
-        ) if chunk_method in ["fixed", "recursive", "semantic"] else None
-        if st.sidebar.button("チャンク化を実行", help="選択したパターンでテキストをチャンク化"):
-            # チャンク化API呼び出し
-            import requests
-            BACKEND_URL = st.secrets.get('BACKEND_URL', 'http://localhost:8000')
-            payload = {
-                "chunk_method": chunk_method,
-                "chunk_size": chunk_size,
-                "chunk_overlap": chunk_overlap,
-                "text": st.session_state.get('text', '')
-            }
+    # チャット入力
+    if prompt := st.chat_input("メッセージを入力..."):
+        # ユーザーメッセージを表示
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # 選択されたモデルで応答を生成
+        response_text = ""
+        with st.chat_message("assistant"):
             try:
-                response = requests.post(f"{BACKEND_URL}/chunk_text/", json=payload)
-                if response.status_code == 200:
-                    chunk_result = response.json()
-                    st.session_state['sidebar_chunk_result'] = chunk_result
-                    st.sidebar.success(f"チャンク化成功: {chunk_result.get('num_chunks', 0)}個")
+                if not os.getenv("OPENAI_API_KEY"):
+                    st.error("APIキーが設定されていません。.envファイルにOPENAI_API_KEYを設定してください。")
+                    response_text = "APIキーが設定されていません。設定を確認してください。"
+                
+                # プロンプトを準備
+                messages = [{"role": "system", "content": "あなたは親切で役立つアシスタントです。"}]
+                messages.extend([{"role": m["role"], "content": m["content"]} for m in st.session_state.chat_messages])
+                
+                # モデルに応じてAPIを呼び出し
+                if st.session_state.chat_model in ["gpt-4o-mini", "gpt-3.5-turbo"]:
+                    # OpenAI APIを使用
+                    api_key = os.getenv("OPENAI_API_KEY")
+                    if not api_key:
+                        response_text = "エラー: APIキーが設定されていません。"
+                    else:
+                        try:
+                            client = OpenAI(api_key=api_key)
+                            response = client.chat.completions.create(
+                                model=st.session_state.chat_model,
+                                messages=messages,
+                                temperature=0.7,
+                                max_tokens=1000
+                            )
+                            response_text = response.choices[0].message.content
+                        except Exception as e:
+                            response_text = f"APIエラーが発生しました: {str(e)}"
                 else:
-                    st.sidebar.error(f"チャンク化失敗: {response.text}")
+                    # 無料モデルの場合（例としての実装）
+                    response_text = f"{st.session_state.chat_model} からの応答: あなたのメッセージ「{prompt}」を受け取りました。\n\n（注: 無料モデルの場合はダミー応答です）"
+                
+                st.markdown(response_text)
+                
+                # アシスタントのメッセージを履歴に追加
+                st.session_state.chat_messages.append({"role": "assistant", "content": response_text})
+                
             except Exception as e:
-                st.sidebar.error(f"チャンク化リクエストで例外: {e}")
-
-        # チャンク化結果表示
-        if 'sidebar_chunk_result' in st.session_state:
-            chunk_result = st.session_state['sidebar_chunk_result']
-            st.sidebar.markdown(f"- チャンク数: {chunk_result.get('num_chunks', 0)}")
-            st.sidebar.markdown(f"- 平均チャンク長: {chunk_result.get('avg_chunk_len', 0)}")
-            st.sidebar.markdown("---")
-            st.sidebar.markdown("#### チャンクリスト（先頭5件）")
-            for i, chunk in enumerate(chunk_result.get('chunks', [])[:5]):
-                st.sidebar.markdown(f"**{i+1}**: {chunk[:80]}{'...' if len(chunk)>80 else ''}")
-
-        # --- 一括評価ロジック ---
-        if st.session_state.get('run_bulk_eval', False):
-            with st.spinner("一括評価中...（全パターンを評価しています）"):
-                import requests
-                BACKEND_URL = st.secrets.get('BACKEND_URL', 'http://localhost:8000')
-                payload = {
-                    "embedding_model": st.session_state.get('selected_embedding_model', 'openai'),
-                    "chunk_methods": chunk_methods,
-                    "chunk_sizes": chunk_sizes,
-                    "chunk_overlaps": chunk_overlaps,
-                    # 他の必要なパラメータもここに追加
-                }
-                try:
-                    response = requests.post(f"{BACKEND_URL}/bulk_evaluate/", json=payload)
-                    if response.status_code == 200:
-                        results = response.json()
-                        st.session_state['bulk_eval_results'] = results
-                        st.success("一括評価が完了しました！")
-                    else:
-                        st.error(f"一括評価に失敗: {response.text}")
-                except Exception as e:
-                    st.error(f"一括評価リクエストで例外: {e}")
-                st.session_state['run_bulk_eval'] = False
-
-        # --- 一括評価結果をグラフ・表に反映 ---
-        # --- 一括評価結果の表示部（全指標網羅・日本語ラベル対応）---
-        if 'bulk_eval_results' in st.session_state:
-            import pandas as pd
-            st.markdown("### 一括評価結果（全組み合わせ）")
-            results_df = pd.DataFrame(st.session_state['bulk_eval_results'])
-
-            # 必要な指標カラム一覧
-            required_cols = [
-                "embedding_model", "chunk_method", "chunk_size", "chunk_overlap",
-                "overall_score", "faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness", "avg_chunk_len", "num_chunks"
-            ]
-            # 欠損カラムを0.0で補完
-            missing_cols = [col for col in required_cols if col not in results_df.columns]
-            if missing_cols:
-                st.warning(f"一括評価結果に不足している指標カラムがあります: {missing_cols}。0.0で補完します。バックエンドのバージョンやAPIレスポンスもご確認ください。")
-                for col in missing_cols:
-                    results_df[col] = 0.0
-            # カラム順を統一
-            results_df = results_df[required_cols]
-
-            # --- 日本語ラベル変換 ---
-            METRIC_JA = {
-                "embedding_model": "Embeddingモデル",
-                "chunk_method": "チャンク方式",
-                "chunk_size": "チャンクサイズ",
-                "chunk_overlap": "オーバーラップ",
-                "overall_score": "総合スコア",
-                "faithfulness": "ファクト整合性",
-                "answer_relevancy": "回答関連性",
-                "context_recall": "文脈再現率",
-                "context_precision": "文脈適合率",
-                "answer_correctness": "回答正確性",
-                "avg_chunk_len": "平均チャンク長",
-                "num_chunks": "チャンク数"
-            }
-            results_df_ja = results_df.rename(columns=METRIC_JA)
-
-            # --- DataFrameを日本語ラベルで表示 ---
-            st.dataframe(results_df_ja, use_container_width=True)
-
-            # --- 以降の全グラフ・比較表・PDF出力のデータソースもresults_df_jaに統一 ---
-            # 既存のscore_metricsや比較グラフもresults_df_jaを使う
-            score_metrics = [
-                (col, METRIC_JA.get(col, col)) for col in ["overall_score", "faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
-            ]
-            # グラフ描画
-
-            for metric, label in score_metrics:
-                if metric in results_df.columns:
-                    st.markdown(f"#### {label}：モデル・チャンク戦略・サイズ・オーバーラップ別の比較")
-                    # 2カラムの幅比率を調整しグラフが広くなるように
-                    col1, col2 = st.columns([3,2])  # 左を広めに
-                    with col1:
-                        st.markdown(f"##### モデルごとに評価方法・サイズ・オーバーラップ別の比較")
-                        fig1 = px.bar(
-                            results_df,
-                            x="chunk_method",
-                            y=metric,
-                            color="embedding_model",
-                            barmode="group",
-                            facet_col="chunk_size",
-                            facet_row="chunk_overlap",
-                            title=f"{label}：モデルごとに評価方法・サイズ・オーバーラップ別の比較",
-                            labels={"chunk_method": "チャンク方式", "embedding_model": "モデル", metric: label}
-                        )
-                        # グラフ1も同様にゆとりを持たせる
-                        fig1.update_layout(height=600, margin=dict(l=40, r=40, t=80, b=40), legend=dict(font=dict(size=16)))
-                        st.plotly_chart(fig1, use_container_width=True)
-                        st.markdown('<br>', unsafe_allow_html=True)
-                    with col2:
-                        st.markdown(f"##### 評価方法ごとにモデル・サイズ・オーバーラップ別の比較")
-                        fig2 = px.bar(
-                            results_df,
-                            x="embedding_model",
-                            y=metric,
-                            color="chunk_method",
-                            barmode="group",
-                            facet_col="chunk_size",
-                            facet_row="chunk_overlap",
-                            title=f"{label}：評価方法ごとにモデル・サイズ・オーバーラップ別の比較",
-                            labels={"embedding_model": "モデル", "chunk_method": "チャンク方式", metric: label}
-                        )
-                        # グラフ2も同様にゆとりを持たせる
-                        fig2.update_layout(height=600, margin=dict(l=40, r=40, t=80, b=40), legend=dict(font=dict(size=16)))
-                        st.plotly_chart(fig2, use_container_width=True)
-                        st.markdown('<br>', unsafe_allow_html=True)
-            # 比較表もresults_dfで
-            st.markdown("#### 全指標の比較表（網羅的）")
-            st.dataframe(results_df, use_container_width=True)
-            # PDF出力機能もresults_dfを利用して自動生成
-
-        # --- 操作ボタン ---
-        st.markdown("---")
-        col_btn1, col_btn2, col_btn3 = st.columns(3)
-        with col_btn1:
-            if st.button("再評価・グラフ再描画", help="最新のデータでグラフを再描画します"):
-                st.rerun()
-        with col_btn2:
-            if st.button("全結果をPDF出力（比較レイアウト）", help="全グラフ・比較表をPDFで一括ダウンロード"):
-                st.session_state['pdf_export'] = True
-        with col_btn3:
-            if st.button("比較API実行", help="バックエンド比較APIを呼び出して結果を表示"):
-                st.session_state['run_compare_api'] = True
-
-        # --- PDF一括出力機能 ---
-        if st.session_state.get('pdf_export', False):
-            from fpdf import FPDF
-            import tempfile
-            import plotly.io as pio
-            import os
-            from PIL import Image
-            import io
-            st.info("PDFを生成中...")
-            pdf = FPDF(orientation='L', unit='mm', format='A4')
-            pdf.add_page()
-            pdf.add_font('NotoSansJPVF', '', '/app/fonts/NotoSansJP-VariableFont_wght.ttf', uni=True)
-            pdf.set_font('NotoSansJPVF', '', 14)
-            pdf.cell(0, 10, txt="RAG評価結果 比較レポート", ln=1, align='C')
-            pdf.ln(2)
-            # --- 画面に表示したグラフ（fig）のみPDFへ ---
-            eval_figs = st.session_state.get('eval_figs', [])
-            img_paths = []
-            for fig in eval_figs:
-                # タイトル取得
-                title = fig.layout.title.text if hasattr(fig.layout, 'title') and fig.layout.title.text else ""
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-                    fig.write_image(f.name, format='png', scale=2)
-                    img_paths.append((f.name, None, title))
-
-            for left, right, label in img_paths:
-                pdf.add_page()  # 1ページ1枚配置
-                pdf.set_font('NotoSansJPVF', '', 14)
-                pdf.cell(0, 12, txt=f"{label}", ln=1, align='C')
-                y = pdf.get_y()
-                img_width = pdf.w - 40
-                x_center = (pdf.w - img_width) / 2
-                pdf.image(left, x=x_center, y=y, w=img_width)
-                pdf.ln(img_width * 0.6 + 20)
-
-            pdf.add_page()
-            pdf.set_font('NotoSansJPVF', '', 12)
-            pdf.cell(0, 10, txt="全指標の比較表", ln=1)
-            table_cols = ["embedding_model", "chunk_strategy"] + [m for m, _ in score_metrics]
-            table_df = results_df[table_cols].copy()
-            col_width = (pdf.w - 20) / len(table_df.columns)
-            for col in table_df.columns:
-                pdf.cell(col_width, 8, str(col), border=1)
-            pdf.ln()
-            for _, row in table_df.iterrows():
-                for val in row:
-                    pdf.cell(col_width, 8, str(val), border=1)
-                pdf.ln()
-            for left, right, _ in img_paths:
-                try:
-                    os.remove(left)
-                    os.remove(right)
-                except Exception:
-                    pass
-            pdf_bytes = pdf.output(dest='S').encode('latin1')
-            st.success("PDF生成が完了しました！")
-            st.download_button(
-                label="PDFダウンロード",
-                data=pdf_bytes,
-                file_name="rag_evaluation_report.pdf",
-                mime="application/pdf"
-            )
-            st.session_state['pdf_export'] = False
-
-        # --- 比較タブ ---
-        with tab4:
-            st.header("比較")
-            st.markdown("一括評価結果を比較します。")
-
-            # 比較するモデルと戦略の選択
-            models = ["ollama_llama2", "openai"]
-            strategies = ["rag", "ragas"]
-
-            selected_models = st.multiselect("モデルを選択", models, key="compare_models_tab4_main")
-            selected_strategies = st.multiselect("戦略を選択", strategies, key="compare_strategies_tab4_main")
-        selected_models = st.multiselect("モデルを選択", models, key="compare_models_tab4")
-        selected_strategies = st.multiselect("戦略を選択", strategies, key="compare_strategies_tab4")
-
-        if st.button("評価を実行", key="evaluate_button_compare"):
-            with st.spinner("評価を実行中..."):
-                # QAセット必須チェック
-                if st.session_state.get("text") and st.session_state.get("qa_questions") and st.session_state.get("qa_answers"):
-                    payload = {"models": selected_models, "strategies": selected_strategies,
-                               "text": st.session_state.text,
-                               "questions": st.session_state.qa_questions,
-                               "answers": st.session_state.qa_answers}
-                    response = requests.post(f"{BACKEND_URL}/compare/", json=payload)
-                    if response.status_code == 200:
-                        st.success("比較が完了しました！")
-                        st.write("比較APIの返却内容:", response.json())  # 返却内容を確認用に表示
-                    else:
-                        st.error(f"比較に失敗しました: {response.text}")
-                else:
-                    st.warning("PDFアップロードとQA自動生成を先に実施してください。比較は行いません。")
-
+                error_msg = f"エラーが発生しました: {str(e)}"
+                st.error(error_msg)
+                st.session_state.chat_messages.append({"role": "assistant", "content": error_msg})
+        
+        # 画面を更新
+        st.rerun()
