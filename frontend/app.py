@@ -111,6 +111,10 @@ def plot_overlap_comparison(results_df: pd.DataFrame) -> None:
         
         with tab1:
             # メトリクスごとに個別のグラフを作成
+            # --- ダウンロード用: 全グラフ・テーブルを一時保存するリストを用意 ---
+            all_figs = []
+            all_tables = []
+
             for metric in available_metrics:
                 st.subheader(f"{metric} の比較")
                 
@@ -181,6 +185,8 @@ def plot_overlap_comparison(results_df: pd.DataFrame) -> None:
                             )
                             
                             st.plotly_chart(fig, use_container_width=True)
+                            # ダウンロード用にfigを保存
+                            all_figs.append((f"{metric}_{model}_chunk.png", fig))
                 
                 # モデル情報のみある場合
                 elif 'embedding_model' in group_cols:
@@ -275,6 +281,7 @@ def plot_overlap_comparison(results_df: pd.DataFrame) -> None:
                 # メトリクス間にスペースを追加
                 st.markdown("<br>", unsafe_allow_html=True)
         
+
         with tab2:
             # ヒートマップの表示
             if 'chunk_size' in group_cols and 'embedding_model' in group_cols:
@@ -308,6 +315,8 @@ def plot_overlap_comparison(results_df: pd.DataFrame) -> None:
                             coloraxis_colorbar_title="スコア (0-1)"
                         )
                         st.plotly_chart(fig, use_container_width=True)
+                        # ヒートマップもダウンロード用リストに必ず追加
+                        all_figs.append((f"heatmap_{model}.png", fig))
         
         with tab3:
             # 最適なオーバーラップサイズのサマリー
@@ -345,13 +354,43 @@ def plot_overlap_comparison(results_df: pd.DataFrame) -> None:
                         },
                         use_container_width=True
                     )
+                    # サマリー表もダウンロード用リストに追加
+                    all_tables.append(("summary.csv", summary_df))
                 else:
                     st.info("最適なオーバーラップサイズを計算するための十分なデータがありません。")
         
+        # 詳細データ（集計済みデータフレーム）もダウンロード用リストに追加
+        all_tables.append(("detail.csv", overlap_scores))
+
         with st.expander("詳細データを表示"):
             st.dataframe(overlap_scores.style.background_gradient(
                 subset=available_metrics, cmap='YlGnBu'
             ), use_container_width=True)
+
+        # --- ダウンロードボタンを関数末尾で表示 ---
+        import io, zipfile
+        from datetime import datetime
+        import plotly.io as pio
+        def save_all_figs_and_tables(figs, tables):
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w") as zf:
+                # グラフ画像
+                for fname, fig in figs:
+                    img_bytes = fig.to_image(format="png")
+                    zf.writestr(fname, img_bytes)
+                # テーブル（csv）
+                for tname, df in tables:
+                    zf.writestr(tname, df.to_csv(index=False, encoding='utf-8'))
+            zip_buffer.seek(0)
+            return zip_buffer
+        if st.button("全グラフ・表を一括ダウンロード (zip)"):
+            zip_buffer = save_all_figs_and_tables(all_figs, all_tables)
+            st.download_button(
+                label="ダウンロード開始",
+                data=zip_buffer,
+                file_name=f"overlap_metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip"
+            )
     
     except Exception as e:
         st.error(f"オーバーラップ比較の表示中にエラーが発生しました: {str(e)}")
