@@ -1,30 +1,33 @@
 from datetime import datetime
 from pytz import timezone
+import os
+import json
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import pandas as pd
+import numpy as np
+import requests
+import re
+import traceback
+from typing import List, Dict, Any, Optional, Union, Tuple
+from dotenv import load_dotenv
+import base64
+import io
+import zipfile
+from pathlib import Path
+import streamlit as st
+import streamlit.components.v1 as components
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+import matplotlib.font_manager as fm
+import tempfile
+import shutil
+import matplotlib.pyplot as plt
+from openai import OpenAI
 
 def jst_now_str():
     return datetime.now(timezone('Asia/Tokyo')).strftime('%Y-%m-%d %H:%M:%S JST')
-
-import os
-import json
-import streamlit as st
-import streamlit.components.v1 as components
-import base64
-import json
-import pandas as pd
-import plotly.express as px
-import requests
-from typing import List, Dict, Any, Optional, Tuple, Literal, Union
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
-import plotly.graph_objects as go  # レーダーチャート等で使用
-from openai import OpenAI
-from dotenv import load_dotenv
-import io
-import zipfile
-from datetime import datetime
-import tempfile
-import shutil
-import traceback
 
 # ---# 日本語フォントの設定
 def get_japanese_font():
@@ -62,89 +65,294 @@ def plot_overlap_comparison(results_df: pd.DataFrame) -> None:
     Args:
         results_df: 評価結果のDataFrame
     """
-    # 必要なカラムが存在するか確認
-    required_columns = ['faithfulness', 'answer_relevancy', 'context_recall', 'context_precision', 'overall_score']
-    available_metrics = [col for col in required_columns if col in results_df.columns]
-    
-    if not available_metrics:
-        st.warning("比較可能な評価指標が見つかりません。")
-        return
-    
-    # オーバーラップ情報がなければコンテキストから計算を試みる
-    if 'overlap' not in results_df.columns and 'contexts' in results_df.columns:
-        try:
-            results_df['overlap'] = results_df['contexts'].apply(
-                lambda x: len(' '.join(x).split()) - len(set(' '.join(x).split())) 
-                if x and len(x) > 0 else 0
-            )
-        except Exception as e:
-            st.warning(f"オーバーラップ情報の計算中にエラーが発生しました: {str(e)}")
-            return
-    
-    if 'overlap' not in results_df.columns:
-        st.warning("オーバーラップ情報が見つかりません。比較には'overlap'列または'contexts'列が必要です。")
-        return
-    
-    # オーバーラップの値でグループ化して平均を計算
     try:
-        overlap_scores = results_df.groupby('overlap')[available_metrics].mean().reset_index()
-        overlap_scores = overlap_scores.sort_values('overlap')
+        # 必要なメトリクスを定義
+        required_columns = ['faithfulness', 'answer_relevancy', 'context_recall', 'context_precision', 'answer_correctness', 'overall_score']
+        available_metrics = [col for col in required_columns if col in results_df.columns]
+        
+        if not available_metrics:
+            st.warning("比較可能な評価指標が見つかりません。")
+            return
+        
+        # オーバーラップ情報を準備
+        if 'overlap' not in results_df.columns and 'chunk_overlap' in results_df.columns:
+            results_df['overlap'] = results_df['chunk_overlap']
+        elif 'overlap' not in results_df.columns and 'contexts' in results_df.columns:
+            try:
+                results_df['overlap'] = results_df['contexts'].apply(
+                    lambda x: len(' '.join(x).split()) - len(set(' '.join(x).split())) if x and len(x) > 0 else 0
+                )
+            except Exception as e:
+                st.warning(f"オーバーラップ情報の計算中にエラーが発生しました: {str(e)}")
+                return
+        
+        if 'overlap' not in results_df.columns:
+            st.warning("オーバーラップ情報が見つかりません。比較には'overlap'列または'chunk_overlap'列が必要です。")
+            return
+        
+        # グループ化に使用するカラムを決定
+        group_cols = ['overlap']
+        if 'embedding_model' in results_df.columns:
+            group_cols.append('embedding_model')
+        if 'chunk_strategy' in results_df.columns:
+            group_cols.append('chunk_strategy')
+        if 'chunk_size' in results_df.columns:
+            group_cols.append('chunk_size')
+        
+        # データを集計
+        overlap_scores = results_df.groupby(group_cols)[available_metrics].mean().reset_index()
         
         if len(overlap_scores) <= 1:
             st.warning(f"オーバーラップの値が1種類しかありません（値: {results_df['overlap'].iloc[0]}）。比較には複数のオーバーラップ値が必要です。")
             return
-            
-        # 可視化
-        st.subheader("オーバーラップ比較")
         
         # タブで複数の可視化を表示
-        tab1, tab2 = st.tabs(["折れ線グラフ", "棒グラフ"])
+        tab1, tab2, tab3 = st.tabs(["折れ線グラフ", "ヒートマップ", "最適値サマリー"])
         
         with tab1:
-            fig_line = px.line(
-                overlap_scores.melt(id_vars='overlap', var_name='metric', value_name='score'),
-                x='overlap',
-                y='score',
-                color='metric',
-                title='オーバーラップサイズごとの評価指標',
-                labels={'overlap': 'オーバーラップサイズ', 'score': 'スコア', 'metric': '評価指標'},
-                markers=True
-            )
-            fig_line.update_layout(
-                xaxis_title='オーバーラップサイズ',
-                yaxis_title='スコア',
-                legend_title='評価指標',
-                height=500,
-                hovermode='x unified'
-            )
-            st.plotly_chart(fig_line, use_container_width=True)
-            
+            # メトリクスごとに個別のグラフを作成
+            for metric in available_metrics:
+                st.subheader(f"{metric} の比較")
+                
+                # モデルとチャンクサイズの両方の情報がある場合
+                if 'embedding_model' in group_cols and 'chunk_size' in group_cols:
+                    models = overlap_scores['embedding_model'].unique()
+                    chunk_sizes = sorted(overlap_scores['chunk_size'].unique())
+                    
+                    # モデルごとのタブを作成
+                    model_tabs = st.tabs([f"{model}" for model in models])
+                    
+                    for tab_idx, model in enumerate(models):
+                        with model_tabs[tab_idx]:
+                            model_data = overlap_scores[overlap_scores['embedding_model'] == model]
+                            
+                            # チャンクサイズごとに異なる色を割り当て
+                            colors = px.colors.qualitative.Plotly
+                            
+                            # グラフを作成
+                            fig = go.Figure()
+                            
+                            # 各チャンクサイズのデータを追加
+                            for i, chunk_size in enumerate(chunk_sizes):
+                                size_data = model_data[model_data['chunk_size'] == chunk_size]
+                                if len(size_data) > 0:
+                                    color_idx = i % len(colors)
+                                    
+                                    fig.add_trace(go.Scatter(
+                                        x=size_data['overlap'],
+                                        y=size_data[metric],
+                                        name=f"チャンクサイズ: {chunk_size}",
+                                        mode='lines+markers',
+                                        line=dict(width=3, color=colors[color_idx]),
+                                        marker=dict(size=10, color=colors[color_idx]),
+                                        hovertemplate=f'<b>{model} (チャンク: {chunk_size})</b><br>オーバーラップ: %{{x}}<br>スコア: %{{y:.3f}}<extra></extra>',
+                                        showlegend=True
+                                    ))
+                            
+                            # レイアウトを設定
+                            fig.update_layout(
+                                title=f"{model} - チャンクサイズ別比較",
+                                xaxis_title="オーバーラップサイズ (トークン数)",
+                                yaxis_title=f"{metric} スコア (0-1)",
+                                template='plotly_white',
+                                height=400,
+                                margin=dict(l=50, r=50, t=80, b=50),
+                                legend=dict(
+                                    orientation='h',
+                                    yanchor='bottom',
+                                    y=1.02,
+                                    xanchor='right',
+                                    x=1,
+                                    bgcolor='rgba(255,255,255,0.9)',
+                                    bordercolor='rgba(0,0,0,0.2)',
+                                    borderwidth=1
+                                ),
+                                xaxis=dict(
+                                    showgrid=True,
+                                    gridwidth=1,
+                                    gridcolor='rgba(0,0,0,0.1)'
+                                ),
+                                yaxis=dict(
+                                    range=[0, 1.05],
+                                    showgrid=True,
+                                    gridwidth=1,
+                                    gridcolor='rgba(0,0,0,0.1)'
+                                )
+                            )
+                            
+                            st.plotly_chart(fig, use_container_width=True)
+                
+                # モデル情報のみある場合
+                elif 'embedding_model' in group_cols:
+                    # モデルごとに異なる色を割り当て
+                    colors = px.colors.qualitative.Plotly
+                    
+                    # グラフを作成
+                    fig = go.Figure()
+                    
+                    # 各モデルのデータを追加
+                    for i, model in enumerate(overlap_scores['embedding_model'].unique()):
+                        model_data = overlap_scores[overlap_scores['embedding_model'] == model]
+                        color_idx = i % len(colors)
+                        
+                        fig.add_trace(go.Scatter(
+                            x=model_data['overlap'],
+                            y=model_data[metric],
+                            name=model,
+                            mode='lines+markers',
+                            line=dict(width=3, color=colors[color_idx]),
+                            marker=dict(size=10, color=colors[color_idx]),
+                            hovertemplate=f'<b>{model}</b><br>オーバーラップ: %{{x}}<br>スコア: %{{y:.3f}}<extra></extra>'
+                        ))
+                    
+                    # レイアウトを設定
+                    fig.update_layout(
+                        xaxis_title="オーバーラップサイズ (トークン数)",
+                        yaxis_title=f"{metric} スコア (0-1)",
+                        template='plotly_white',
+                        height=400,
+                        margin=dict(l=50, r=50, t=50, b=50),
+                        legend=dict(
+                            orientation='h',
+                            yanchor='bottom',
+                            y=1.02,
+                            xanchor='right',
+                            x=1,
+                            bgcolor='rgba(255,255,255,0.9)',
+                            bordercolor='rgba(0,0,0,0.2)',
+                            borderwidth=1
+                        ),
+                        xaxis=dict(
+                            showgrid=True,
+                            gridwidth=1,
+                            gridcolor='rgba(0,0,0,0.1)'
+                        ),
+                        yaxis=dict(
+                            range=[0, 1.05],
+                            showgrid=True,
+                            gridwidth=1,
+                            gridcolor='rgba(0,0,0,0.1)',
+                            showline=True,
+                            linewidth=2,
+                            linecolor='black',
+                            mirror=True,
+                            ticks='outside',
+                            tickwidth=2,
+                            tickcolor='black',
+                            ticklen=6
+                        )
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # モデル情報がない場合
+                else:
+                    # シンプルなグラフ
+                    fig = px.line(
+                        overlap_scores, 
+                        x='overlap', 
+                        y=metric,
+                        title=f"{metric} スコア",
+                        labels={'overlap': 'オーバーラップサイズ (トークン数)', metric: 'スコア (0-1)'},
+                        markers=True
+                    )
+                    
+                    fig.update_traces(
+                        line=dict(width=3),
+                        marker=dict(size=10)
+                    )
+                    
+                    fig.update_layout(
+                        height=400,
+                        showlegend=False,
+                        xaxis=dict(showgrid=True, gridwidth=1, gridcolor='rgba(0,0,0,0.1)'),
+                        yaxis=dict(range=[0, 1.05], showgrid=True, gridwidth=1, gridcolor='rgba(0,0,0,0.1)'),
+                        margin=dict(l=50, r=50, t=50, b=50)
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # メトリクス間にスペースを追加
+                st.markdown("<br>", unsafe_allow_html=True)
+        
         with tab2:
-            # データをロングフォーマットに変換
-            melted_data = overlap_scores.melt(id_vars='overlap', var_name='metric', value_name='score')
-            
-            fig_bar = px.bar(
-                data_frame=melted_data,
-                x='metric',
-                y='score',
-                color='overlap',
-                barmode='group',
-                title='評価指標ごとのオーバーラップ比較',
-                labels={'metric': '評価指標', 'score': 'スコア', 'overlap': 'オーバーラップ'}
-            )
-            fig_bar.update_layout(
-                xaxis_title='評価指標',
-                yaxis_title='スコア',
-                legend_title='オーバーラップサイズ',
-                height=500,
-                xaxis_tickangle=-45
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
-            
-        # データテーブルも表示
+            # ヒートマップの表示
+            if 'chunk_size' in group_cols and 'embedding_model' in group_cols:
+                # モデルとチャンクサイズごとのヒートマップ
+                for model in overlap_scores['embedding_model'].unique():
+                    model_data = overlap_scores[overlap_scores['embedding_model'] == model]
+                    
+                    # ピボットテーブルを作成
+                    pivot_data = model_data.pivot_table(
+                        index='chunk_size',
+                        columns='overlap',
+                        values='overall_score',
+                        aggfunc='mean'
+                    ).sort_index(ascending=False)
+                    
+                    if not pivot_data.empty:
+                        fig = px.imshow(
+                            pivot_data,
+                            labels=dict(
+                                x="オーバーラップサイズ (トークン数)", 
+                                y="チャンクサイズ (トークン数)", 
+                                color="スコア (0-1)"
+                            ),
+                            title=f"{model} - チャンクサイズとオーバーラップの関係",
+                            color_continuous_scale='Viridis',
+                            aspect="auto"
+                        )
+                        fig.update_layout(
+                            xaxis_title="オーバーラップサイズ (トークン数)",
+                            yaxis_title="チャンクサイズ (トークン数)",
+                            coloraxis_colorbar_title="スコア (0-1)"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+        
+        with tab3:
+            # 最適なオーバーラップサイズのサマリー
+            if 'embedding_model' in group_cols and 'chunk_strategy' in group_cols and 'chunk_size' in group_cols:
+                # 最適なオーバーラップサイズを見つける
+                best_overlaps = []
+                
+                for model in overlap_scores['embedding_model'].unique():
+                    model_data = overlap_scores[overlap_scores['embedding_model'] == model]
+                    for strategy in model_data['chunk_strategy'].unique():
+                        strategy_data = model_data[model_data['chunk_strategy'] == strategy]
+                        for size in strategy_data['chunk_size'].unique():
+                            size_data = strategy_data[strategy_data['chunk_size'] == size]
+                            if not size_data.empty:
+                                best_idx = size_data['overall_score'].idxmax()
+                                best_overlaps.append({
+                                    'モデル': model,
+                                    'チャンク化方法': strategy,
+                                    'チャンクサイズ': size,
+                                    '最適オーバーラップ': size_data.loc[best_idx, 'overlap'],
+                                    '最高スコア': round(size_data.loc[best_idx, 'overall_score'], 3)
+                                })
+                
+                if best_overlaps:
+                    summary_df = pd.DataFrame(best_overlaps)
+                    st.dataframe(
+                        summary_df.sort_values(['モデル', 'チャンク化方法', 'チャンクサイズ']),
+                        column_config={
+                            '最高スコア': st.column_config.ProgressColumn(
+                                '最高スコア',
+                                format='%.3f',
+                                min_value=0,
+                                max_value=1.0
+                            )
+                        },
+                        use_container_width=True
+                    )
+                else:
+                    st.info("最適なオーバーラップサイズを計算するための十分なデータがありません。")
+        
         with st.expander("詳細データを表示"):
-            st.dataframe(overlap_scores.set_index('overlap').style.background_gradient(cmap='YlGnBu'))
-            
+            st.dataframe(overlap_scores.style.background_gradient(
+                subset=available_metrics, cmap='YlGnBu'
+            ), use_container_width=True)
+    
     except Exception as e:
         st.error(f"オーバーラップ比較の表示中にエラーが発生しました: {str(e)}")
         st.error(f"エラーの詳細: {traceback.format_exc()}")
