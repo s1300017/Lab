@@ -280,7 +280,6 @@ def plot_overlap_comparison(results_df: pd.DataFrame) -> None:
                 
                 # メトリクス間にスペースを追加
                 st.markdown("<br>", unsafe_allow_html=True)
-        
 
         with tab2:
             # ヒートマップの表示
@@ -371,20 +370,26 @@ def plot_overlap_comparison(results_df: pd.DataFrame) -> None:
         import io, zipfile
         from datetime import datetime
         import plotly.io as pio
-        def save_all_figs_and_tables(figs, tables):
+        if st.button("全グラフ・表を一括ダウンロード (zip)"):
+            # 進捗バーのプレースホルダを用意
+            progress_bar = st.progress(0)
+            total_tasks = len(all_figs) + len(all_tables)
+            current = 0
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w") as zf:
                 # グラフ画像
-                for fname, fig in figs:
+                for fname, fig in all_figs:
                     img_bytes = fig.to_image(format="png")
                     zf.writestr(fname, img_bytes)
+                    current += 1
+                    progress_bar.progress(current / total_tasks)
                 # テーブル（csv）
-                for tname, df in tables:
+                for tname, df in all_tables:
                     zf.writestr(tname, df.to_csv(index=False, encoding='utf-8'))
+                    current += 1
+                    progress_bar.progress(current / total_tasks)
             zip_buffer.seek(0)
-            return zip_buffer
-        if st.button("全グラフ・表を一括ダウンロード (zip)"):
-            zip_buffer = save_all_figs_and_tables(all_figs, all_tables)
+            progress_bar.empty()  # バーを消す
             st.download_button(
                 label="ダウンロード開始",
                 data=zip_buffer,
