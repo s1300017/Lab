@@ -463,6 +463,7 @@ class EvalRequest(BaseModel):
     contexts: list[list[str]]
     llm_model: str # Added for dynamic selection
     embedding_model: str # Added for dynamic selection
+    include_overlap_metrics: bool = False
 
 class ModelSelection(BaseModel):
     llm_model: str
@@ -556,28 +557,82 @@ def evaluate_ragas(request: EvalRequest):
         }
         dataset = Dataset.from_dict(dataset_dict)
 
+        # 評価メトリクスの定義
+        metrics = [
+            faithfulness,
+            answer_relevancy,
+            context_recall,
+            context_precision,
+        ]
+
+        # オーバーラップメトリクスを追加
+        if request.include_overlap_metrics:
+            # コンテキストからオーバーラップを計算する関数
+            def calculate_overlap(contexts: list[list[str]]) -> float:
+                if not contexts or len(contexts) < 2:
+                    return 0.0
+                
+                # すべてのコンテキストを結合してトークン化
+                all_tokens = []
+                for ctx in contexts:
+                    if isinstance(ctx, str):
+                        all_tokens.extend(ctx.split())
+                    else:
+                        for text in ctx:
+                            all_tokens.extend(text.split())
+                
+                # 重複するトークン数を計算
+                unique_tokens = set(all_tokens)
+                total_tokens = len(all_tokens)
+                unique_count = len(unique_tokens)
+                
+                if total_tokens == 0:
+                    return 0.0
+                    
+                # 重複率を計算 (0.0 〜 1.0)
+                overlap_ratio = 1.0 - (unique_count / total_tokens) if total_tokens > 0 else 0.0
+                return overlap_ratio
+
+            # 各質問のコンテキストに対してオーバーラップを計算
+            overlap_scores = []
+            for ctx_list in request.contexts:
+                overlap = calculate_overlap(ctx_list)
+                overlap_scores.append(overlap)
+            
+            # 平均オーバーラップをスコアに追加
+            avg_overlap = sum(overlap_scores) / len(overlap_scores) if overlap_scores else 0.0
+        else:
+            overlap_scores = [0.0] * len(request.questions)
+            avg_overlap = 0.0
+
+        # 評価を実行
         result = evaluate(
             dataset=dataset,
-            metrics=[
-                faithfulness,
-                answer_relevancy,
-                context_recall,
-                context_precision,
-            ],
+            metrics=metrics,
             llm=llm_instance,
             embeddings=embeddings_instance,
         )
 
         # 必須評価指標キーを全て含める（欠損時は0.0で埋める）
         required_keys = [
-            "overall_score", "faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness", "avg_chunk_len", "num_chunks"
+            "overall_score", "faithfulness", "answer_relevancy", 
+            "context_recall", "context_precision", "answer_correctness", 
+            "avg_chunk_len", "num_chunks"
         ]
+        
         # ragasのscoresはdictで返る
         scores = result.scores if isinstance(result.scores, dict) else {}
+        
         # 欠損キーを0.0で補完
         for k in required_keys:
             if k not in scores:
                 scores[k] = 0.0
+        
+        # オーバーラップメトリクスを追加
+        if request.include_overlap_metrics:
+            scores["overlap_ratio"] = avg_overlap
+            scores["overlap_scores"] = overlap_scores
+        
         return scores
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -24,6 +24,7 @@ import zipfile
 from datetime import datetime
 import tempfile
 import shutil
+import traceback
 
 # ---# 日本語フォントの設定
 def get_japanese_font():
@@ -53,6 +54,100 @@ def get_japanese_font():
 
 # グローバルな日本語フォントを設定
 japanese_font = get_japanese_font()
+
+def plot_overlap_comparison(results_df: pd.DataFrame) -> None:
+    """
+    オーバーラップごとの評価指標を比較するグラフを表示する
+    
+    Args:
+        results_df: 評価結果のDataFrame
+    """
+    # 必要なカラムが存在するか確認
+    required_columns = ['faithfulness', 'answer_relevancy', 'context_recall', 'context_precision', 'overall_score']
+    available_metrics = [col for col in required_columns if col in results_df.columns]
+    
+    if not available_metrics:
+        st.warning("比較可能な評価指標が見つかりません。")
+        return
+    
+    # オーバーラップ情報がなければコンテキストから計算を試みる
+    if 'overlap' not in results_df.columns and 'contexts' in results_df.columns:
+        try:
+            results_df['overlap'] = results_df['contexts'].apply(
+                lambda x: len(' '.join(x).split()) - len(set(' '.join(x).split())) 
+                if x and len(x) > 0 else 0
+            )
+        except Exception as e:
+            st.warning(f"オーバーラップ情報の計算中にエラーが発生しました: {str(e)}")
+            return
+    
+    if 'overlap' not in results_df.columns:
+        st.warning("オーバーラップ情報が見つかりません。比較には'overlap'列または'contexts'列が必要です。")
+        return
+    
+    # オーバーラップの値でグループ化して平均を計算
+    try:
+        overlap_scores = results_df.groupby('overlap')[available_metrics].mean().reset_index()
+        overlap_scores = overlap_scores.sort_values('overlap')
+        
+        if len(overlap_scores) <= 1:
+            st.warning(f"オーバーラップの値が1種類しかありません（値: {results_df['overlap'].iloc[0]}）。比較には複数のオーバーラップ値が必要です。")
+            return
+            
+        # 可視化
+        st.subheader("オーバーラップ比較")
+        
+        # タブで複数の可視化を表示
+        tab1, tab2 = st.tabs(["折れ線グラフ", "棒グラフ"])
+        
+        with tab1:
+            fig_line = px.line(
+                overlap_scores.melt(id_vars='overlap', var_name='metric', value_name='score'),
+                x='overlap',
+                y='score',
+                color='metric',
+                title='オーバーラップサイズごとの評価指標',
+                labels={'overlap': 'オーバーラップサイズ', 'score': 'スコア', 'metric': '評価指標'},
+                markers=True
+            )
+            fig_line.update_layout(
+                xaxis_title='オーバーラップサイズ',
+                yaxis_title='スコア',
+                legend_title='評価指標',
+                height=500,
+                hovermode='x unified'
+            )
+            st.plotly_chart(fig_line, use_container_width=True)
+            
+        with tab2:
+            # データをロングフォーマットに変換
+            melted_data = overlap_scores.melt(id_vars='overlap', var_name='metric', value_name='score')
+            
+            fig_bar = px.bar(
+                data_frame=melted_data,
+                x='metric',
+                y='score',
+                color='overlap',
+                barmode='group',
+                title='評価指標ごとのオーバーラップ比較',
+                labels={'metric': '評価指標', 'score': 'スコア', 'overlap': 'オーバーラップ'}
+            )
+            fig_bar.update_layout(
+                xaxis_title='評価指標',
+                yaxis_title='スコア',
+                legend_title='オーバーラップサイズ',
+                height=500,
+                xaxis_tickangle=-45
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+            
+        # データテーブルも表示
+        with st.expander("詳細データを表示"):
+            st.dataframe(overlap_scores.set_index('overlap').style.background_gradient(cmap='YlGnBu'))
+            
+    except Exception as e:
+        st.error(f"オーバーラップ比較の表示中にエラーが発生しました: {str(e)}")
+        st.error(f"エラーの詳細: {traceback.format_exc()}")
 
 # --- グラフ保存用ユーティリティ関数 ---
 
@@ -321,13 +416,20 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                 strategy_scores = model_data.groupby('chunk_strategy')['overall_score'].mean().sort_values(ascending=False)
                 
                 # バーチャートの作成
+                # データフレームを作成
+                bar_data = pd.DataFrame({
+                    'strategy': strategy_scores.index,
+                    'score': strategy_scores.values
+                })
+                
                 fig_bar = px.bar(
-                    x=strategy_scores.values,
-                    y=strategy_scores.index,
+                    data_frame=bar_data,
+                    x='score',
+                    y='strategy',
                     orientation='h',
                     title=f"{model_name} - チャンク戦略別パフォーマンス",
-                    labels={'x': '平均スコア', 'y': 'チャンク戦略'},
-                    color=strategy_scores.values,
+                    labels={'score': '平均スコア', 'strategy': 'チャンク戦略'},
+                    color='score',
                     color_continuous_scale=px.colors.sequential.Viridis,
                 )
                 
@@ -1241,7 +1343,30 @@ with tab3:
                     progress_text.text(f"完了: {completed_tasks[0]} / {total_tasks} 件")
                     
                     if response.status_code == 200:
-                        return response.json()
+                        result = response.json()
+                        
+                        # レスポンスがリストの場合は最初の要素を取得
+                        if isinstance(result, list):
+                            if len(result) > 0:
+                                result = result[0]
+                            else:
+                                result = {}
+                        
+                        # 結果が辞書でない場合は辞書に変換
+                        if not isinstance(result, dict):
+                            result = {}
+                        
+                        # メタデータを追加
+                        result['embedding_model'] = emb
+                        result['chunk_method'] = method
+                        result['chunk_size'] = size
+                        result['chunk_overlap'] = overlap
+                        
+                        # オーバーラップ情報が含まれていない場合はデフォルト値を設定
+                        if 'overlap' not in result:
+                            result['overlap'] = overlap if overlap is not None else 0
+                            
+                        return result
                     else:
                         st.error("評価に失敗しました。詳細:")
                         st.json({
@@ -1327,19 +1452,34 @@ with tab3:
     if st.session_state.bulk_evaluation_results:
         st.subheader("一括評価結果")
         st.write("一括評価APIの返却内容:", st.session_state.bulk_evaluation_results)  # 返却内容を確認用に表示
-
+        
         # 結果をDataFrameに変換
         eval_results = st.session_state.bulk_evaluation_results
+        
+        # 既存のデータ処理ロジックを維持
         if isinstance(eval_results, list):
             results_df = pd.DataFrame(eval_results)
         else:
             results_df = pd.DataFrame([eval_results])
+        
+        # スコア情報を展開
+        if 'scores' in results_df.columns:
+            # スコアが辞書形式で格納されている場合、各スコアを個別のカラムに展開
+            scores_df = pd.json_normalize(results_df['scores'])
+            # 元のカラムと結合（接頭辞を付けて競合を避ける）
+            results_df = pd.concat([results_df.drop('scores', axis=1), scores_df.add_prefix('score_')], axis=1)
         
         # 必要カラム補完・ラベル列追加
         required_cols = {
             'avg_chunk_len', 'num_chunks', 'overall_score', 'chunk_strategy', 'embedding_model',
             'faithfulness', 'answer_relevancy', 'context_recall', 'context_precision', 'answer_correctness'
         }
+        
+        # スコアカラムの補完（score_プレフィックスが付いている場合に対応）
+        for col in ['faithfulness', 'answer_relevancy', 'context_recall', 'context_precision', 'answer_correctness', 'overall_score']:
+            if f'score_{col}' in results_df.columns and col not in results_df.columns:
+                results_df[col] = results_df[f'score_{col}']
+        
         missing_cols = required_cols - set(results_df.columns)
         
         if 'chunk_method' in results_df.columns and 'chunk_strategy' not in results_df.columns:
@@ -1356,11 +1496,19 @@ with tab3:
                     else:
                         results_df[col] = 0.0
             
+            # オーバーラップ情報を追加（chunk_overlapをデフォルト値として使用）
+            if 'overlap' not in results_df.columns and 'chunk_overlap' in results_df.columns:
+                results_df['overlap'] = results_df['chunk_overlap']
+            
             # ラベル列を追加（chunk_sizeがあれば含める）
             if 'chunk_size' in results_df.columns:
                 results_df['label'] = results_df['chunk_strategy'] + '-' + results_df['chunk_size'].astype(str)
             else:
                 results_df['label'] = results_df['chunk_strategy']
+        
+        # オーバーラップ比較を表示
+        if 'overlap' in results_df.columns and len(results_df['overlap'].unique()) > 1:
+            plot_overlap_comparison(results_df)
             
             # メトリクスとその日本語ラベルを定義
             metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
@@ -1376,15 +1524,34 @@ with tab3:
             for model_name, model_data in model_groups:
                 if not model_data.empty and 'chunk_size' in model_data.columns and 'overall_score' in model_data.columns:
                     # バブルチャートの作成
+                    # 必要なカラムが存在するか確認し、存在しない場合はデフォルト値を設定
+                    if 'num_chunks' not in model_data.columns:
+                        model_data['num_chunks'] = 0
+                    if 'avg_chunk_len' not in model_data.columns:
+                        model_data['avg_chunk_len'] = 0
+                    if 'overall_score' not in model_data.columns:
+                        model_data['overall_score'] = 0
+                    
+                    # バブルサイズを計算（0除算を防ぐ）
+                    bubble_sizes = [min(s * 20, 50) if pd.notnull(s) else 5 for s in model_data["overall_score"]]
+                    
+                    # データフレームのコピーを作成（元のデータを変更しないように）
+                    plot_data = model_data.copy()
+                    plot_data['bubble_size'] = bubble_sizes
+                    
                     fig_bubble = px.scatter(
-                        model_data,
+                        data_frame=plot_data,
                         x="num_chunks",
                         y="avg_chunk_len",
-                        size=[min(s * 20, 50) for s in model_data["overall_score"]],
+                        size="bubble_size",
                         color="overall_score",
-                        hover_name=model_data['chunk_strategy'] + '-' + model_data['chunk_size'].astype(str),
-                        text=model_data['chunk_strategy'],
-                        title=f"{model_name} - チャンク分布とパフォーマンス",
+                        hover_data={
+                            "chunk_size": True,
+                            "chunk_strategy": True,
+                            "num_chunks": True,
+                            "avg_chunk_len": ":.1f",
+                            "overall_score": ".3f"
+                        },
                         labels={
                             "num_chunks": "チャンク数",
                             "avg_chunk_len": "平均チャンク長",
@@ -1429,14 +1596,23 @@ with tab3:
                     # チャンク戦略ごとのパフォーマンスを集計
                     strategy_scores = model_data.groupby('chunk_strategy')['overall_score'].mean().sort_values(ascending=False)
                     
+                    # データフレームの作成
+                    bar_data = pd.DataFrame({
+                        'strategy': strategy_scores.index,
+                        'score': strategy_scores.values,
+                        'score_text': [f"{x:.3f}" for x in strategy_scores.values]
+                    })
+                    
                     # バーチャートの作成
                     fig_bar = px.bar(
-                        x=strategy_scores.values,
-                        y=strategy_scores.index,
+                        data_frame=bar_data,
+                        x='score',
+                        y='strategy',
                         orientation='h',
+                        text='score_text',
                         title=f"{model_name} - チャンク戦略別パフォーマンス",
-                        labels={'x': '平均スコア', 'y': 'チャンク戦略'},
-                        color=strategy_scores.values,
+                        labels={'score': '平均スコア', 'strategy': 'チャンク戦略'},
+                        color='score',
                         color_continuous_scale=px.colors.sequential.Viridis,
                         width=1200,  # グラフの幅を拡大
                         height=800,  # グラフの高さを拡大
