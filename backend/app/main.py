@@ -896,6 +896,14 @@ async def bulk_evaluate(request: Request):
                 chunk_methods = data.get("chunk_methods", [data.get("chunk_method", "recursive")])
                 chunk_sizes = data.get("chunk_sizes", [data.get("chunk_size", 1000)])
                 chunk_overlaps = data.get("chunk_overlaps", [data.get("chunk_overlap", 0)])
+                
+                # セマンティックチャンキングが単独で選択されているかチェック
+                is_semantic_only = chunk_methods == ["semantic"]
+                if is_semantic_only and (any(size != 1000 for size in chunk_sizes) or any(overlap != 0 for overlap in chunk_overlaps)):
+                    print("注意: セマンティックチャンキングが単独で選択されているため、チャンクサイズとオーバーラップの値は無視されます。")
+                # セマンティックと他の方法が同時に選択されている場合
+                elif "semantic" in chunk_methods:
+                    print("情報: セマンティックチャンキングと他の方法が同時に選択されています。チャンクサイズとオーバーラップは、他の方法に適用されます。")
 
                 # 必須パラメータチェック
                 sample_text = data.get("text")

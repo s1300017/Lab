@@ -2,6 +2,7 @@ from datetime import datetime
 from pytz import timezone
 import os
 import json
+import time
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -1051,6 +1052,7 @@ def clear_database():
             st.session_state.text = ""
             st.session_state.chunks = []
             st.session_state.evaluation_results = None
+            st.session_state.bulk_evaluation_results = None  # 一括評価結果もリセット
             st.session_state.chat_history = []
         else:
             st.error(f"データベースのクリアに失敗しました: {response.text}")
@@ -1126,29 +1128,62 @@ with st.sidebar:
     
     if has_data:
         if st.button("リセット（すべてクリア）"):
-            # 1. localStorageをクリア
-            components.html("""
-            <script>
-            localStorage.removeItem('rag_app_state');
-            window.parent.postMessage({streamlitMessage: 'localStorageCleared'}, '*');
-            </script>
-            """, height=0)
-            
-            # 2. session_stateを初期化
-            init_session_state()
-            
-            # 3. バックエンドのデータベースをクリア
-            try:
-                response = requests.post(f"{BACKEND_URL}/clear_db/")
-                if response.status_code == 200:
-                    st.success("すべてのデータを正常にクリアしました！")
-                else:
-                    st.error(f"データベースのクリアに失敗しました: {response.text}")
-            except requests.exceptions.RequestException as e:
-                st.error(f"バックエンドに接続できませんでした: {e}")
-            
-            # 4. ページを再読み込み
-            st.rerun()
+            with st.spinner("リセットを実行中..."):
+                # 1. localStorageをクリア
+                components.html("""
+                <script>
+                localStorage.removeItem('rag_app_state');
+                window.parent.postMessage({streamlitMessage: 'localStorageCleared'}, '*');
+                </script>
+                """, height=0)
+                
+                # 2. session_stateを初期化
+                init_session_state()
+                
+                # 3. バックエンドのデータベースをクリア
+                try:
+                    response = requests.post(f"{BACKEND_URL}/clear_db/")
+                    if response.status_code == 200:
+                        st.success("✅ すべてのデータを正常にクリアしました！")
+                        
+                        # 状態確認
+                        st.subheader("リセット状態の確認")
+                        col1, col2, col3, col4, col5 = st.columns(5)
+                        
+                        with col1:
+                            st.metric("セッション状態", "クリア済み")
+                        with col2:
+                            st.metric("ローカルストレージ", "クリア済み")
+                        with col3:
+                            st.metric("データベース", "クリア済み")
+                        with col4:
+                            st.metric("評価結果", "リセット済み")
+                        with col5:
+                            st.metric("チャット履歴", "クリア済み")
+                        
+                        # 詳細な状態を表示
+                        with st.expander("詳細な状態を表示"):
+                            st.json({
+                                "session_state_text": bool(st.session_state.get("text")),
+                                "session_state_chunks": len(st.session_state.get("chunks", [])),
+                                "session_state_evaluation_results": bool(st.session_state.get("evaluation_results")),
+                                "session_state_bulk_evaluation_results": bool(st.session_state.get("bulk_evaluation_results")),
+                                "session_state_chat_history": len(st.session_state.get("chat_history", []))
+                            })
+                            
+                    else:
+                        st.error(f"データベースのクリアに失敗しました: {response.text}")
+                        st.stop()
+                except requests.exceptions.RequestException as e:
+                    st.error(f"バックエンドに接続できませんでした: {e}")
+                    st.stop()
+                
+                # 4. 成功メッセージを表示
+                st.toast("リセットが完了しました。ページを再読み込みします...")
+                time.sleep(2)  # メッセージを表示するための待機時間
+                # セッション状態をクリアしてから再読み込み
+                st.session_state.clear()
+                st.rerun()
     else:
         st.warning("""
         📝 データがありません
@@ -1158,18 +1193,53 @@ with st.sidebar:
 
     # --- データベース初期化ボタン ---
     if st.button("データベースのみ初期化"):
-        try:
-            response = requests.post(f"{BACKEND_URL}/clear_db/")
-            if response.status_code == 200:
-                st.success("データベースを正常にクリアしました！")
-                st.session_state.text = ""
-                st.session_state.chunks = []
-                st.session_state.evaluation_results = None
-                st.session_state.chat_history = []
-            else:
-                st.error(f"データベースのクリアに失敗しました: {response.text}")
-        except requests.exceptions.RequestException as e:
-            st.error(f"バックエンドに接続できませんでした: {e}")
+        with st.spinner("データベースを初期化中..."):
+            try:
+                # 1. バックエンドのデータベースをクリア
+                response = requests.post(f"{BACKEND_URL}/clear_db/")
+                if response.status_code == 200:
+                    # 2. データベース関連の状態をリセット
+                    st.session_state.chunks = []
+                    st.session_state.evaluation_results = None
+                    st.session_state.bulk_evaluation_results = None
+                    st.session_state.chat_history = []
+                    
+                    st.success("✅ データベースを正常に初期化しました！")
+                    
+                    # 状態確認
+                    st.subheader("データベース初期化の状態確認")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric("データベース", "初期化済み")
+                    with col2:
+                        st.metric("評価結果", "リセット済み")
+                    with col3:
+                        st.metric("チャット履歴", "クリア済み")
+                    
+                    # 詳細な状態を表示
+                    with st.expander("詳細な状態を表示"):
+                        st.json({
+                            "session_state_chunks": len(st.session_state.get("chunks", [])),
+                            "session_state_evaluation_results": bool(st.session_state.get("evaluation_results")),
+                            "session_state_bulk_evaluation_results": bool(st.session_state.get("bulk_evaluation_results")),
+                            "session_state_chat_history": len(st.session_state.get("chat_history", []))
+                        })
+                    
+                    # 成功メッセージを表示
+                    st.toast("データベースの初期化が完了しました。ページを再読み込みします...")
+                    time.sleep(2)  # メッセージを表示するための待機時間
+                    # セッション状態をクリアしてから再読み込み
+                    st.session_state.clear()
+                    st.rerun()
+                else:
+                    st.error(f"データベースの初期化に失敗しました: {response.text}")
+                    st.stop()
+                    
+            except requests.exceptions.RequestException as e:
+                st.error(f"バックエンドに接続できませんでした: {e}")
+                st.error("バックエンドが起動しているか確認してください。")
+                st.stop()
 
     st.header("設定")
     
@@ -1502,16 +1572,38 @@ with tab3:
         ["fixed", "recursive", "semantic", "sentence", "paragraph"],
         default=["fixed", "recursive", "semantic"]
     )
+    
+    # セマンティックチャンキングが単独で選択されているかチェック
+    is_semantic_only = chunk_methods == ["semantic"]
+    
+    # セマンティックチャンキングが単独で選択されている場合、注意メッセージを表示
+    if is_semantic_only:
+        st.warning("セマンティックチャンキングが単独で選択されています。チャンクサイズとオーバーラップは無視されます。")
+    # セマンティックと他の方法が同時に選択されている場合
+    elif "semantic" in chunk_methods:
+        st.info("セマンティックチャンキングと他の方法が同時に選択されています。チャンクサイズとオーバーラップは、他の方法に適用されます。")
+    
+    # チャンクサイズの選択
     chunk_sizes = st.multiselect(
         "チャンクサイズ（文字数）",
         [128, 256, 500, 1000, 1500, 2000],
-        default=[500, 1000]
+        default=[500, 1000],
+        disabled=is_semantic_only  # セマンティックのみの場合は無効化
     )
+    
+    # オーバーラップの選択
     chunk_overlaps = st.multiselect(
         "オーバーラップ（文字数）",
         [0, 32, 64, 100, 200, 300],
-        default=[0, 100, 200]
+        default=[0, 100, 200],
+        disabled=is_semantic_only  # セマンティックのみの場合は無効化
     )
+    
+    # セマンティックチャンキングのみが選択されている場合、デフォルト値を設定
+    if is_semantic_only and (not chunk_sizes or not chunk_overlaps):
+        chunk_sizes = [1000]  # ダミーの値（使用されない）
+        chunk_overlaps = [0]  # ダミーの値（使用されない）
+    
     st.caption("※Embeddingモデル・チャンク分割方式・サイズ・オーバーラップの全組み合わせで自動一括評価を実行します")
 
     if st.button("一括評価を実行", key="bulk_evaluate_button_2"):
