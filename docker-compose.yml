@@ -11,7 +11,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      TZ: Asia/Tokyo # JST化
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      TZ: Asia/Tokyo
     restart: always
     healthcheck:
       test:
@@ -58,8 +59,9 @@ services:
       - ./frontend:/app
       - ./.env:/app/.env  # .envファイルをマウント
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}  # ホストの環境変数から取得
-      - TZ=Asia/Tokyo # JST化
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - TZ=Asia/Tokyo
     depends_on:
       - db
       - ollama
@@ -67,13 +69,16 @@ services:
     restart: always
 
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: rag_backend_debug
     container_name: rag_backend
     ports:
       - "8000:8000"
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
     volumes:
-      - ./backend:/app
-      - ./backend/models.yaml:/app/models.yaml
+      - ./backend/models.yaml:/models.yaml  # パスを /models.yaml に変更
       - ./backend/strategies.yaml:/app/strategies.yaml
       - ./models:/app/models # ホストのmodelsディレクトリをコンテナにマウント
     depends_on:
@@ -82,14 +87,14 @@ services:
       ollama:
         condition: service_healthy
     environment:
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - TRANSFORMERS_CACHE=/app/models
       - HF_HOME=/app/models
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       - TZ=Asia/Tokyo # JST化
+      - POSTGRES_DB=rag_db
+      - POSTGRES_USER=rag_user
+      - POSTGRES_PASSWORD=rag_password
+      - DATABASE_URL=postgresql://rag_user:rag_password@db:5432/rag_db
     restart: always
 
 volumes:

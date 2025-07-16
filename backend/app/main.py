@@ -8,6 +8,7 @@ def jst_now_str():
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+import threading
 
 # --- PDF・抽出データ保存用ディレクトリのグローバル定義 ---
 import uuid
@@ -20,37 +21,93 @@ EXTRACTED_DIR = DATA_DIR / "extracted"
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 EXTRACTED_DIR.mkdir(parents=True, exist_ok=True)
 
-print(f"[{jst_now_str()}] === FastAPI main.py 起動開始 ===")
+print(f"[{jst_now_str()}] === FastAPI main.py 起動開始 [テスト用] ===")
 
 # データベース接続設定
-DB_URL = os.environ.get("DATABASE_URL", "postgresql://rag_user:rag_password@db:5432/rag_db")
+POSTGRES_DB = os.environ.get("POSTGRES_DB", "rag_db")
+POSTGRES_USER = os.environ.get("POSTGRES_USER", "rag_user")
+POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "rag_password")
+DB_URL = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@db:5432/{POSTGRES_DB}"
 engine = create_engine(DB_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-def init_db():
-    try:
-        with engine.connect() as conn:
-            # 必要なテーブルを作成
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS embeddings (
-                    id SERIAL PRIMARY KEY,
-                    text TEXT NOT NULL,
-                    embedding_model TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """))
-            conn.commit()
-            print(f"[{jst_now_str()}] データベース初期化成功: embeddingsテーブルを作成しました")
-    except Exception as e:
-        print(f"[{jst_now_str()}] データベース初期化失敗: {str(e)}")
-        raise
-
+# FastAPIアプリケーションの初期化
 app = FastAPI()
 
-# サーバー起動時にデータベースを初期化
+# サーバ起動時にデータベースを初期化
 @app.on_event("startup")
 async def startup_event():
-    init_db()
+    print(f"[{jst_now_str()}] [DEBUG] startup_event呼び出し")
+    print(f"[{jst_now_str()}] [DEBUG] DB_URL = {os.getenv('DATABASE_URL')}")
+    
+    # データベース接続をテスト
+    max_retries = 5
+    retry_delay = 5  # 秒
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"[{jst_now_str()}] [DEBUG] データベース接続を試行中... (試行 {attempt + 1}/{max_retries})")
+            init_db()
+            print(f"[{jst_now_str()}] [DEBUG] データベース初期化に成功しました")
+            break
+        except Exception as e:
+            print(f"[{jst_now_str()}] [ERROR] データベース初期化エラー (試行 {attempt + 1}/{max_retries}): {str(e)}")
+            if attempt == max_retries - 1:
+                print(f"[{jst_now_str()}] [CRITICAL] データベース初期化に失敗しました。最大試行回数に達しました。")
+                raise
+            import time
+            time.sleep(retry_delay)
+
+def init_db():
+    print(f"[{jst_now_str()}] [DEBUG] init_db呼び出し")
+    try:
+        print(f"[{jst_now_str()}] [DEBUG] データベース接続テスト開始")
+        with engine.connect() as conn:
+            print(f"[{jst_now_str()}] [DEBUG] データベース接続成功")
+            
+            # トランザクションを開始
+            with conn.begin():
+                # テーブルが存在するか確認
+                result = conn.execute(text(
+                    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'embeddings');"
+                ))
+                table_exists = result.scalar()
+                
+                if not table_exists:
+                    print(f"[{jst_now_str()}] [INFO] embeddingsテーブルを作成します")
+                    conn.execute(text("""
+                        CREATE TABLE embeddings (
+                            id SERIAL PRIMARY KEY,
+                            text TEXT NOT NULL,
+                            embedding_model TEXT NOT NULL,
+                            chunk_strategy TEXT NOT NULL,
+                            chunk_size INTEGER,
+                            chunk_overlap INTEGER,
+                            avg_chunk_len FLOAT,
+                            num_chunks INTEGER,
+                            overall_score FLOAT,
+                            faithfulness FLOAT,
+                            answer_relevancy FLOAT,
+                            context_recall FLOAT,
+                            context_precision FLOAT,
+                            answer_correctness FLOAT,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """))
+                    print(f"[{jst_now_str()}] [INFO] embeddingsテーブルを作成しました")
+                else:
+                    print(f"[{jst_now_str()}] [INFO] embeddingsテーブルは既に存在します")
+                    
+                # コミットは自動的に行われる
+                
+    except Exception as e:
+        print(f"[{jst_now_str()}] [ERROR] データベース初期化エラー: {str(e)}")
+        # エラーの詳細をログに出力
+        import traceback
+        print(f"[{jst_now_str()}] [ERROR] スタックトレース:\n{traceback.format_exc()}")
+        raise
+    for route in app.routes:
+        print(f"[{jst_now_str()}] [ROUTE]", route.path, route.methods)
 
 # サーバ起動時にルート一覧を出力
 import threading
@@ -314,8 +371,12 @@ def semantic_chunk_text(text, chunk_size=1000, chunk_overlap=200, embedding_mode
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_ollama import OllamaLLM
+from langchain_community.embeddings import OllamaEmbeddings
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.embeddings import OllamaEmbeddings, HuggingFaceEmbeddings
+from langchain_community.vectorstores.pgvector import PGVector
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 from langchain_community.vectorstores.pgvector import PGVector
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -430,17 +491,39 @@ def get_embeddings(model_name: str):
 
 
 # Default models（モデルが未ダウンロードでもサーバーが起動できるように修正）
+current_llm = None
+current_embeddings = None
+
+# デフォルトでHuggingFaceのモデルを使用
 try:
+    # まずは軽量モデルを試す
     current_llm = get_llm("ollama_llama2")
 except Exception as e:
     import logging
-    logging.warning(f"LLM初期化失敗: {e}")
+    logging.warning(f"LLM初期化失敗 (ollama_llama2): {e}")
+    try:
+        # 代替モデルを試す
+        current_llm = get_llm("mistral")
+    except Exception as e2:
+        logging.warning(f"LLM初期化失敗 (mistral): {e2}")
+        current_llm = None
 
 try:
+    # デフォルトでHuggingFaceの軽量モデルを使用
     current_embeddings = get_embeddings("huggingface_bge_small")
+    if current_embeddings is None:
+        raise ValueError("Failed to initialize huggingface_bge_small")
+    logging.info("Successfully initialized HuggingFace BGE Small model")
 except Exception as e:
     import logging
-    logging.warning(f"Embedding初期化失敗: {e}")
+    logging.error(f"Embedding初期化失敗: {e}")
+    try:
+        # 代替モデルを試す
+        current_embeddings = get_embeddings("huggingface_miniLM")
+        logging.info("Falling back to HuggingFace MiniLM model")
+    except Exception as e2:
+        logging.error(f"代替Embeddingモデルの初期化にも失敗: {e2}")
+        current_embeddings = None
 
 # --- Pydantic Models ---
 class ChunkRequest(BaseModel):
@@ -454,8 +537,8 @@ class EmbedRequest(BaseModel):
 
 class QueryRequest(BaseModel):
     query: str
-    llm_model: str # Added for dynamic selection
-    embedding_model: str # Added for dynamic selection
+    llm_model: str = "mistral"  # デフォルト値を設定
+    embedding_model: str = "huggingface_bge_small"  # デフォルト値を設定
 
 class EvalRequest(BaseModel):
     questions: list[str]
@@ -514,34 +597,91 @@ def embed_and_store(request: EmbedRequest):
 @app.post("/query/")
 def query_rag(request: QueryRequest):
     try:
+        # モデルを初期化
         llm_instance = get_llm(request.llm_model)
         embeddings_instance = get_embeddings(request.embedding_model)
 
-        vectorstore = PGVector.from_documents(
-            documents=[],  # 空のドキュメントで初期化
-            embedding=embeddings_instance,
-            collection_name=get_collection_name(request.embedding_model)  # embeddingモデルごとにコレクションを切り替え
-        )
-        vectorstore.add_texts(texts=chunks)
-        retriever = vectorstore.as_retriever()
+        # データベースからテキストを取得
+        with SessionLocal() as session:
+            result = session.execute(
+                text("SELECT text FROM embeddings WHERE chunk_strategy = 'test'")
+            )
+            texts = [row[0] for row in result.fetchall()]
+            
+            if not texts:
+                return {
+                    "answer": "データベースにテストデータが見つかりません。先にテストデータを挿入してください。", 
+                    "contexts": []
+                }
 
-        template = """Answer the question based only on the following context:\n{context}\n\nQuestion: {question}"""
-        prompt = ChatPromptTemplate.from_template(template)
+            # ベクトルストアを初期化
+            collection_name = get_collection_name(request.embedding_model)
+            connection_string = "postgresql://rag_user:rag_password@db:5432/rag_db"
+            
+            # 既存のコレクションを削除
+            try:
+                session.execute(text(f"DROP TABLE IF EXISTS {collection_name} CASCADE"))
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                print(f"Warning: Failed to drop collection {collection_name}: {str(e)}")
+            
+            # 新しいコレクションを作成
+            vectorstore = PGVector(
+                embedding_function=embeddings_instance,
+                collection_name=collection_name,
+                connection_string=connection_string,
+                use_jsonb=True
+            )
+            
+            # チャンクを初期化（データベースから取得したテキストをそのまま使用）
+            chunks = texts
+            
+            # テキストを追加
+            vectorstore.add_texts(texts=texts)
+            
+            # リトリーバーを作成
+            retriever = vectorstore.as_retriever()
 
-        chain = (
-            {"context": retriever, "question": RunnablePassthrough()}
-            | prompt
-            | llm_instance
-            | StrOutputParser()
-        )
+            # プロンプトテンプレート
+            template = """以下の文脈に基づいて質問に答えてください。
 
-        answer = chain.invoke(request.query)
-        retrieved_docs = retriever.get_relevant_documents(request.query)
-        contexts = [doc.page_content for doc in retrieved_docs]
+文脈:
+{context}
 
-        return {"answer": answer, "contexts": contexts}
+質問: {question}"""
+            prompt = ChatPromptTemplate.from_template(template)
+
+            # チェーンを作成
+            chain = (
+                {"context": retriever, "question": RunnablePassthrough()}
+                | prompt
+                | llm_instance
+                | StrOutputParser()
+            )
+
+            # 質問に回答
+            answer = chain.invoke(request.query)
+            
+            # 関連するドキュメントを取得
+            retrieved_docs = retriever.get_relevant_documents(request.query)
+            contexts = [doc.page_content for doc in retrieved_docs]
+            
+            # 結果を返却
+            return {
+                "answer": answer, 
+                "contexts": contexts,
+                "source_documents": [{"page_content": doc.page_content} for doc in retrieved_docs]
+            }
+            
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"Error in query_rag: {error_trace}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"エラーが発生しました: {str(e)}\n{error_trace}"
+        )
 
 @app.post("/evaluate/")
 def evaluate_ragas(request: EvalRequest):

@@ -1713,6 +1713,10 @@ with tab3:
             results_df = pd.DataFrame(eval_results)
         else:
             results_df = pd.DataFrame([eval_results])
+            
+        # データの統計情報表示
+        print(f"\n=== データ統計情報 ===")
+        print(results_df.describe())
         
         # スコア情報を展開
         if 'scores' in results_df.columns:
@@ -1720,6 +1724,13 @@ with tab3:
             scores_df = pd.json_normalize(results_df['scores'])
             # 元のカラムと結合（接頭辞を付けて競合を避ける）
             results_df = pd.concat([results_df.drop('scores', axis=1), scores_df.add_prefix('score_')], axis=1)
+        
+        # データ型の変換
+        numeric_cols = ['avg_chunk_len', 'num_chunks', 'overall_score', 'faithfulness', 
+                       'answer_relevancy', 'context_recall', 'context_precision', 'answer_correctness']
+        for col in numeric_cols:
+            if col in results_df.columns:
+                results_df[col] = pd.to_numeric(results_df[col], errors='coerce')
         
         # 必要カラム補完・ラベル列追加
         required_cols = {
@@ -1743,7 +1754,7 @@ with tab3:
             if missing_cols:
                 st.info(f'バブルチャート用のカラムが不足しています: {missing_cols}。自動で仮値を補完します。')
                 for col in missing_cols:
-                    if col == 'chunk_strategy':
+                    if col in ['chunk_strategy', 'embedding_model']:
                         results_df[col] = 'unknown'
                     else:
                         results_df[col] = 0.0
@@ -1757,6 +1768,10 @@ with tab3:
                 results_df['label'] = results_df['chunk_strategy'] + '-' + results_df['chunk_size'].astype(str)
             else:
                 results_df['label'] = results_df['chunk_strategy']
+            
+            # データの統計情報表示
+            print(f"\n=== 最終的なデータ統計情報 ===")
+            print(results_df.describe())
         
         # オーバーラップ比較を表示
         if 'overlap' in results_df.columns and len(results_df['overlap'].unique()) > 1:

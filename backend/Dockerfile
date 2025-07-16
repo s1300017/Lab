@@ -21,7 +21,11 @@ RUN python -m nltk.downloader -d /usr/local/share/nltk_data punkt
 RUN mkdir -p /app/models
 
 # アプリケーションコードをコピー
-COPY ./app /app
+COPY app/main.py /app/main.py
+COPY app/logs /app/logs
+COPY app/uploads /app/uploads
+RUN ls -lR /app
+WORKDIR /app
 
 # 環境変数を設定
 ENV TRANSFORMERS_CACHE=/app/models
@@ -35,4 +39,4 @@ RUN if [ -d "/app/models" ]; then \
         mkdir -p /app/models; \
     fi
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["python3", "/app/main.py"]
