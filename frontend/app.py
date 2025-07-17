@@ -1424,8 +1424,9 @@ with tab1:
         st.subheader("チャンキング設定")
         chunk_method = st.radio("チャンク化方式", ["recursive", "semantic"], index=0, help="recursive: 文字数ベース, semantic: 意味ベース")
         chunk_size = st.slider("チャンクサイズ", 200, 4000, 1000, 100)
-        chunk_overlap = st.slider("チャンクオーバーラップ", 50, 1000, 200, 50)
+        chunk_overlap = st.slider("チャンクオーバーラップ", 0, 1000, 200, 50)
         embedding_model = st.selectbox("埋め込みモデル (semantic時必須)", ["huggingface_bge_small", "openai"], index=0)
+        
         if st.button("チャンキングとベクトル化"):
             with st.spinner('チャンキングとベクトル化を実行中...'):
                 # 1. Chunk
@@ -1446,9 +1447,15 @@ with tab1:
                     embed_response = requests.post(f"{BACKEND_URL}/embed_and_store/", json=embed_payload)
                     if embed_response.status_code == 200:
                         st.success(f"{len(st.session_state.chunks)}個のチャンクを生成し、ベクトル化しました。")
-                        # --- メインコンテンツ ---
-                        if not st.session_state.text:
-                            st.info("サイドバーでPDFファイルをアップロードし、設定を行ってください。")
+                    else:
+                        st.error(f"ベクトル化に失敗しました: {embed_response.text}")
+                else:
+                    st.error(f"チャンキングに失敗しました: {chunk_response.text}")
+
+# メインコンテンツ
+if not st.session_state.text:
+    st.info("サイドバーでPDFファイルをアップロードし、設定を行ってください。")
+    st.stop()
 
 # タブ2: 評価
 # PDFがアップロードされていない場合はチャット画面のみ表示
@@ -1465,20 +1472,20 @@ with tab2:
         
         # 質問と回答の入力
         questions = st.text_area("評価する質問を入力（1行に1つ）", 
-                              value="\n".join(st.session_state.get('qa_questions', [])), 
-                              height=150,
-                              help="評価したい質問を1行ずつ入力してください")
-        
+        value="\n".join(st.session_state.get('qa_questions', [])), 
+        height=150,
+        help="評価したい質問を1行ずつ入力してください")
+                
         answers = st.text_area("回答を入力（1行に1つ、質問と順番を合わせてください）", 
-                             value="\n".join(st.session_state.get('qa_answers', [])), 
-                             height=150,
-                             help="質問に対する回答を1行ずつ入力してください")
-        
+        value="\n".join(st.session_state.get('qa_answers', [])), 
+        height=150,
+        help="質問に対する回答を1行ずつ入力してください")
+                
         # 評価実行ボタン
         if st.button("評価を実行", key="evaluate_button_evaluation_tab"):
             questions = [q.strip() for q in questions.split('\n') if q.strip()]
             answers = [a.strip() for a in answers.split('\n') if a.strip()]
-            
+                        
             if not questions:
                 st.warning("評価する質問を入力してください。")
             elif len(questions) != len(answers):
@@ -1530,19 +1537,21 @@ with tab2:
                 st.metric("文脈再現率", f"{scores.get('context_recall', 0):.2f}")
             with col4:
                 st.metric("文脈適合率", f"{scores.get('context_precision', 0):.2f}")
-        
-        # 詳細な評価結果を表示
-        if 'results' in eval_results:
-            st.write("### 質問ごとの詳細")
-            for i, result in enumerate(eval_results['results']):
-                with st.expander(f"質問 {i+1}: {result.get('question', '')}"):
-                    st.write(f"**質問**: {result.get('question', '')}")
-                    st.write(f"**回答**: {result.get('answer', '')}")
-                    st.write(f"**スコア**: {result.get('score', 'N/A')}")
-                    if 'details' in result:
-                        st.json(result['details'])
-    else:
-        st.info("評価結果がありません。上記のフォームから評価を実行してください。")
+            
+            # 詳細な評価結果を表示
+            if 'results' in eval_results and eval_results['results']:
+                st.write("### 質問ごとの詳細")
+                for i, result in enumerate(eval_results['results']):
+                    if not isinstance(result, dict):
+                        continue
+                    with st.expander(f"質問 {i+1}: {result.get('question', '')}"):
+                        st.write(f"**質問**: {result.get('question', '')}")
+                        st.write(f"**回答**: {result.get('answer', '')}")
+                        st.write(f"**スコア**: {result.get('score', 'N/A')}")
+                        if 'details' in result and result['details']:
+                            st.json(result['details'])
+        else:
+            st.info("評価結果がありません。上記のフォームから評価を実行してください。")
 
 # 一括評価タブ
 with tab3:
@@ -1566,21 +1575,19 @@ with tab3:
     )
     selected_embeddings = [embedding_options[label] for label in selected_labels]
 
-    # チャンク分割方式・パラメータ複数選択
+    # チャンク分割方法の選択
     chunk_methods = st.multiselect(
-        "チャンク分割方式を選択",
-        ["fixed", "recursive", "semantic", "sentence", "paragraph"],
-        default=["fixed", "recursive", "semantic"]
+        "チャンク分割方法 (複数選択可)",
+        options=["recursive", "fixed", "semantic", "sentence", "paragraph"],
+        default=["recursive"],
+        help="複数選択することで、異なるチャンク分割方法を比較できます。"
     )
     
-    # セマンティックチャンキングが単独で選択されているかチェック
-    is_semantic_only = chunk_methods == ["semantic"]
+    # セマンティックチャンキングの選択状態をチェック
+    is_semantic_only = len(chunk_methods) == 1 and "semantic" in chunk_methods
     
-    # セマンティックチャンキングが単独で選択されている場合、注意メッセージを表示
-    if is_semantic_only:
-        st.warning("セマンティックチャンキングが単独で選択されています。チャンクサイズとオーバーラップは無視されます。")
-    # セマンティックと他の方法が同時に選択されている場合
-    elif "semantic" in chunk_methods:
+    # セマンティックと他の方法が同時に選択されている場合の処理
+    if "semantic" in chunk_methods and len(chunk_methods) > 1:
         st.info("セマンティックチャンキングと他の方法が同時に選択されています。チャンクサイズとオーバーラップは、他の方法に適用されます。")
     
     # チャンクサイズの選択
@@ -1855,11 +1862,23 @@ with tab3:
             if 'overlap' not in results_df.columns and 'chunk_overlap' in results_df.columns:
                 results_df['overlap'] = results_df['chunk_overlap']
             
-            # ラベル列を追加（chunk_sizeがあれば含める）
-            if 'chunk_size' in results_df.columns:
-                results_df['label'] = results_df['chunk_strategy'] + '-' + results_df['chunk_size'].astype(str)
-            else:
-                results_df['label'] = results_df['chunk_strategy']
+            # セマンティックチャンキングの重複を削除（チャンクサイズ/オーバーラップの違いによる）
+            semantic_mask = results_df['chunk_strategy'] == 'semantic'
+            if semantic_mask.any():
+                # セマンティックチャンキングの最初のエントリのみを保持
+                first_semantic_idx = results_df[semantic_mask].index[0]
+                results_df = results_df[~semantic_mask | (results_df.index == first_semantic_idx)]
+            
+            # ラベル列を追加（セマンティックチャンキングの場合はチャンクサイズを表示しない）
+            def create_label(row):
+                if row['chunk_strategy'] == 'semantic':
+                    return 'semantic'  # セマンティックチャンキングは常に'semantic'というラベルを使用
+                elif 'chunk_size' in row:
+                    return f"{row['chunk_strategy']}-{int(row['chunk_size'])}"
+                else:
+                    return row['chunk_strategy']
+            
+            results_df['label'] = results_df.apply(create_label, axis=1)
             
             # データの統計情報表示
             print(f"\n=== 最終的なデータ統計情報 ===")
@@ -1952,17 +1971,24 @@ with tab3:
             # モデルごとにバーチャートを表示
             for model_name, model_data in model_groups:
                 if not model_data.empty and 'chunk_strategy' in model_data.columns and 'overall_score' in model_data.columns:
-                    # チャンク戦略ごとのパフォーマンスを集計
-                    strategy_scores = model_data.groupby('chunk_strategy')['overall_score'].mean().sort_values(ascending=False)
+                    # チャンク戦略ごとのパフォーマンスを集計（セマンティックチャンキングは1つにまとめる）
+                    def normalize_strategy(row):
+                        return 'semantic' if row['chunk_strategy'] == 'semantic' else f"{row['chunk_strategy']}-{row.get('chunk_size', '')}"
                     
-                    # データフレームの作成
+                    model_data['strategy_key'] = model_data.apply(normalize_strategy, axis=1)
+                    strategy_scores = model_data.groupby('strategy_key')['overall_score'].mean().sort_values(ascending=False)
+                    
+                    # チャンク戦略ごとの平均スコアを表示
+                    st.subheader(f"モデル: {model_name} - チャンク戦略別スコア")
+                    st.bar_chart(strategy_scores, use_container_width=True)
+                    
+                    # バーチャートの作成
                     bar_data = pd.DataFrame({
                         'strategy': strategy_scores.index,
                         'score': strategy_scores.values,
                         'score_text': [f"{x:.3f}" for x in strategy_scores.values]
                     })
                     
-                    # バーチャートの作成
                     fig_bar = px.bar(
                         data_frame=bar_data,
                         x='score',

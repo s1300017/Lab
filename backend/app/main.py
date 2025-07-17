@@ -323,50 +323,79 @@ def paragraph_chunk_text(text):
     paras = re.split(r'\n\s*\n', text)
     return [p.strip() for p in paras if p.strip()]
 
-def semantic_chunk_text(text, chunk_size=1000, chunk_overlap=200, embedding_model=None):
+def semantic_chunk_text(text, chunk_size=None, chunk_overlap=None, embedding_model=None, similarity_threshold=0.7):
     """
     セマンティックチャンク分割：
     1. 文単位で分割
     2. 各文のembeddingを取得
     3. コサイン類似度で分割点を決定し、意味的に自然なチャンクを作成
+    
+    Note:
+        chunk_size と chunk_overlap パラメータは互換性のために残されていますが、
+        セマンティックチャンキングでは使用されません。
+    
+    Args:
+        text: 分割するテキスト
+        chunk_size: 互換性のためのパラメータ（使用されません）
+        chunk_overlap: 互換性のためのパラメータ（使用されません）
+        embedding_model: 埋め込みモデル（必須）
+        similarity_threshold: センテンス間の類似度閾値（0〜1）
+    
+    Returns:
+        list: チャンク化されたテキストのリスト
     """
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity
+    
     # 文単位で分割
     sentences = nltk.sent_tokenize(text)
     if not sentences:
         return [text]
+        
+    print(f"セマンティックチャンキング: {len(sentences)}文を処理中...")
+    
     # 各文のembedding取得
     if embedding_model is None:
         raise ValueError("embedding_modelが指定されていません")
-    embeddings = embedding_model.embed_documents(sentences)
+    
+    # バッチ処理で埋め込みを取得（大量の文がある場合に備えて）
+    batch_size = 32
+    embeddings = []
+    for i in range(0, len(sentences), batch_size):
+        batch = sentences[i:i+batch_size]
+        batch_embeddings = embedding_model.embed_documents(batch)
+        embeddings.extend(batch_embeddings)
+    
     # チャンク生成
     chunks = []
     current_chunk = []
-    current_len = 0
-    i = 0
-    while i < len(sentences):
-        current_chunk.append(sentences[i])
-        current_len += len(sentences[i])
-        # チャンクサイズを超えたら区切る
-        if current_len >= chunk_size or i == len(sentences) - 1:
-            # overlapを考慮（直前の文からchunk_overlap分だけ残す）
-            if chunk_overlap > 0 and i != len(sentences) - 1:
-                overlap_len = 0
-                overlap_chunk = []
-                j = len(current_chunk) - 1
-                while j >= 0 and overlap_len < chunk_overlap:
-                    overlap_chunk.insert(0, current_chunk[j])
-                    overlap_len += len(current_chunk[j])
-                    j -= 1
-                # 次のチャンクの先頭にoverlap_chunkを追加
-                if i+1 < len(sentences):
-                    next_start = i+1 - len(overlap_chunk)
-                    if next_start < 0:
-                        next_start = 0
-                    i = next_start
-            chunks.append(' '.join(current_chunk))
-            current_chunk = []
-            current_len = 0
-        i += 1
+    
+    for i in range(len(sentences)):
+        current_sentence = sentences[i]
+        current_embedding = np.array(embeddings[i]).reshape(1, -1)
+        
+        # 現在のチャンクが空の場合は追加
+        if not current_chunk:
+            current_chunk.append(current_sentence)
+            continue
+            
+        # 現在のチャンクの最後の文との類似度を計算
+        last_embedding = np.array(embeddings[i-1]).reshape(1, -1)
+        similarity = cosine_similarity(last_embedding, current_embedding)[0][0]
+        
+        # 類似度が閾値より低い場合にのみ新しいチャンクを開始
+        if similarity < similarity_threshold:
+            if current_chunk:  # 現在のチャンクを保存
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [current_sentence]  # 新しいチャンクを開始
+        else:
+            current_chunk.append(current_sentence)
+    
+    # 最後のチャンクを追加
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    print(f"セマンティックチャンキング完了: {len(chunks)}個のチャンクを生成")
     return chunks
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -530,6 +559,8 @@ class ChunkRequest(BaseModel):
     text: str
     chunk_size: int = 1000
     chunk_overlap: int = 200
+    chunk_method: str = 'recursive'  # 'recursive' or 'semantic'
+    embedding_model: str = None  # Required for semantic chunking
 
 class EmbedRequest(BaseModel):
     chunks: list[str]
@@ -558,26 +589,58 @@ class ModelSelection(BaseModel):
 @app.post("/chunk/")
 def chunk_text(request: ChunkRequest):
     """
-    chunk_methodに応じてrecursiveまたはsemanticで分割
+    chunk_methodに応じて適切な方法でテキストをチャンク分割
+    - recursive: 再帰的にテキストを分割（デフォルト）
+    - semantic: 意味的なまとまりで分割（embeddingモデルが必要）
     """
-    chunk_method = getattr(request, 'chunk_method', 'recursive')
-    embedding_model = getattr(request, 'embedding_model', None)
-    if chunk_method == 'semantic':
-        # embedding_model必須
-        if embedding_model is None:
-            raise HTTPException(status_code=400, detail="semantic chunkingにはembedding_modelが必要です")
-        embedder = get_embeddings(embedding_model)
-        chunks = semantic_chunk_text(request.text, chunk_size=request.chunk_size, chunk_overlap=request.chunk_overlap, embedding_model=embedder)
-    elif chunk_method == 'recursive':
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=request.chunk_size,
-            chunk_overlap=request.chunk_overlap,
-            length_function=len,
-        )
-        chunks = text_splitter.split_text(request.text)
+    if request.chunk_method == 'semantic':
+        # embedding_modelが指定されていることを確認
+        if not request.embedding_model:
+            raise HTTPException(
+                status_code=400,
+                detail="semanticチャンキングにはembedding_modelの指定が必要です"
+            )
+        try:
+            # 埋め込みモデルを取得
+            embedder = get_embeddings(request.embedding_model)
+            print(f"セマンティックチャンキングを開始します（chunk_sizeとchunk_overlapは無視されます）...")
+            # セマンティックチャンキングを実行（chunk_sizeとchunk_overlapは無視）
+            chunks = semantic_chunk_text(
+                text=request.text,
+                chunk_size=None,  # 無視される
+                chunk_overlap=None,  # 無視される
+                embedding_model=embedder
+            )
+            return {"chunks": chunks}
+            
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"セマンティックチャンキング中にエラーが発生しました: {str(e)}"
+            )
+            
+    elif request.chunk_method == 'recursive':
+        # 再帰的チャンキング（デフォルト）
+        try:
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=request.chunk_size,
+                chunk_overlap=request.chunk_overlap,
+                length_function=len,
+            )
+            chunks = text_splitter.split_text(request.text)
+            return {"chunks": chunks}
+            
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"テキストのチャンキング中にエラーが発生しました: {str(e)}"
+            )
     else:
-        raise HTTPException(status_code=400, detail=f"未対応のchunk_method: {chunk_method}")
-    return {"chunks": chunks}
+        # 未対応のチャンキング方法が指定された場合
+        raise HTTPException(
+            status_code=400,
+            detail=f"未対応のchunk_method: {request.chunk_method}。'recursive' または 'semantic' を指定してください。"
+        )
 
 
 @app.post("/embed_and_store/")
@@ -897,13 +960,14 @@ async def bulk_evaluate(request: Request):
                 chunk_sizes = data.get("chunk_sizes", [data.get("chunk_size", 1000)])
                 chunk_overlaps = data.get("chunk_overlaps", [data.get("chunk_overlap", 0)])
                 
-                # セマンティックチャンキングが単独で選択されているかチェック
-                is_semantic_only = chunk_methods == ["semantic"]
-                if is_semantic_only and (any(size != 1000 for size in chunk_sizes) or any(overlap != 0 for overlap in chunk_overlaps)):
-                    print("注意: セマンティックチャンキングが単独で選択されているため、チャンクサイズとオーバーラップの値は無視されます。")
-                # セマンティックと他の方法が同時に選択されている場合
-                elif "semantic" in chunk_methods:
-                    print("情報: セマンティックチャンキングと他の方法が同時に選択されています。チャンクサイズとオーバーラップは、他の方法に適用されます。")
+                # セマンティックチャンキングが選択されている場合の情報メッセージ
+                if "semantic" in chunk_methods:
+                    if len(chunk_methods) == 1:
+                        print("情報: セマンティックチャンキングが選択されました。チャンクサイズとオーバーラップは使用されません。")
+                    else:
+                        print(f"情報: セマンティックチャンキングとその他のチャンキング方式が同時に選択されています。")
+                        print(f"      セマンティックチャンキング: デフォルトパラメータを使用")
+                        print(f"      その他の方式: 指定されたチャンクサイズとオーバーラップを使用")
 
                 # 必須パラメータチェック
                 sample_text = data.get("text")
@@ -924,31 +988,69 @@ async def bulk_evaluate(request: Request):
                 for i in range(len(chunk_methods)):
                     try:
                         chunk_method = chunk_methods[i]
-                        chunk_size = chunk_sizes[i] if i < len(chunk_sizes) else 0
-                        chunk_overlap = chunk_overlaps[i] if i < len(chunk_overlaps) else 0
-
-                        # チャンク分割方式ごとに分岐
-                        if chunk_method == "recursive":
-                            splitter = RecursiveCharacterTextSplitter(
-                                chunk_size=int(chunk_size),
-                                chunk_overlap=int(chunk_overlap),
-                                length_function=len
-                            )
-                            chunks = splitter.split_text(sample_text)
-                        elif chunk_method == "fixed":
-                            chunks = fixed_chunk_text(sample_text, chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap))
-                        elif chunk_method == "semantic":
+                        
+                        # セマンティックチャンキングの場合、チャンクサイズとオーバーラップは無視する
+                        if chunk_method == "semantic":
                             if not embedding_model:
-                                results.append({"error": "semantic chunkingにはembedding_modelが必要です", "chunk_method": chunk_method, "chunk_size": chunk_size, "chunk_overlap": chunk_overlap})
+                                results.append({
+                                    "error": "セマンティックチャンキングにはembedding_modelの指定が必須です", 
+                                    "chunk_method": chunk_method
+                                })
                                 continue
-                            chunks = semantic_chunk_text(sample_text, chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap), embedding_model=embedder)
-                        elif chunk_method == "sentence":
-                            chunks = sentence_chunk_text(sample_text)
-                        elif chunk_method == "paragraph":
-                            chunks = paragraph_chunk_text(sample_text)
+                                
+                            print(f"セマンティックチャンキングを開始します（chunk_sizeとchunk_overlapは無視されます）...")
+                            
+                            # セマンティックチャンキングのパラメータを取得
+                            semantic_params = data.get("semantic_params", {})
+                            similarity_threshold = float(semantic_params.get("similarity_threshold", 0.7))
+                            
+                            print(f"セマンティックチャンキングを実行: similarity_threshold={similarity_threshold}")
+                            chunks = semantic_chunk_text(
+                                text=sample_text,
+                                chunk_size=None,  # 無視される
+                                chunk_overlap=None,  # 無視される
+                                embedding_model=embedder,
+                                similarity_threshold=similarity_threshold
+                            )
+                            
+                            # セマンティックチャンキングの場合はchunk_sizeとchunk_overlapをNoneに設定
+                            chunk_size_val = None
+                            chunk_overlap_val = None
+                            chunk_strategy = "semantic"
                         else:
-                            results.append({"error": f"未対応のchunk_method: {chunk_method}", "chunk_method": chunk_method, "chunk_size": chunk_size, "chunk_overlap": chunk_overlap})
-                            continue
+                            # 通常のチャンキング方法の場合
+                            chunk_size = chunk_sizes[i] if i < len(chunk_sizes) else 1000
+                            chunk_overlap = chunk_overlaps[i] if i < len(chunk_overlaps) else 200
+                            # チャンク分割
+                            if chunk_method == "recursive":
+                                text_splitter = RecursiveCharacterTextSplitter(
+                                    chunk_size=chunk_sizes[i],
+                                    chunk_overlap=chunk_overlaps[i],
+                                    length_function=len,
+                                )
+                                chunks = text_splitter.split_text(sample_text)
+                            elif chunk_method == "fixed":
+                                chunks = fixed_chunk_text(
+                                    sample_text, 
+                                    chunk_size=chunk_sizes[i], 
+                                    chunk_overlap=chunk_overlaps[i]
+                                )
+                            elif chunk_method == "sentence":
+                                chunks = sentence_chunk_text(sample_text)
+                            elif chunk_method == "paragraph":
+                                chunks = paragraph_chunk_text(sample_text)
+                            # semanticチャンキングは上記のif文で既に処理済み
+                            else:
+                                raise ValueError(f"未対応のchunk_method: {chunk_method}")
+                            
+                            # チャンク戦略を設定
+                            chunk_size_val = chunk_sizes[i] if i < len(chunk_sizes) else chunk_sizes[0]
+                            chunk_overlap_val = chunk_overlaps[i] if i < len(chunk_overlaps) else chunk_overlaps[0]
+                            chunk_strategies = data.get("chunk_strategies", []) if isinstance(data, dict) else []
+                            if chunk_strategies and i < len(chunk_strategies):
+                                chunk_strategy = chunk_strategies[i]
+                            else:
+                                chunk_strategy = f"{chunk_method}-{chunk_size_val}-{chunk_overlap_val}"
 
                         # ベクトルストア構築
                         vectorstore = PGVector.from_documents(
@@ -1071,17 +1173,24 @@ async def bulk_evaluate(request: Request):
                         required_keys = [
                             "overall_score", "faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness", "avg_chunk_len", "num_chunks"
                         ]
-                        chunk_size_val = chunk_sizes[i] if i < len(chunk_sizes) else chunk_sizes[0]
-                        chunk_overlap_val = chunk_overlaps[i] if i < len(chunk_overlaps) else chunk_overlaps[0]
-                        chunk_strategies = data.get("chunk_strategies", []) if isinstance(data, dict) else []
-                        if chunk_strategies and i < len(chunk_strategies):
-                            chunk_strategy = chunk_strategies[i]
+                        
+                        # チャンク戦略を設定
+                        if chunk_method == "semantic":
+                            chunk_strategy = "semantic"
                         else:
-                            chunk_strategy = f"{chunk_method}-{chunk_size_val}-{chunk_overlap_val}"
+                            chunk_size_val = chunk_sizes[i] if i < len(chunk_sizes) else chunk_sizes[0]
+                            chunk_overlap_val = chunk_overlaps[i] if i < len(chunk_overlaps) else chunk_overlaps[0]
+                            chunk_strategies = data.get("chunk_strategies", []) if isinstance(data, dict) else []
+                            if chunk_strategies and i < len(chunk_strategies):
+                                chunk_strategy = chunk_strategies[i]
+                            else:
+                                chunk_strategy = f"{chunk_method}-{chunk_size_val}-{chunk_overlap_val}"
+                        
+                        # 評価結果を格納する辞書を作成
                         response_dict = {
                             "embedding_model": embedding_model,
-                            "chunk_size": chunk_size_val,
-                            "chunk_overlap": chunk_overlap_val,
+                            "chunk_size": chunk_size_val if chunk_method != "semantic" else None,
+                            "chunk_overlap": chunk_overlap_val if chunk_method != "semantic" else None,
                             "chunk_method": chunk_method,
                             "overall_score": overall_score,
                             "faithfulness": metrics_avg["faithfulness"],
@@ -1094,6 +1203,10 @@ async def bulk_evaluate(request: Request):
                             "avg_chunk_len": avg_chunk_len,
                             "metrics": metrics_per_qa
                         }
+                        
+                        # セマンティックチャンキングの場合は類似度閾値を追加
+                        if chunk_method == "semantic":
+                            response_dict["similarity_threshold"] = similarity_threshold
                         for k in required_keys:
                             if k not in response_dict:
                                 response_dict[k] = 0.0
