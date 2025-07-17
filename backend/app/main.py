@@ -746,6 +746,88 @@ def query_rag(request: QueryRequest):
             detail=f"エラーが発生しました: {str(e)}\n{error_trace}"
         )
 
+def calculate_overlap_metrics(contexts: list[list[str]], embedder=None) -> dict:
+    """複数のオーバーラップメトリクスを計算する
+    
+    Args:
+        contexts: コンテキストのリスト
+        embedder: オプションの埋め込みモデル（セマンティックオーバーラップ用）
+    
+    Returns:
+        dict: 各種オーバーラップメトリクスを含む辞書
+    """
+    if not contexts or len(contexts) < 2:
+        return {
+            "overlap_ratio": 0.0,
+            "adjacent_overlap": [0.0],
+            "semantic_overlap": 0.0
+        }
+    
+    # 1. 元のオーバーラップ計算（後方互換性のため保持）
+    all_tokens = []
+    for ctx in contexts:
+        if isinstance(ctx, str):
+            all_tokens.extend(ctx.split())
+        else:
+            for text in ctx:
+                all_tokens.extend(text.split())
+    
+    unique_tokens = set(all_tokens)
+    total_tokens = len(all_tokens)
+    unique_count = len(unique_tokens)
+    
+    overlap_ratio = 1.0 - (unique_count / total_tokens) if total_tokens > 0 else 0.0
+    
+    # 2. 隣接チャンク間のオーバーラップ
+    adjacent_overlaps = []
+    for i in range(len(contexts) - 1):
+        # 現在のチャンクと次のチャンクのトークンを取得
+        current_ctx = contexts[i] if isinstance(contexts[i], list) else [contexts[i]]
+        next_ctx = contexts[i+1] if isinstance(contexts[i+1], list) else [contexts[i+1]]
+        
+        current_tokens = set(' '.join(current_ctx).split())
+        next_tokens = set(' '.join(next_ctx).split())
+        
+        # 共通トークン数を計算
+        common_tokens = current_tokens.intersection(next_tokens)
+        min_len = min(len(current_tokens), len(next_tokens))
+        
+        # オーバーラップ率を計算
+        overlap = len(common_tokens) / min_len if min_len > 0 else 0.0
+        adjacent_overlaps.append(overlap)
+    
+    # 3. セマンティックオーバーラップ（埋め込みモデルが利用可能な場合）
+    semantic_overlap = 0.0
+    if embedder and len(contexts) > 1:
+        try:
+            # 各チャンクを1つの文字列に結合
+            chunk_texts = [' '.join(ctx) if isinstance(ctx, list) else ctx for ctx in contexts]
+            
+            # 埋め込みを取得
+            embeddings = embedder.embed_documents(chunk_texts)
+            
+            # 隣接チャンク間の類似度を計算
+            similarities = []
+            for i in range(len(embeddings) - 1):
+                # コサイン類似度を計算
+                sim = cosine_similarity(
+                    [embeddings[i]], 
+                    [embeddings[i+1]]
+                )[0][0]
+                similarities.append(sim)
+            
+            semantic_overlap = sum(similarities) / len(similarities) if similarities else 0.0
+        except Exception as e:
+            print(f"セマンティックオーバーラップの計算中にエラーが発生しました: {str(e)}")
+            semantic_overlap = 0.0
+    
+    return {
+        "overlap_ratio": overlap_ratio,
+        "adjacent_overlap": adjacent_overlaps,
+        "avg_adjacent_overlap": sum(adjacent_overlaps) / len(adjacent_overlaps) if adjacent_overlaps else 0.0,
+        "semantic_overlap": semantic_overlap
+    }
+
 @app.post("/evaluate/")
 def evaluate_ragas(request: EvalRequest):
     try:
@@ -770,43 +852,24 @@ def evaluate_ragas(request: EvalRequest):
 
         # オーバーラップメトリクスを追加
         if request.include_overlap_metrics:
-            # コンテキストからオーバーラップを計算する関数
-            def calculate_overlap(contexts: list[list[str]]) -> float:
-                if not contexts or len(contexts) < 2:
-                    return 0.0
-                
-                # すべてのコンテキストを結合してトークン化
-                all_tokens = []
-                for ctx in contexts:
-                    if isinstance(ctx, str):
-                        all_tokens.extend(ctx.split())
-                    else:
-                        for text in ctx:
-                            all_tokens.extend(text.split())
-                
-                # 重複するトークン数を計算
-                unique_tokens = set(all_tokens)
-                total_tokens = len(all_tokens)
-                unique_count = len(unique_tokens)
-                
-                if total_tokens == 0:
-                    return 0.0
-                    
-                # 重複率を計算 (0.0 〜 1.0)
-                overlap_ratio = 1.0 - (unique_count / total_tokens) if total_tokens > 0 else 0.0
-                return overlap_ratio
-
-            # 各質問のコンテキストに対してオーバーラップを計算
-            overlap_scores = []
-            for ctx_list in request.contexts:
-                overlap = calculate_overlap(ctx_list)
-                overlap_scores.append(overlap)
+            # 拡張されたオーバーラップメトリクスを計算
+            overlap_metrics = calculate_overlap_metrics(request.contexts, embeddings_instance)
             
-            # 平均オーバーラップをスコアに追加
-            avg_overlap = sum(overlap_scores) / len(overlap_scores) if overlap_scores else 0.0
+            # 各質問のコンテキストに対してオーバーラップを計算
+            per_question_overlaps = []
+            for ctx_list in request.contexts:
+                metrics = calculate_overlap_metrics(ctx_list, embeddings_instance)
+                per_question_overlaps.append(metrics)
+            
+            # 平均オーバーラップを計算
+            avg_overlap = overlap_metrics["overlap_ratio"]
+            avg_adjacent_overlap = overlap_metrics.get("avg_adjacent_overlap", 0.0)
+            semantic_overlap = overlap_metrics.get("semantic_overlap", 0.0)
         else:
-            overlap_scores = [0.0] * len(request.questions)
             avg_overlap = 0.0
+            avg_adjacent_overlap = 0.0
+            semantic_overlap = 0.0
+            per_question_overlaps = [{"overlap_ratio": 0.0, "adjacent_overlap": [0.0], "semantic_overlap": 0.0} for _ in request.contexts]
 
         # 評価を実行
         result = evaluate(
@@ -834,7 +897,9 @@ def evaluate_ragas(request: EvalRequest):
         # オーバーラップメトリクスを追加
         if request.include_overlap_metrics:
             scores["overlap_ratio"] = avg_overlap
-            scores["overlap_scores"] = overlap_scores
+            scores["avg_adjacent_overlap"] = avg_adjacent_overlap
+            scores["semantic_overlap"] = semantic_overlap
+            scores["per_question_overlaps"] = per_question_overlaps
         
         return scores
     except Exception as e:

@@ -1583,33 +1583,48 @@ with tab3:
         help="複数選択することで、異なるチャンク分割方法を比較できます。"
     )
     
-    # セマンティックチャンキングの選択状態をチェック
-    is_semantic_only = len(chunk_methods) == 1 and "semantic" in chunk_methods
+    # サイズ/オーバーラップを必要とするチャンク方法を定義
+    NEEDS_SIZE_OVERLAP = ["recursive", "fixed"]
     
-    # セマンティックと他の方法が同時に選択されている場合の処理
-    if "semantic" in chunk_methods and len(chunk_methods) > 1:
-        st.info("セマンティックチャンキングと他の方法が同時に選択されています。チャンクサイズとオーバーラップは、他の方法に適用されます。")
+    # 選択されたチャンク方法から、サイズ/オーバーラップが必要かどうかを判定
+    needs_size_overlap = any(method in chunk_methods for method in NEEDS_SIZE_OVERLAP)
+    has_semantic = "semantic" in chunk_methods
     
-    # チャンクサイズの選択
+    # チャンクサイズの選択（必要な場合のみ有効化）
     chunk_sizes = st.multiselect(
         "チャンクサイズ（文字数）",
         [128, 256, 500, 1000, 1500, 2000],
-        default=[500, 1000],
-        disabled=is_semantic_only  # セマンティックのみの場合は無効化
+        default=[500, 1000] if needs_size_overlap else [1000],
+        disabled=not needs_size_overlap,
+        help="recursive/fixedチャンキングの場合に使用されます。"
     )
     
-    # オーバーラップの選択
+    # オーバーラップの選択（必要な場合のみ有効化）
     chunk_overlaps = st.multiselect(
         "オーバーラップ（文字数）",
         [0, 32, 64, 100, 200, 300],
-        default=[0, 100, 200],
-        disabled=is_semantic_only  # セマンティックのみの場合は無効化
+        default=[0, 100] if needs_size_overlap else [0],
+        disabled=not needs_size_overlap,
+        help="recursive/fixedチャンキングの場合に使用されます。"
     )
     
-    # セマンティックチャンキングのみが選択されている場合、デフォルト値を設定
-    if is_semantic_only and (not chunk_sizes or not chunk_overlaps):
-        chunk_sizes = [1000]  # ダミーの値（使用されない）
-        chunk_overlaps = [0]  # ダミーの値（使用されない）
+    # 情報表示
+    # サイズ/オーバーラップを必要としないチャンク方法
+    non_size_methods = ["semantic", "sentence", "paragraph"]
+    selected_non_size_methods = [m for m in chunk_methods if m in non_size_methods]
+    
+    if selected_non_size_methods and needs_size_overlap:
+        methods_text = "、".join(selected_non_size_methods)
+        st.info(f"{methods_text}チャンキングは意味的なまとまりで分割されるため、サイズ/オーバーラップの影響を受けません。")
+    elif selected_non_size_methods:
+        methods_text = "、".join(selected_non_size_methods)
+        st.info(f"{methods_text}チャンキングは意味的なまとまりで分割されるため、サイズ/オーバーラップは不要です。")
+    
+    # デフォルト値の設定（バリデーション用）
+    if not chunk_sizes:
+        chunk_sizes = [1000]  # デフォルト値
+    if not chunk_overlaps:
+        chunk_overlaps = [0]  # デフォルト値
     
     st.caption("※Embeddingモデル・チャンク分割方式・サイズ・オーバーラップの全組み合わせで自動一括評価を実行します")
 
@@ -1628,9 +1643,10 @@ with tab3:
             invalid_combinations = []
             valid_combinations = []
             
-            # 有効な組み合わせのみ抽出
+            # 有効な組み合わせを生成
             for method in chunk_methods:
-                if method in ["fixed", "recursive", "semantic"]:
+                if method in NEEDS_SIZE_OVERLAP:
+                    # サイズ/オーバーラップを必要とするチャンク方法
                     for size in chunk_sizes:
                         for overlap in chunk_overlaps:
                             if size > overlap:
@@ -1638,7 +1654,8 @@ with tab3:
                             else:
                                 invalid_combinations.append((method, size, overlap))
                 else:
-                    # size/overlapを使わない方式は一度だけNoneで追加
+                    # サイズ/オーバーラップを必要としないチャンク方法
+                    # これらの方法ではサイズ/オーバーラップは無視される
                     valid_combinations.append((method, None, None))
             
             if not valid_combinations:
@@ -1871,12 +1888,31 @@ with tab3:
             
             # ラベル列を追加（セマンティックチャンキングの場合はチャンクサイズを表示しない）
             def create_label(row):
-                if row['chunk_strategy'] == 'semantic':
-                    return 'semantic'  # セマンティックチャンキングは常に'semantic'というラベルを使用
-                elif 'chunk_size' in row:
-                    return f"{row['chunk_strategy']}-{int(row['chunk_size'])}"
+                # セマンティックチャンキングの場合は常に'semantic'というラベルを使用
+                if row.get('chunk_strategy') == 'semantic':
+                    return 'semantic'
+                
+                # チャンク戦略が存在しない場合はデフォルト値を設定
+                chunk_strategy = row.get('chunk_strategy', 'unknown')
+                
+                # chunk_sizeとchunk_overlapを安全に取得
+                try:
+                    chunk_size = int(row.get('chunk_size', 0))
+                except (ValueError, TypeError):
+                    chunk_size = 0
+                    
+                try:
+                    chunk_overlap = int(row.get('chunk_overlap', 0))
+                except (ValueError, TypeError):
+                    chunk_overlap = 0
+                
+                # ラベルを生成
+                if chunk_size > 0 and chunk_overlap > 0:
+                    return f"{chunk_strategy}-{chunk_size}-{chunk_overlap}"
+                elif chunk_size > 0:
+                    return f"{chunk_strategy}-{chunk_size}"
                 else:
-                    return row['chunk_strategy']
+                    return chunk_strategy
             
             results_df['label'] = results_df.apply(create_label, axis=1)
             
