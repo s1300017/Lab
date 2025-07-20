@@ -913,32 +913,24 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                         else:
                             strategy_value = str(strategy)
                         
-                        # ダミーの行データを作成
-                        row = {'chunk_strategy': str(strategy_value).strip()}
+                        # チャンク戦略から基本戦略名を抽出
+                        strategy_parts = str(strategy_value).strip().split('-')
+                        base_strategy = strategy_parts[0].lower()
                         
-                        # チャンクサイズとオーバーラップを追加（0も明示的に設定）
-                    if not strategy_data.empty:
                         # デバッグ情報を出力
                         print("\n=== 行データのデバッグ情報 ===")
-                        print(f"戦略データの列: {strategy_data.columns.tolist()}")
-                        print(f"chunk_size の有無: {'chunk_size' in strategy_data.columns}")
-                        print(f"chunk_overlap の有無: {'chunk_overlap' in strategy_data.columns}")
+                        print(f"元の戦略値: {strategy_value}")
+                        print(f"抽出した基本戦略: {base_strategy}")
                         
-                        if 'chunk_size' in strategy_data.columns:
-                            chunk_size = strategy_data.iloc[0].get('chunk_size')
-                            print(f"取得した chunk_size: {chunk_size} (型: {type(chunk_size)})")
-                            row['chunk_size'] = int(chunk_size) if pd.notna(chunk_size) else 0
-                        
-                        if 'chunk_overlap' in strategy_data.columns:
-                            chunk_overlap = strategy_data.iloc[0].get('chunk_overlap')
-                            print(f"取得した chunk_overlap: {chunk_overlap} (型: {type(chunk_overlap)})")
-                            # 0 も明示的に設定
-                            row['chunk_overlap'] = int(chunk_overlap) if pd.notna(chunk_overlap) else 0
-                        
-                        print(f"設定後の row: {row}")
-                        
-                        # create_label関数を使用して表示用の戦略名を取得
-                        display_strategy = create_label(row)
+                        # 基本戦略がシンプル戦略の場合はそのまま使用
+                        simple_strategies = ['semantic', 'sentence', 'paragraph']
+                        if base_strategy in simple_strategies:
+                            display_strategy = base_strategy
+                            print(f"シンプル戦略を検出: {display_strategy}")
+                        else:
+                            # パラメトリック戦略の場合は、chunk_strategyをそのまま使用
+                            display_strategy = str(strategy_value).strip()
+                            print(f"パラメトリック戦略を検出: {display_strategy}")
                     
                     # デバッグ用
                     print(f"レーダーチャート戦略名処理 - 元の戦略: {strategy}")
@@ -2147,19 +2139,38 @@ with tab3:
                     def normalize_strategy(row):
                         return 'semantic' if row['chunk_strategy'] == 'semantic' else f"{row['chunk_strategy']}-{row.get('chunk_size', '')}"
                     
-                    model_data['strategy_key'] = model_data.apply(normalize_strategy, axis=1)
-                    strategy_scores = model_data.groupby('strategy_key')['overall_score'].mean().sort_values(ascending=False)
+                    # 戦略名を正規化
+                    def format_strategy(row):
+                        strategy = str(row['chunk_strategy']).strip()
+                        # 基本戦略を抽出
+                        base_strategy = strategy.split('-')[0].lower()
+                        # シンプル戦略の場合は基本戦略名のみを返す
+                        if base_strategy in ['semantic', 'sentence', 'paragraph']:
+                            return base_strategy
+                        # パラメトリック戦略の場合はchunk_strategyをそのまま使用
+                        return strategy
+                    
+                    # 正規化した戦略名を追加
+                    model_data['formatted_strategy'] = model_data.apply(format_strategy, axis=1)
+                    
+                    # スコアを計算
+                    strategy_scores = model_data.groupby('formatted_strategy')['overall_score'].mean().sort_values(ascending=False)
                     
                     # チャンク戦略ごとの平均スコアを表示
                     st.subheader(f"モデル: {model_name} - チャンク戦略別スコア")
-                    # 戦略名をフォーマット
-                    strategy_scores.index = strategy_scores.index.map(
-                        lambda x: x.split('-')[0].lower() if x.split('-')[0].lower() in ['semantic', 'sentence', 'paragraph'] else x
-                    )
                     
+                    # データフレーム表示用に整形
+                    display_df = strategy_scores.reset_index()
+                    display_df.columns = ['チャンク戦略', '平均スコア']
+                    display_df['平均スコア'] = display_df['平均スコア'].round(3)
+                    
+                    # データフレームを表示
+                    st.dataframe(display_df, use_container_width=True)
+                    
+                    # バーチャートを表示
                     st.bar_chart(strategy_scores, use_container_width=True)
                     
-                    # バーチャートの作成
+                    # バーチャートのデータを準備
                     bar_data = pd.DataFrame({
                         'strategy': strategy_scores.index,
                         'score': strategy_scores.values,
