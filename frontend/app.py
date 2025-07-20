@@ -916,12 +916,26 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                         # ダミーの行データを作成
                         row = {'chunk_strategy': str(strategy_value).strip()}
                         
-                        # チャンクサイズとオーバーラップを追加
-                        if not strategy_data.empty:
-                            if 'chunk_size' in strategy_data.columns:
-                                row['chunk_size'] = strategy_data.iloc[0].get('chunk_size', 0)
-                            if 'chunk_overlap' in strategy_data.columns:
-                                row['chunk_overlap'] = strategy_data.iloc[0].get('chunk_overlap', 0)
+                        # チャンクサイズとオーバーラップを追加（0も明示的に設定）
+                    if not strategy_data.empty:
+                        # デバッグ情報を出力
+                        print("\n=== 行データのデバッグ情報 ===")
+                        print(f"戦略データの列: {strategy_data.columns.tolist()}")
+                        print(f"chunk_size の有無: {'chunk_size' in strategy_data.columns}")
+                        print(f"chunk_overlap の有無: {'chunk_overlap' in strategy_data.columns}")
+                        
+                        if 'chunk_size' in strategy_data.columns:
+                            chunk_size = strategy_data.iloc[0].get('chunk_size')
+                            print(f"取得した chunk_size: {chunk_size} (型: {type(chunk_size)})")
+                            row['chunk_size'] = int(chunk_size) if pd.notna(chunk_size) else 0
+                        
+                        if 'chunk_overlap' in strategy_data.columns:
+                            chunk_overlap = strategy_data.iloc[0].get('chunk_overlap')
+                            print(f"取得した chunk_overlap: {chunk_overlap} (型: {type(chunk_overlap)})")
+                            # 0 も明示的に設定
+                            row['chunk_overlap'] = int(chunk_overlap) if pd.notna(chunk_overlap) else 0
+                        
+                        print(f"設定後の row: {row}")
                         
                         # create_label関数を使用して表示用の戦略名を取得
                         display_strategy = create_label(row)
@@ -1954,7 +1968,7 @@ with tab3:
             
             # ラベル列を追加（semantic/sentence/paragraphは戦略名のみ、他はサイズ・オーバーラップを含む）
             def create_label(row):
-                # デバッグ用に現在の行の情報を表示
+                # デバッグ情報を出力
                 print(f"\n=== ラベル生成デバッグ開始 ===")
                 print(f"行データ全体: {row}")
                 print(f"行データの型: {type(row)}")
@@ -1962,24 +1976,24 @@ with tab3:
                 # チャンク戦略を安全に取得
                 chunk_strategy = str(row.get('chunk_strategy', 'unknown')).strip()
                 print(f"1. 元の chunk_strategy: {chunk_strategy} (型: {type(chunk_strategy)})")
-                
+
                 # チャンク戦略から基本戦略名を抽出
                 strategy_parts = chunk_strategy.split('-')
                 base_strategy = strategy_parts[0].lower()
                 print(f"2. 抽出した基本戦略名: {base_strategy}")
-                
+
                 # シンプル戦略の定義
                 simple_strategies = ['semantic', 'sentence', 'paragraph']
                 print(f"3. シンプル戦略リスト: {simple_strategies}")
-                
+
                 # シンプル戦略のチェック
                 is_simple = base_strategy in simple_strategies
                 print(f"4. シンプル戦略チェック: {is_simple} ({base_strategy} in {simple_strategies})")
-                
+
                 if is_simple:
                     print(f"5. シンプル戦略を検出: {base_strategy} を返します")
                     return base_strategy
-                
+
                 # 未知の戦略の処理
                 if base_strategy == 'unknown':
                     print("6. 未知の戦略を検出: 'unknown'を返します")
@@ -1987,23 +2001,42 @@ with tab3:
 
                 # パラメトリック戦略の処理
                 try:
-                    chunk_size = int(row.get('chunk_size', 0))
-                    chunk_overlap = int(row.get('chunk_overlap', 0))
-                    print(f"7. チャンクサイズ: {chunk_size}, オーバーラップ: {chunk_overlap}")
+                    # 数値の取得と変換
+                    chunk_size = row.get('chunk_size')
+                    chunk_overlap = row.get('chunk_overlap')
                     
-                    if chunk_size > 0 and chunk_overlap > 0:
+                    # デバッグ情報を出力
+                    print(f"7. チャンクサイズ: {chunk_size} (型: {type(chunk_size)}), オーバーラップ: {chunk_overlap} (型: {type(chunk_overlap)})")
+                    
+                    # 数値に変換（NoneやNaNの場合は0を設定）
+                    if pd.notna(chunk_size):
+                        chunk_size = int(float(chunk_size))  # floatを経由してintに変換
+                    else:
+                        chunk_size = 0
+                        
+                    if pd.notna(chunk_overlap):
+                        chunk_overlap = int(float(chunk_overlap))  # floatを経由してintに変換
+                    else:
+                        chunk_overlap = 0
+                        
+                    print(f"8. 変換後 - チャンクサイズ: {chunk_size}, オーバーラップ: {chunk_overlap}")
+
+                    # ラベルを生成
+                    if chunk_size > 0:
+                        # オーバーラップが0でも明示的に表示
                         result = f"{base_strategy}-{chunk_size}-{chunk_overlap}"
-                    elif chunk_size > 0:
-                        result = f"{base_strategy}-{chunk_size}"
+                        print(f"9. パラメトリック戦略 (サイズとオーバーラップ): {result}")
                     else:
                         result = base_strategy
-                        
-                    print(f"8. 生成されたラベル: {result}")
+                        print(f"10. 基本戦略のみ: {result}")
+
+                    print(f"11. 生成されたラベル: {result}")
                     return result
-                    
-                except (ValueError, TypeError) as e:
-                    print(f"9. エラーが発生しました: {e}")
-                    print(f"   エラーのため、基本戦略名 {base_strategy} を返します")
+
+                except Exception as e:
+                    print(f"12. エラーが発生しました: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
                     return base_strategy
                     
             results_df['label'] = results_df.apply(create_label, axis=1)
