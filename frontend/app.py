@@ -1900,10 +1900,6 @@ with tab3:
         else:
             results_df = pd.DataFrame([eval_results])
             
-        # データの統計情報表示
-        print(f"\n=== データ統計情報 ===")
-        print(results_df.describe())
-        
         # スコア情報を展開
         if 'scores' in results_df.columns:
             # スコアが辞書形式で格納されている場合、各スコアを個別のカラムに展開
@@ -1929,117 +1925,63 @@ with tab3:
             if f'score_{col}' in results_df.columns and col not in results_df.columns:
                 results_df[col] = results_df[f'score_{col}']
         
-        missing_cols = required_cols - set(results_df.columns)
-        
+        # chunk_methodをchunk_strategyとして使用（存在する場合）
         if 'chunk_method' in results_df.columns and 'chunk_strategy' not in results_df.columns:
             results_df['chunk_strategy'] = results_df['chunk_method']
-            st.info('chunk_strategy列をchunk_methodから補完しました')
         
-        if len(results_df) > 0:
-            # 不足カラムの補完
-            if missing_cols:
-                st.info(f'バブルチャート用のカラムが不足しています: {missing_cols}。自動で仮値を補完します。')
-                for col in missing_cols:
-                    if col in ['chunk_strategy', 'embedding_model']:
-                        results_df[col] = 'unknown'
-                    else:
-                        results_df[col] = 0.0
+        # オーバーラップ情報を追加（chunk_overlapをデフォルト値として使用）
+        if 'overlap' not in results_df.columns and 'chunk_overlap' in results_df.columns:
+            results_df['overlap'] = results_df['chunk_overlap']
+        
+        # 不足カラムの補完
+        missing_cols = required_cols - set(results_df.columns)
+        if missing_cols:
+            st.info(f'不足しているカラムを補完します: {missing_cols}')
+            for col in missing_cols:
+                if col in ['chunk_strategy', 'embedding_model']:
+                    results_df[col] = 'unknown'
+                else:
+                    results_df[col] = 0.0
+        
+        # 重複を削除（同じchunk_strategyとembedding_modelの組み合わせで最初のエントリを保持）
+        results_df = results_df.drop_duplicates(
+            subset=['chunk_strategy', 'embedding_model'], 
+            keep='first'
+        )
+        
+        # ラベルを生成する関数（最適化版）
+        def create_label(row):
+            chunk_strategy = str(row.get('chunk_strategy', 'unknown')).strip()
+            strategy_parts = chunk_strategy.split('-')
+            base_strategy = strategy_parts[0].lower()
             
-            # オーバーラップ情報を追加（chunk_overlapをデフォルト値として使用）
-            if 'overlap' not in results_df.columns and 'chunk_overlap' in results_df.columns:
-                results_df['overlap'] = results_df['chunk_overlap']
-            
-            # シンプル戦略（semantic, sentence, paragraph）の重複を削除
-            simple_strategies = ['semantic', 'sentence', 'paragraph']
-            for strategy in simple_strategies:
-                strategy_mask = results_df['chunk_strategy'].str.startswith(strategy)
-                if strategy_mask.any():
-                    # 各戦略の最初のエントリのみを保持
-                    first_idx = results_df[strategy_mask].index[0]
-                    results_df = results_df[~strategy_mask | (results_df.index == first_idx)]
-            
-            # ラベル列を追加（semantic/sentence/paragraphは戦略名のみ、他はサイズ・オーバーラップを含む）
-            def create_label(row):
-                # デバッグ情報を出力
-                print(f"\n=== ラベル生成デバッグ開始 ===")
-                print(f"行データ全体: {row}")
-                print(f"行データの型: {type(row)}")
+            # シンプル戦略の場合は基本名のみ返す
+            if base_strategy in ['semantic', 'sentence', 'paragraph']:
+                return base_strategy
                 
-                # チャンク戦略を安全に取得
-                chunk_strategy = str(row.get('chunk_strategy', 'unknown')).strip()
-                print(f"1. 元の chunk_strategy: {chunk_strategy} (型: {type(chunk_strategy)})")
-
-                # チャンク戦略から基本戦略名を抽出
-                strategy_parts = chunk_strategy.split('-')
-                base_strategy = strategy_parts[0].lower()
-                print(f"2. 抽出した基本戦略名: {base_strategy}")
-
-                # シンプル戦略の定義
-                simple_strategies = ['semantic', 'sentence', 'paragraph']
-                print(f"3. シンプル戦略リスト: {simple_strategies}")
-
-                # シンプル戦略のチェック
-                is_simple = base_strategy in simple_strategies
-                print(f"4. シンプル戦略チェック: {is_simple} ({base_strategy} in {simple_strategies})")
-
-                if is_simple:
-                    print(f"5. シンプル戦略を検出: {base_strategy} を返します")
-                    return base_strategy
-
-                # 未知の戦略の処理
-                if base_strategy == 'unknown':
-                    print("6. 未知の戦略を検出: 'unknown'を返します")
-                    return 'unknown'
-
-                # パラメトリック戦略の処理
-                try:
-                    # 数値の取得と変換
-                    chunk_size = row.get('chunk_size')
-                    chunk_overlap = row.get('chunk_overlap')
+            # 未知の戦略の処理
+            if base_strategy == 'unknown':
+                return 'unknown'
+                
+            # パラメトリック戦略の処理
+            try:
+                chunk_size = int(float(row.get('chunk_size', 0)))
+                chunk_overlap = int(float(row.get('chunk_overlap', 0)))
+                
+                if chunk_size > 0:
+                    return f"{base_strategy}-{chunk_size}-{chunk_overlap}"
+                return base_strategy
                     
-                    # デバッグ情報を出力
-                    print(f"7. チャンクサイズ: {chunk_size} (型: {type(chunk_size)}), オーバーラップ: {chunk_overlap} (型: {type(chunk_overlap)})")
-                    
-                    # 数値に変換（NoneやNaNの場合は0を設定）
-                    if pd.notna(chunk_size):
-                        chunk_size = int(float(chunk_size))  # floatを経由してintに変換
-                    else:
-                        chunk_size = 0
-                        
-                    if pd.notna(chunk_overlap):
-                        chunk_overlap = int(float(chunk_overlap))  # floatを経由してintに変換
-                    else:
-                        chunk_overlap = 0
-                        
-                    print(f"8. 変換後 - チャンクサイズ: {chunk_size}, オーバーラップ: {chunk_overlap}")
-
-                    # ラベルを生成
-                    if chunk_size > 0:
-                        # オーバーラップが0でも明示的に表示
-                        result = f"{base_strategy}-{chunk_size}-{chunk_overlap}"
-                        print(f"9. パラメトリック戦略 (サイズとオーバーラップ): {result}")
-                    else:
-                        result = base_strategy
-                        print(f"10. 基本戦略のみ: {result}")
-
-                    print(f"11. 生成されたラベル: {result}")
-                    return result
-
-                except Exception as e:
-                    print(f"12. エラーが発生しました: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-                    return base_strategy
-                    
-            results_df['label'] = results_df.apply(create_label, axis=1)
-            
-            # デバッグ用にラベル付与後のデータフレームを表示
-            print("\n=== ラベル付与後のデータフレーム ===")
+            except (ValueError, TypeError):
+                return base_strategy
+        
+        # ラベル列を追加
+        results_df['label'] = results_df.apply(create_label, axis=1)
+        
+        # デバッグ情報を出力（必要に応じてコメントアウト）
+        if 'debug' in st.session_state and st.session_state.debug:
+            print("\n=== 処理後のデータフレーム ===")
             print(results_df[['chunk_strategy', 'chunk_size', 'chunk_overlap', 'label']].to_string())
-            
-            # データの統計情報表示
-            print(f"\n=== 最終的なデータ統計情報 ===")
-            print(results_df.describe())
         
         # オーバーラップ比較を表示
         if 'overlap' in results_df.columns and len(results_df['overlap'].unique()) > 1:
@@ -2136,10 +2078,6 @@ with tab3:
             for model_name, model_data in model_groups:
                 if not model_data.empty and 'chunk_strategy' in model_data.columns and 'overall_score' in model_data.columns:
                     # チャンク戦略ごとのパフォーマンスを集計（セマンティックチャンキングは1つにまとめる）
-                    def normalize_strategy(row):
-                        return 'semantic' if row['chunk_strategy'] == 'semantic' else f"{row['chunk_strategy']}-{row.get('chunk_size', '')}"
-                    
-                    # 戦略名を正規化
                     def format_strategy(row):
                         strategy = str(row['chunk_strategy']).strip()
                         # 基本戦略を抽出
@@ -2219,8 +2157,10 @@ with tab3:
                     st.markdown('<br>', unsafe_allow_html=True)
             
             # チャンク戦略ごとにレーダーチャートを表示
-            if 'chunk_strategy' in results_df.columns:
-                chunk_strategies = results_df['chunk_strategy'].unique()
+            if 'chunk_strategy' in results_df.columns and 'label' in results_df.columns:
+                # メトリクスとその日本語ラベルを定義
+                metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
+                metrics_jp = ["信頼性", "回答の関連性", "コンテキストの再現性", "コンテキストの正確性", "回答の正確性"]
                 
                 # ユニークなラベルでループ
                 for label in results_df['label'].unique():
@@ -2228,22 +2168,17 @@ with tab3:
                     strategy_data = results_df[results_df['label'] == label]
                     
                     if not strategy_data.empty:
-                        # デバッグ情報を出力
-                        print(f"\n=== レーダーチャート生成: {label} ===")
-                        print(f"使用するラベル: {label}")
-                        print(f"データ件数: {len(strategy_data)}")
-                        
-                        # サブヘッダーにラベルを使用
                         st.subheader(f"{label} - 評価メトリクスの比較")
                         fig_radar = go.Figure()
                         
                         # 各モデルのデータを追加
-                        for model_name, model_data in model_groups:
-                            model_strategy_data = strategy_data[strategy_data['embedding_model'] == model_name] if 'embedding_model' in strategy_data.columns else strategy_data
+                        for model_name in strategy_data['embedding_model'].unique():
+                            # モデル名でフィルタリング
+                            model_data = strategy_data[strategy_data['embedding_model'] == model_name]
                             
-                            if not model_strategy_data.empty:
+                            if not model_data.empty:
                                 # 各メトリクスの平均値を計算
-                                r_values = [model_strategy_data[m].mean() if m in model_strategy_data.columns else 0.5 for m in metrics]
+                                r_values = [model_data[m].mean() if m in model_data.columns else 0.5 for m in metrics]
                                 
                                 fig_radar.add_trace(go.Scatterpolar(
                                     r=r_values,
@@ -2277,17 +2212,18 @@ with tab3:
                             legend=dict(
                                 orientation='h',
                                 yanchor='bottom',
-                                y=1.15,
-                                xanchor='center',
+                                y=1.1,
                                 x=0.5,
-                                font=dict(size=12)
+                                xanchor='center',
+                                font=dict(size=10)
                             ),
-                            margin=dict(l=60, r=60, t=30, b=60),  # 上部マージンを小さく調整
+                            margin=dict(l=40, r=40, t=80, b=40),
                             height=500,
                             paper_bgcolor='rgba(0,0,0,0)',
                             plot_bgcolor='rgba(0,0,0,0)'
                         )
                         
+                        # レーダーチャートを表示
                         st.plotly_chart(fig_radar, use_container_width=True)
                         st.markdown('<br>', unsafe_allow_html=True)
             
