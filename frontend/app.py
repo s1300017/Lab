@@ -143,20 +143,53 @@ def plot_overlap_comparison(results_df: pd.DataFrame) -> None:
                                 if len(size_data) > 0:
                                     color_idx = i % len(colors)
                                     
+                                    # ラベル列を使用して戦略名を取得
+                                    if 'label' in size_data.columns:
+                                        display_strategy = size_data['label'].iloc[0]
+                                    else:
+                                        # ラベル列が存在しない場合は元のロジックを使用
+                                        strategy = size_data['chunk_strategy'].iloc[0]
+                                        if isinstance(strategy, str):
+                                            base_strategy = strategy.split('-')[0].lower()
+                                            if base_strategy in ['semantic', 'sentence', 'paragraph']:
+                                                display_strategy = base_strategy
+                                            else:
+                                                display_strategy = f"{base_strategy}-{chunk_size}"
+                                        else:
+                                            display_strategy = str(strategy)
+                                    
+                                    # ホバーテキストのフォーマットを決定
+                                    if isinstance(display_strategy, str) and any(s in display_strategy for s in ['semantic', 'sentence', 'paragraph']):
+                                        hover_text = f'<b>{display_strategy}</b><br>オーバーラップ: %{{x}}<br>スコア: %{{y:.3f}}<extra></extra>'
+                                    else:
+                                        hover_text = f'<b>{display_strategy} (チャンク: {chunk_size})</b><br>オーバーラップ: %{{x}}<br>スコア: %{{y:.3f}}<extra></extra>'
+                                    
                                     fig.add_trace(go.Scatter(
                                         x=size_data['overlap'],
                                         y=size_data[metric],
-                                        name=f"チャンクサイズ: {chunk_size}",
+                                        name=display_strategy,
                                         mode='lines+markers',
                                         line=dict(width=3, color=colors[color_idx]),
                                         marker=dict(size=10, color=colors[color_idx]),
-                                        hovertemplate=f'<b>{model} (チャンク: {chunk_size})</b><br>オーバーラップ: %{{x}}<br>スコア: %{{y:.3f}}<extra></extra>',
+                                        hovertemplate=hover_text,
                                         showlegend=True
                                     ))
                             
                             # レイアウトを設定
+                            # チャンク戦略名を取得（create_label関数を使用）
+                            strategy_name = 'チャンクサイズ別比較'  # デフォルト値
+                            if 'chunk_strategy' in model_data.columns:
+                                # データフレームの最初の行から戦略名を取得
+                                strategy = model_data.iloc[0]
+                                # create_label関数を使用して戦略名を生成
+                                base_strategy = create_label(strategy)
+                                if base_strategy in ['semantic', 'sentence', 'paragraph']:
+                                    strategy_name = f"{base_strategy}戦略"
+                                else:
+                                    strategy_name = f"{base_strategy}戦略 - チャンクサイズ別比較"
+                            
                             fig.update_layout(
-                                title=f"{model} - チャンクサイズ別比較",
+                                title=f"{model} - {strategy_name}",
                                 xaxis_title="オーバーラップサイズ (トークン数)",
                                 yaxis_title=f"{metric} スコア (0-1)",
                                 template='plotly_white',
@@ -870,9 +903,40 @@ def create_zip_with_graphs(bulk_results: Union[dict, list], filename: str = "gra
                         )
                     
                     # レイアウトの調整
+                    # 戦略名を取得（既にラベルが付与されている場合はそれを使用）
+                    if 'label' in strategy_data.columns and not strategy_data.empty:
+                        display_strategy = strategy_data.iloc[0]['label']
+                    else:
+                        # ラベルが付与されていない場合は、既存のロジックでラベルを生成
+                        if hasattr(strategy, 'iloc'):  # pandas.Seriesの場合
+                            strategy_value = strategy.iloc[0] if not strategy.empty else str(strategy)
+                        else:
+                            strategy_value = str(strategy)
+                        
+                        # ダミーの行データを作成
+                        row = {'chunk_strategy': str(strategy_value).strip()}
+                        
+                        # チャンクサイズとオーバーラップを追加
+                        if not strategy_data.empty:
+                            if 'chunk_size' in strategy_data.columns:
+                                row['chunk_size'] = strategy_data.iloc[0].get('chunk_size', 0)
+                            if 'chunk_overlap' in strategy_data.columns:
+                                row['chunk_overlap'] = strategy_data.iloc[0].get('chunk_overlap', 0)
+                        
+                        # create_label関数を使用して表示用の戦略名を取得
+                        display_strategy = create_label(row)
+                    
+                    # デバッグ用
+                    print(f"レーダーチャート戦略名処理 - 元の戦略: {strategy}")
+                    print(f"使用する表示戦略名: {display_strategy}")
+                    
+                    # タイトルを設定
+                    title_text = f"{display_strategy} - 評価メトリクスの比較"
+                    print(f"設定するタイトル: {title_text}")
+                    
                     fig_radar.update_layout(
                         title={
-                            'text': f"{strategy} - 評価メトリクスの比較",
+                            'text': title_text,
                             'x': 0.5,
                             'xanchor': 'center',
                             'y': 0.95,  # 上部に余白を確保
@@ -1879,42 +1943,74 @@ with tab3:
             if 'overlap' not in results_df.columns and 'chunk_overlap' in results_df.columns:
                 results_df['overlap'] = results_df['chunk_overlap']
             
-            # セマンティックチャンキングの重複を削除（チャンクサイズ/オーバーラップの違いによる）
-            semantic_mask = results_df['chunk_strategy'] == 'semantic'
-            if semantic_mask.any():
-                # セマンティックチャンキングの最初のエントリのみを保持
-                first_semantic_idx = results_df[semantic_mask].index[0]
-                results_df = results_df[~semantic_mask | (results_df.index == first_semantic_idx)]
+            # シンプル戦略（semantic, sentence, paragraph）の重複を削除
+            simple_strategies = ['semantic', 'sentence', 'paragraph']
+            for strategy in simple_strategies:
+                strategy_mask = results_df['chunk_strategy'].str.startswith(strategy)
+                if strategy_mask.any():
+                    # 各戦略の最初のエントリのみを保持
+                    first_idx = results_df[strategy_mask].index[0]
+                    results_df = results_df[~strategy_mask | (results_df.index == first_idx)]
             
-            # ラベル列を追加（セマンティックチャンキングの場合はチャンクサイズを表示しない）
+            # ラベル列を追加（semantic/sentence/paragraphは戦略名のみ、他はサイズ・オーバーラップを含む）
             def create_label(row):
-                # セマンティックチャンキングの場合は常に'semantic'というラベルを使用
-                if row.get('chunk_strategy') == 'semantic':
-                    return 'semantic'
+                # デバッグ用に現在の行の情報を表示
+                print(f"\n=== ラベル生成デバッグ開始 ===")
+                print(f"行データ全体: {row}")
+                print(f"行データの型: {type(row)}")
                 
-                # チャンク戦略が存在しない場合はデフォルト値を設定
-                chunk_strategy = row.get('chunk_strategy', 'unknown')
+                # チャンク戦略を安全に取得
+                chunk_strategy = str(row.get('chunk_strategy', 'unknown')).strip()
+                print(f"1. 元の chunk_strategy: {chunk_strategy} (型: {type(chunk_strategy)})")
                 
-                # chunk_sizeとchunk_overlapを安全に取得
+                # チャンク戦略から基本戦略名を抽出
+                strategy_parts = chunk_strategy.split('-')
+                base_strategy = strategy_parts[0].lower()
+                print(f"2. 抽出した基本戦略名: {base_strategy}")
+                
+                # シンプル戦略の定義
+                simple_strategies = ['semantic', 'sentence', 'paragraph']
+                print(f"3. シンプル戦略リスト: {simple_strategies}")
+                
+                # シンプル戦略のチェック
+                is_simple = base_strategy in simple_strategies
+                print(f"4. シンプル戦略チェック: {is_simple} ({base_strategy} in {simple_strategies})")
+                
+                if is_simple:
+                    print(f"5. シンプル戦略を検出: {base_strategy} を返します")
+                    return base_strategy
+                
+                # 未知の戦略の処理
+                if base_strategy == 'unknown':
+                    print("6. 未知の戦略を検出: 'unknown'を返します")
+                    return 'unknown'
+
+                # パラメトリック戦略の処理
                 try:
                     chunk_size = int(row.get('chunk_size', 0))
-                except (ValueError, TypeError):
-                    chunk_size = 0
-                    
-                try:
                     chunk_overlap = int(row.get('chunk_overlap', 0))
-                except (ValueError, TypeError):
-                    chunk_overlap = 0
-                
-                # ラベルを生成
-                if chunk_size > 0 and chunk_overlap > 0:
-                    return f"{chunk_strategy}-{chunk_size}-{chunk_overlap}"
-                elif chunk_size > 0:
-                    return f"{chunk_strategy}-{chunk_size}"
-                else:
-                    return chunk_strategy
-            
+                    print(f"7. チャンクサイズ: {chunk_size}, オーバーラップ: {chunk_overlap}")
+                    
+                    if chunk_size > 0 and chunk_overlap > 0:
+                        result = f"{base_strategy}-{chunk_size}-{chunk_overlap}"
+                    elif chunk_size > 0:
+                        result = f"{base_strategy}-{chunk_size}"
+                    else:
+                        result = base_strategy
+                        
+                    print(f"8. 生成されたラベル: {result}")
+                    return result
+                    
+                except (ValueError, TypeError) as e:
+                    print(f"9. エラーが発生しました: {e}")
+                    print(f"   エラーのため、基本戦略名 {base_strategy} を返します")
+                    return base_strategy
+                    
             results_df['label'] = results_df.apply(create_label, axis=1)
+            
+            # デバッグ用にラベル付与後のデータフレームを表示
+            print("\n=== ラベル付与後のデータフレーム ===")
+            print(results_df[['chunk_strategy', 'chunk_size', 'chunk_overlap', 'label']].to_string())
             
             # データの統計情報表示
             print(f"\n=== 最終的なデータ統計情報 ===")
@@ -1953,6 +2049,11 @@ with tab3:
                     plot_data = model_data.copy()
                     plot_data['bubble_size'] = bubble_sizes
                     
+                    # 戦略名をフォーマット
+                    plot_data['formatted_strategy'] = plot_data['chunk_strategy'].apply(
+                        lambda x: x.split('-')[0].lower() if x.split('-')[0].lower() in ['semantic', 'sentence', 'paragraph'] else x
+                    )
+                    
                     fig_bubble = px.scatter(
                         data_frame=plot_data,
                         x="num_chunks",
@@ -1962,10 +2063,12 @@ with tab3:
                         hover_data={
                             "chunk_size": True,
                             "chunk_strategy": True,
+                            "formatted_strategy": False,  # ホバーには表示しないが、カスタムホバーテキストで使用
                             "num_chunks": True,
                             "avg_chunk_len": ":.1f",
                             "overall_score": ".3f"
                         },
+                        hover_name="formatted_strategy",  # ホバーに表示される戦略名をフォーマット済みのものに
                         labels={
                             "num_chunks": "チャンク数",
                             "avg_chunk_len": "平均チャンク長",
@@ -2016,6 +2119,11 @@ with tab3:
                     
                     # チャンク戦略ごとの平均スコアを表示
                     st.subheader(f"モデル: {model_name} - チャンク戦略別スコア")
+                    # 戦略名をフォーマット
+                    strategy_scores.index = strategy_scores.index.map(
+                        lambda x: x.split('-')[0].lower() if x.split('-')[0].lower() in ['semantic', 'sentence', 'paragraph'] else x
+                    )
+                    
                     st.bar_chart(strategy_scores, use_container_width=True)
                     
                     # バーチャートの作成
@@ -2070,11 +2178,19 @@ with tab3:
             if 'chunk_strategy' in results_df.columns:
                 chunk_strategies = results_df['chunk_strategy'].unique()
                 
-                for strategy in chunk_strategies:
-                    strategy_data = results_df[results_df['chunk_strategy'] == strategy]
+                # ユニークなラベルでループ
+                for label in results_df['label'].unique():
+                    # ラベルに対応するデータを取得
+                    strategy_data = results_df[results_df['label'] == label]
                     
                     if not strategy_data.empty:
-                        st.subheader(f"{strategy} - 評価メトリクスの比較")
+                        # デバッグ情報を出力
+                        print(f"\n=== レーダーチャート生成: {label} ===")
+                        print(f"使用するラベル: {label}")
+                        print(f"データ件数: {len(strategy_data)}")
+                        
+                        # サブヘッダーにラベルを使用
+                        st.subheader(f"{label} - 評価メトリクスの比較")
                         fig_radar = go.Figure()
                         
                         # 各モデルのデータを追加
