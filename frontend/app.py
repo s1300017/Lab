@@ -1627,6 +1627,23 @@ with tab2:
 with tab3:
     st.header("一括評価")
     st.markdown("Embeddingモデル・チャンク分割方式・サイズ・オーバーラップの全組み合わせで一括自動評価を行います。")
+    
+    # スコアの説明を表示
+    with st.expander("評価指標の説明", expanded=True):
+        st.markdown("""
+        ### 評価指標の説明
+        
+        | 指標 | 説明 | 理想値 |
+        |------|------|------|
+        | **Faithfulness (信頼性)** | 生成された回答が、提供されたコンテキストに忠実であるかどうかを測定 | 1.0 |
+        | **Answer Relevancy (回答の関連性)** | 回答が質問とどれだけ関連しているかを測定 | 1.0 |
+        | **Context Recall (コンテキストの再現性)** | 関連するすべての情報が検索結果に含まれているかを測定 | 1.0 |
+        | **Context Precision (コンテキストの正確性)** | 検索結果のうち、関連する情報がどれだけ正確に含まれているかを測定 | 1.0 |
+        | **Answer Correctness (回答の正確性)** | 回答の事実関係が正しいかどうかを測定 | 1.0 |
+        | **Overall Score (総合スコア)** | 上記のスコアを平均した総合的な評価値 | 1.0 |
+        
+        **注:** すべてのスコアは0〜1の範囲で正規化されており、1に近いほど良い結果を示します。
+        """)
 
     # Embeddingモデルの複数選択
     embedding_options = {
@@ -2021,6 +2038,36 @@ with tab3:
                         lambda x: x.split('-')[0].lower() if x.split('-')[0].lower() in ['semantic', 'sentence', 'paragraph'] else x
                     )
                     
+                    # バブルチャートの説明を表示
+                    with st.expander(f"{model_name} - バブルチャートの見方", expanded=False):
+                        st.markdown(f"""
+                        ### バブルチャートの見方
+                        - **X軸**: チャンク数 - ドキュメントがいくつのチャンクに分割されたか
+                        - **Y軸**: 平均チャンクサイズ - 1チャンクあたりの平均文字数
+                        - **バブルのサイズ**: 総合スコアに基づく（スコアが高いほど大きい）
+                        - **バブルの色**: 総合スコア（青に近いほどスコアが高い）
+                        
+                        ### スコアの算出方法
+                        - **総合スコア (Overall Score)**:
+                          ```
+                          総合スコア = (faithfulness + answer_relevancy + context_recall + context_precision + answer_correctness) / 5
+                          ```
+                          各メトリクスは0〜1の値を取り、1に近いほど良い結果です。
+                          
+                        - **バブルサイズの計算**:
+                          ```
+                          バブルサイズ = min(総合スコア * 20, 50)
+                          ```
+                          （最小サイズは5、最大サイズは50に制限）
+                        
+                        #### 解釈のポイント
+                        - **右上**: チャンク数が多く、チャンクサイズも大きい（情報量は多いが、精度に影響する可能性）
+                        - **左下**: チャンク数が少なく、チャンクサイズも小さい（精度は高いが、情報が不足する可能性）
+                        - **バブルの色とサイズ**: 青くて大きいバブルほど、効率的なチャンク戦略です
+                        
+                        **注**: マウスオーバーで各データポイントの詳細な数値を確認できます
+                        """)
+                    
                     fig_bubble = px.scatter(
                         data_frame=plot_data,
                         x="num_chunks",
@@ -2105,10 +2152,26 @@ with tab3:
                     # データフレームを表示
                     st.dataframe(display_df, use_container_width=True)
                     
-                    # バーチャートを表示
-                    st.bar_chart(strategy_scores, use_container_width=True)
+                    # バーチャートの説明を表示
+                    with st.expander(f"{model_name} - バーチャートの見方", expanded=False):
+                        st.markdown(f"""
+                        ### バーチャートのスコア計算方法
+                        - 各バーは異なるチャンク戦略のパフォーマンスを表します
+                        - スコアは0〜1の範囲で、1に近いほど良い結果です
+                        - 計算方法：
+                          ```
+                          平均スコア = Σ(各評価データの総合スコア) / 評価データ数
+                          ```
+                          - 総合スコアの計算式:
+                            ```
+                            総合スコア = (faithfulness + answer_relevancy + context_recall + context_precision + answer_correctness) / 5
+                            ```
+                          - 各メトリクスは0〜1の値を取り、1に近いほど良い結果です
+                        - バーの色はスコアの高さを表し、青に近いほどスコアが高いです
+                        - バーの上に表示されている数値が平均スコアです
+                        """)
                     
-                    # バーチャートのデータを準備
+                    # バーチャートの作成
                     bar_data = pd.DataFrame({
                         'strategy': strategy_scores.index,
                         'score': strategy_scores.values,
@@ -2161,6 +2224,27 @@ with tab3:
                 # メトリクスとその日本語ラベルを定義
                 metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
                 metrics_jp = ["信頼性", "回答の関連性", "コンテキストの再現性", "コンテキストの正確性", "回答の正確性"]
+                
+                # レーダーチャートの説明を表示
+                with st.expander("レーダーチャートの見方", expanded=False):
+                    st.markdown("""
+                    ### レーダーチャートの見方
+                    - 各軸は異なる評価指標を表しています
+                    - スコアは0〜1の範囲で、1に近いほど良い結果です
+                    - 各メトリクスは以下のように計算されます：
+                      ```
+                      各メトリクスの平均 = Σ(各評価データのスコア) / 評価データ数
+                      ```
+                      - 各メトリクスは以下の5つの指標から構成されます：
+                        - 信頼性 (Faithfulness)
+                        - 回答の関連性 (Answer Relevancy)
+                        - コンテキストの再現性 (Context Recall)
+                        - コンテキストの正確性 (Context Precision)
+                        - 回答の正確性 (Answer Correctness)
+                      
+                      - 同じチャンク戦略内でモデル間比較が可能です
+                    - マウスオーバーで詳細な数値を確認できます
+                    """)
                 
                 # ユニークなラベルでループ
                 for label in results_df['label'].unique():
