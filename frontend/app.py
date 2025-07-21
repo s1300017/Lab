@@ -1486,7 +1486,7 @@ with st.sidebar:
             st.rerun()
 
 # メインコンテンツのタブ定義
-tab1, tab2, tab3, tab4, tab_chatbot = st.tabs(["チャンキング設定", "評価", "一括評価", "比較", "チャットボット"])
+tab1, tab2, tab3, tab4, tab_chatbot, tab_thesis = st.tabs(["チャンキング設定", "評価", "一括評価", "比較", "チャットボット", "卒論向け分析"])
 
 # タブ1: チャンキング設定
 with tab1:
@@ -2618,3 +2618,180 @@ with tab_chatbot:
         
         # 画面を更新
         st.rerun()
+        
+# タブ6: 卒論向け分析
+with tab_thesis:
+    st.header("卒論向け分析")
+    
+    # 評価指標の詳細説明
+    with st.expander("評価指標の詳細説明", expanded=True):
+        st.markdown("""
+        ### 評価指標の詳細説明
+        
+        1. **Faithfulness (信頼性)**
+        - 定義: 生成された回答が、提供されたコンテキストに忠実であるかどうかを測定
+        - 計算方法: コンテキストからの情報の正確な引用度を評価
+        - 重要性: 信頼性の高い回答の生成を保証
+        
+        2. **Answer Relevancy (回答の関連性)**
+        - 定義: 回答が質問とどれだけ関連しているかを測定
+        - 計算方法: 質問と回答の意味的類似度を評価
+        - 重要性: 質問に対する適切な応答を確保
+        
+        3. **Context Recall (コンテキストの再現性)**
+        - 定義: 関連するすべての情報が検索結果に含まれているかを測定
+        - 計算方法: コンテキスト内の重要な情報のカバー率を評価
+        - 重要性: 全面的な情報提供を保証
+        
+        4. **Context Precision (コンテキストの正確性)**
+        - 定義: 検索結果のうち、関連する情報がどれだけ正確に含まれているかを測定
+        - 計算方法: 関連性と正確性の両方を評価
+        - 重要性: 関連性の高い正確な情報を提供
+        
+        5. **Answer Correctness (回答の正確性)**
+        - 定義: 回答の事実関係が正しいかどうかを測定
+        - 計算方法: 回答の事実関係の正確性を評価
+        - 重要性: 正確な情報の提供を保証
+        
+        6. **Overall Score (総合スコア)**
+        - 定義: 上記5つの指標の平均値
+        - 計算方法: 
+          ```
+          総合スコア = (faithfulness + answer_relevancy + context_recall + context_precision + answer_correctness) / 5
+          ```
+        - 重要性: 全体的なパフォーマンスの評価
+        
+        **注:** すべてのスコアは0〜1の範囲で正規化されており、1に近いほど良い結果を示します。
+        """)
+    
+    # 実験設定の詳細説明
+    with st.expander("実験設定の詳細", expanded=True):
+        st.markdown("""
+        ### 実験設定の詳細説明
+        
+        1. **評価データセット**
+        - データセット名: 自動生成QAセット
+        - データ数: 質問数に応じて変動
+        - データ構造: 
+          - 質問
+          - 正解回答
+          - コンテキスト
+        - 選定理由: ドキュメント内容に基づく自動生成QAセットにより、
+          実際の使用ケースに近い評価が可能
+        
+        2. **実験パラメータ**
+        - チャンクサイズ: 200〜4000文字
+        - オーバーラップ: 0〜1000文字
+        - モデル設定: 
+          - LLM: Ollama, OpenAI
+          - Embedding: HuggingFace, OpenAI
+        
+        3. **再現性設定**
+        - ランダムシード: 固定値を使用
+        - 環境設定: 
+          - Pythonバージョン
+          - 使用ライブラリのバージョン
+          - ハードウェア環境
+        - 実行手順: 
+          1. PDFアップロード
+          2. チャンキング設定
+          3. 評価実行
+          4. 結果確認
+        """)
+    
+    # 結果の統計的分析
+    with st.expander("統計的分析結果", expanded=True):
+        if st.session_state.bulk_evaluation_results:
+            # 結果をDataFrameに変換
+            results_df = pd.DataFrame(st.session_state.bulk_evaluation_results)
+            
+            # 評価指標の統計値を表示
+            st.subheader("評価指標の統計値")
+            metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness", "overall_score"]
+            stats_df = pd.DataFrame({
+                "指標": metrics,
+                "平均値": results_df[metrics].mean(),
+                "標準偏差": results_df[metrics].std(),
+                "最小値": results_df[metrics].min(),
+                "最大値": results_df[metrics].max(),
+                "中央値": results_df[metrics].median()
+            })
+            st.dataframe(stats_df, use_container_width=True)
+            
+            # 相関分析
+            st.subheader("指標間の相関係数")
+            corr_matrix = results_df[metrics].corr()
+            st.dataframe(corr_matrix, use_container_width=True)
+            
+            # 信頼区間の計算
+            st.subheader("信頼区間")
+            confidence_intervals = {
+                "指標": metrics,
+                "95%信頼区間 (下限)": [results_df[metric].quantile(0.025) for metric in metrics],
+                "95%信頼区間 (上限)": [results_df[metric].quantile(0.975) for metric in metrics]
+            }
+            st.dataframe(pd.DataFrame(confidence_intervals), use_container_width=True)
+        else:
+            st.info("統計的分析結果は一括評価実行後のみ表示されます。")
+            
+            # 一括評価実行前の準備状況確認
+            if st.session_state.get("text"):
+                st.write("準備状況:")
+                
+                # 文書のアップロード状況
+                st.write("- 文書: アップロード済み")
+                
+                # チャンク設定の確認
+                if all(key in st.session_state for key in ["chunk_size", "chunk_overlap", "embedding_model"]):
+                    st.write(f"- チャンクサイズ: {st.session_state.chunk_size}")
+                    st.write(f"- オーバーラップ: {st.session_state.chunk_overlap}")
+                    st.write(f"- 埋め込みモデル: {st.session_state.embedding_model}")
+                else:
+                    st.write("- チャンク設定: 未設定")
+                    
+                # モデル選択の確認
+                if "llm_model" in st.session_state:
+                    # モデルがリストの場合
+                    if isinstance(st.session_state.llm_model, list):
+                        models = ", ".join(st.session_state.llm_model)
+                        st.write(f"- LLMモデル: {models}")
+                        # MiniLMの特性説明
+                        if any("mini" in model.lower() for model in st.session_state.llm_model):
+                            st.markdown("**注:** MiniLMモデルの場合、チャンク化の影響が他のモデルと比べて小さいことが一般的です。これはMiniLMの軽量な性質によるものであり、より複雑な文書理解が必要な場合は、より高性能なモデルの使用を検討することをお勧めします。")
+                    else:
+                        st.write(f"- LLMモデル: {st.session_state.llm_model}")
+                        # MiniLMの特性説明
+                        if "mini" in st.session_state.llm_model.lower():
+                            st.markdown("**注:** MiniLMモデルの場合、チャンク化の影響が他のモデルと比べて小さいことが一般的です。これはMiniLMの軽量な性質によるものであり、より複雑な文書理解が必要な場合は、より高性能なモデルの使用を検討することをお勧めします。")
+                else:
+                    st.write("- LLMモデル: 未選択")
+            else:
+                st.write("準備状況:")
+                st.write("- 文書: 未アップロード")
+                st.write("- チャンク設定: 未設定")
+                st.write("- モデル選択: 未選択")
+    
+    # 実験結果の解釈支援
+    with st.expander("実験結果の解釈支援", expanded=True):
+        st.markdown("""
+        ### 実験結果の解釈支援
+        
+        1. **スコアの解釈**
+        - 0.8以上: 非常に良いパフォーマンス
+        - 0.6〜0.8: 良好なパフォーマンス
+        - 0.4〜0.6: 平均的なパフォーマンス
+        - 0.2〜0.4: 低いパフォーマンス
+        - 0.2以下: 非常に低いパフォーマンス
+        
+        2. **結果の分析ポイント**
+        - 各指標のバランスの良さ
+        - モデル間の相対的なパフォーマンス
+        - チャンクサイズとオーバーラップの影響
+        - 統計的有意性の確認
+        
+        3. **改善のためのアプローチ**
+        - スコアが低い指標の特定
+        - モデルの選択肢の再評価
+        - チャンク戦略の最適化
+        - 評価データセットの拡充
+        """)
