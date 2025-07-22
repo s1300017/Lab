@@ -263,9 +263,9 @@ try:
 except ImportError:
     yaml = None  # PyYAMLが未導入の場合
 
-# 設定ファイルのパス
-MODELS_YAML_PATH = Path(__file__).parent.parent / "models.yaml"
-STRATEGIES_YAML_PATH = Path(__file__).parent.parent / "strategies.yaml"
+# 設定ファイルのパス（Dockerコンテナ内の絶対パスを指定）
+MODELS_YAML_PATH = Path("/app/models.yaml")
+STRATEGIES_YAML_PATH = Path("/app/strategies.yaml")
 
 # モデルリスト取得関数
 def load_models_yaml():
@@ -484,39 +484,38 @@ def get_torch_device():
 
 def get_embeddings(model_name: str):
     device = get_torch_device()  # デバイス自動判定
+    common_kwargs = {
+        'model_kwargs': {
+            'device': device,
+            'trust_remote_code': True
+        },
+        'encode_kwargs': {
+            'normalize_embeddings': True
+        }
+    }
+    
     if model_name == "openai":
         return OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
-    elif model_name == "huggingface_bge_small":
-        # ローカルのモデルを使用
-        if not LOCAL_MODEL_PATH.exists():
-            raise FileNotFoundError(
-                f"Model not found at {LOCAL_MODEL_PATH}. "
-                "Please make sure the model is correctly downloaded and mounted."
-            )
+    
+    # HuggingFaceモデルのマッピング
+    hf_models = {
+        "huggingface_bge_small": "BAAI/bge-small-en-v1.5",
+        "huggingface_miniLM": "sentence-transformers/all-MiniLM-L6-v2",
+        "huggingface_mpnet_base": "sentence-transformers/all-mpnet-base-v2",
+        "huggingface_multi_qa_minilm": "sentence-transformers/multi-qa-MiniLM-L6-cos-v1",
+        "huggingface_multi_qa_mpnet": "sentence-transformers/multi-qa-mpnet-base-dot-v1",
+        "huggingface_paraphrase_multilingual": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "huggingface_distiluse_multilingual": "sentence-transformers/distiluse-base-multilingual-cased-v2",
+        "huggingface_xlm_r": "sentence-transformers/xlm-r-100langs-bert-base-nli-stsb-mean-tokens"
+    }
+    
+    if model_name in hf_models:
         return HuggingFaceEmbeddings(
-            model_name="BAAI/bge-small-en-v1.5",
-            model_kwargs={
-                'device': device,  # 自動判定したデバイスを指定
-                'trust_remote_code': True
-            },
-            encode_kwargs={
-                'normalize_embeddings': True
-            }
+            model_name=hf_models[model_name],
+            **common_kwargs
         )
-    elif model_name == "huggingface_miniLM":
-        # 軽量・多言語対応モデル（初回のみ自動DL）
-        return HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={
-                'device': device,  # 自動判定したデバイスを指定
-                'trust_remote_code': True
-            },
-            encode_kwargs={
-                'normalize_embeddings': True
-            }
-        )
-    else:
-        raise ValueError(f"Unsupported embedding model: {model_name}")
+    
+    raise ValueError(f"Unsupported embedding model: {model_name}")
 
 
 # Default models（モデルが未ダウンロードでもサーバーが起動できるように修正）
@@ -1456,8 +1455,15 @@ def list_models():
         if not models_dict or "models" not in models_dict:
             print("[list_models ERROR] models.yamlに'models'キーがありません")
             return JSONResponse(status_code=404, content={"error": "models.yamlに'models'キーがありません"})
-        print(f"[DEBUG] models.yamlのmodelsキー: {models_dict['models']}")
-        return JSONResponse(content={"models": models_dict["models"]})
+        
+        # モデルをカテゴリー別に分類
+        categorized_models = {
+            "LLM": [m for m in models_dict["models"] if m.get("category") == "LLM"],
+            "Embedding": [m for m in models_dict["models"] if m.get("category") == "Embedding"]
+        }
+        
+        print(f"[DEBUG] categorized_models: {categorized_models}")
+        return JSONResponse(content=categorized_models)
     except Exception as e:
         print(f"[list_models ERROR] {e}")
         import traceback

@@ -1,7 +1,56 @@
 models:
   - name: mistral
     type: ollama
+    category: "LLM"
     display_name: "Mistral (Ollama)"
+    description: "Ollamaで実行されるMistralモデル。大規模言語モデルとしての江能力を提供します。"
   - name: gpt-4o-mini
     type: openai
+    category: "LLM"
     display_name: "GPT-4o-mini (OpenAI)"
+    description: "OpenAIのGPT-4o-miniモデル。高品質な応答を提供します。"
+  - name: openai
+    type: openai
+    category: "Embedding"
+    display_name: "OpenAI Embedding"
+    description: "OpenAIの埋め込みモデル。高品質な埋め込みを提供します。"
+  - name: huggingface_bge_small
+    type: huggingface
+    category: "Embedding"
+    display_name: "BGE-small (HuggingFace)"
+    description: "BAAIのBGE-smallモデル。英語テキストの埋め込みに適しています。"
+  - name: huggingface_miniLM
+    type: huggingface
+    category: "Embedding"
+    display_name: "MiniLM (HuggingFace)"
+    description: "Sentence TransformersのMiniLMモデル。軽量で高速な埋め込みを提供します。"
+  - name: huggingface_mpnet_base
+    type: huggingface
+    category: "Embedding"
+    display_name: "MPNet Base (HuggingFace)"
+    description: "MPNetベースのモデル。文書の意味的な類似性に優れています。"
+  - name: huggingface_multi_qa_minilm
+    type: huggingface
+    category: "Embedding"
+    display_name: "Multi-QA MiniLM (HuggingFace)"
+    description: "質問応答タスクに最適化されたMiniLMモデル。"
+  - name: huggingface_multi_qa_mpnet
+    type: huggingface
+    category: "Embedding"
+    display_name: "Multi-QA MPNet (HuggingFace)"
+    description: "質問応答タスクに最適化されたMPNetモデル。"
+  - name: huggingface_paraphrase_multilingual
+    type: huggingface
+    category: "Embedding"
+    display_name: "Paraphrase Multilingual (HuggingFace)"
+    description: "多言語対応のパラフレーズ生成モデル。"
+  - name: huggingface_distiluse_multilingual
+    type: huggingface
+    category: "Embedding"
+    display_name: "DistilUSE Multilingual (HuggingFace)"
+    description: "多言語対応の軽量なユニバーサルセンテンスエンコーダー。"
+  - name: huggingface_xlm_r
+    type: huggingface
+    category: "Embedding"
+    display_name: "XLM-R (HuggingFace)"
+    description: "100言語に対応した多言語モデル。"

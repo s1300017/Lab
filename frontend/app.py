@@ -1320,18 +1320,38 @@ with st.sidebar:
             resp = requests.get(f"{BACKEND_URL}/list_models")
             resp.raise_for_status()
             data = resp.json()
-            return data.get("models", [])
+            # カテゴライズされたモデルを別々のリストで返す
+            llm_models = data.get("LLM", [])
+            embedding_models = data.get("Embedding", [])
+            return {
+                "llm": llm_models,
+                "embedding": embedding_models
+            }
         except Exception as e:
             st.error(f"モデルリスト取得エラー: {e}")
-            return []
-    models = fetch_models()
-    model_options = [m['display_name'] for m in models] if models else ["ollama_llama2", "openai"]
-    model_names = [m['name'] for m in models] if models else ["ollama_llama2", "openai"]
+            return {"llm": [], "embedding": []}
+    
+    # グローバルにモデルリストを保存
+    if 'models' not in st.session_state:
+        st.session_state.models = fetch_models()
+    
+    models = st.session_state.models
+    
+    # LLMモデルの選択肢
+    llm_models = models.get("llm", [])
+    llm_options = [m['display_name'] for m in llm_models] if llm_models else ["ollama_llama2"]
+    llm_names = [m['name'] for m in llm_models] if llm_models else ["ollama_llama2"]
+    
+    # Embeddingモデルの選択肢
+    embedding_models = models.get("embedding", [])
+    embedding_options = [m['display_name'] for m in embedding_models] if embedding_models else ["openai"]
+    embedding_names = [m['name'] for m in embedding_models] if embedding_models else ["openai"]
 
     # デフォルト選択ロジック
-    default_idx = 0
-    if 'llm_model' in st.session_state and st.session_state.llm_model in model_names:
-        default_idx = model_names.index(st.session_state.llm_model)
+    default_llm_idx = 0
+    if 'llm_model' in st.session_state and st.session_state.llm_model in llm_names:
+        default_llm_idx = llm_names.index(st.session_state.llm_model)
+    
     # モデル設定
     st.subheader("モデル設定")
     
@@ -1341,13 +1361,20 @@ with st.sidebar:
     else:
         st.sidebar.success("APIキーが設定されています")
         
-    llm_model = st.selectbox(
-        "LLMモデル",
-        options=model_options,
-        index=model_options.index(st.session_state.llm_model) if st.session_state.llm_model in model_options else 0,
-        key="llm_model_select"
-    )
+    # LLMモデル選択UI
+    if llm_models:
+        llm_model = st.selectbox(
+            "LLMモデル",
+            llm_options,
+            index=default_llm_idx,
+            key="llm_model_select"
+        )
+        st.session_state.llm_model = llm_names[llm_options.index(llm_model)]
+    else:
+        st.warning("利用可能なLLMモデルが見つかりません")
+        llm_model = None
     
+    # チャットボットモデル選択
     chat_model_options = ["gpt-4o-mini", "gpt-3.5-turbo", "llama3-70b-8192"]
     chat_model = st.selectbox(
         "チャットボットモデル",
@@ -1356,18 +1383,22 @@ with st.sidebar:
         key="chat_model_select"
     )
     
-    # Embeddingモデルも同様にAPI化（必要に応じて拡張可）
-    embedding_options = {
-        "OpenAI": "openai",
-        "bge-small（ローカル高速）": "huggingface_bge_small",
-        "MiniLM（軽量・多言語）": "huggingface_miniLM",
-    }
-    emb_default_idx = 0 if st.session_state.embedding_model == "huggingface_bge_small" else 1
-    st.session_state.embedding_model = st.selectbox(
-        "Embeddingモデル",
-        embedding_options,
-        index=emb_default_idx
-    )
+    # Embeddingモデル選択
+    if embedding_models:
+        default_emb_idx = 0
+        if 'embedding_model' in st.session_state and st.session_state.embedding_model in embedding_names:
+            default_emb_idx = embedding_names.index(st.session_state.embedding_model)
+        
+        selected_embedding = st.selectbox(
+            "Embeddingモデル",
+            embedding_options,
+            index=default_emb_idx,
+            key="embedding_model_select"
+        )
+        st.session_state.embedding_model = embedding_names[embedding_options.index(selected_embedding)]
+    else:
+        st.warning("利用可能なEmbeddingモデルが見つかりません")
+        st.session_state.embedding_model = None
 
     import io
     # --- file_idがセッションにあれば状態を復元 ---
@@ -1495,7 +1526,34 @@ with tab1:
         chunk_method = st.radio("チャンク化方式", ["recursive", "semantic"], index=0, help="recursive: 文字数ベース, semantic: 意味ベース")
         chunk_size = st.slider("チャンクサイズ", 200, 4000, 1000, 100)
         chunk_overlap = st.slider("チャンクオーバーラップ", 0, 1000, 200, 50)
-        embedding_model = st.selectbox("埋め込みモデル (semantic時必須)", ["huggingface_bge_small", "openai"], index=0)
+        # 埋め込みモデルの選択肢と特徴説明
+        embedding_models = {
+            "huggingface_bge_small": "軽量モデル。リソースに制限がある場合に適しています。\n- サイズ: 約1GB\n- 用途: リソース制限がある環境での文書理解",
+            "huggingface_bge_large": "高性能モデル。より正確な文書理解が可能です。\n- サイズ: 約8GB\n- 用途: 高精度な文書理解が必要な場合",
+            "sentence_transformers_all-MiniLM-L6-v2": "軽量で高速なモデル。基本的な文書理解に適しています。\n- サイズ: 約170MB\n- 用途: 一般的な文書理解、リソース制限がある環境",
+            "sentence_transformers_all-mpnet-base-v2": "高性能なモデル。複雑な文書理解に適しています。\n- サイズ: 約420MB\n- 用途: 高精度な文書理解、複雑な文脈理解",
+            "sentence_transformers_multi-qa-MiniLM-L6-cos-v1": "QAタスクに特化したモデル。質問応答の精度が向上します。\n- サイズ: 約170MB\n- 用途: 質問応答の精度を重視する場合",
+            "sentence_transformers_multi-qa-MiniLM-L6-dot-v1": "QAタスクに特化したモデル（ドット積版）。\n- サイズ: 約170MB\n- 用途: 質問応答の精度を重視する場合（ドット積版）",
+            "sentence_transformers_multi-qa-mpnet-base-dot-v1": "高性能なQA特化モデル。\n- サイズ: 約420MB\n- 用途: 高精度な質問応答が必要な場合",
+            "sentence_transformers_paraphrase-multilingual-MiniLM-L12-v2": "多言語対応モデル。\n- サイズ: 約350MB\n- 用途: 多言語ドキュメントの処理",
+            "sentence_transformers_paraphrase-MiniLM-L6-v2": "軽量な多言語対応モデル。\n- サイズ: 約170MB\n- 用途: 軽量な多言語対応が必要な場合",
+            "sentence_transformers_paraphrase-multilingual-mpnet-base-v2": "高性能な多言語対応モデル。\n- サイズ: 約420MB\n- 用途: 高精度な多言語対応が必要な場合",
+            "sentence_transformers_distiluse-base-multilingual-cased-v2": "軽量な日本語対応モデル。\n- サイズ: 約170MB\n- 用途: 日本語文書の処理に適しています",
+            "sentence_transformers_distiluse-base-multilingual-cased-v1": "軽量な多言語対応モデル。\n- サイズ: 約170MB\n- 用途: 軽量な多言語対応が必要な場合",
+            "sentence_transformers_xlm-r-100langs-bert-base-nli-stsb-mean-tokens": "100言語対応モデル。\n- サイズ: 約1.2GB\n- 用途: 100以上の言語を処理する場合",
+            "microsoft_layoutlm-base-uncased": "ドキュメントレイアウトを考慮したモデル。PDFなどのドキュメント処理に適しています。\n- サイズ: 約420MB\n- 用途: PDFなどのドキュメントレイアウトを考慮した処理",
+            "microsoft_layoutlmv3-base": "レイアウト情報も考慮した高性能モデル。\n- サイズ: 約1.2GB\n- 用途: ドキュメントのレイアウト情報も考慮した高精度な処理"
+        }
+        
+        # モデル選択UI
+        selected_model = st.selectbox("埋め込みモデル (semantic時必須)", 
+                                    list(embedding_models.keys()),
+                                    format_func=lambda x: f"{x} - {embedding_models[x]}",
+                                    index=0)
+        
+        # 選択されたモデルの特徴を表示
+        st.write(f"選択されたモデルの特徴: {embedding_models[selected_model]}")
+        embedding_model = selected_model
         
         if st.button("チャンキングとベクトル化"):
             with st.spinner('チャンキングとベクトル化を実行中...'):
@@ -1646,21 +1704,46 @@ with tab3:
         """)
 
     # Embeddingモデルの複数選択
-    embedding_options = {
-        "bge-small（ローカル高速）": "huggingface_bge_small",
-        "MiniLM（軽量・多言語）": "huggingface_miniLM",
-        "OpenAI": "openai",
-    }
-    embedding_labels = list(embedding_options.keys())
-    embedding_values = list(embedding_options.values())
-    # デフォルトでbge-smallを選択
-    selected_labels = st.multiselect(
-        "Embeddingモデルを選択",
-        embedding_labels,
-        default=[embedding_labels[0]],
+    # セッションからモデルリストを取得
+    if 'models' not in st.session_state:
+        st.error("モデルリストが読み込まれていません。ページを更新してください。")
+        st.stop()
+        
+    embedding_models = st.session_state.models.get("embedding", [])
+    
+    # モデル名と表示名のマッピングを作成
+    embedding_options = {}
+    for model in embedding_models:
+        model_id = model.get("name", "")  # model_idではなくnameを使用
+        model_name = model.get("display_name", model_id)  # 表示名がなければmodel_idを使用
+        provider = model.get("type", "").lower()  # providerではなくtypeを使用
+        
+        # プロバイダーに応じた接頭辞を追加
+        if "openai" in provider:
+            display_name = f"OpenAI: {model_name}"
+        elif "huggingface" in provider:
+            display_name = f"HuggingFace: {model_name}"
+        else:
+            display_name = f"{provider}: {model_name}"
+            
+        embedding_options[display_name] = model_id
+    
+    # モデルが1つもない場合はエラーメッセージを表示
+    if not embedding_options:
+        st.error("利用可能なEmbeddingモデルが見つかりません。バックエンドの設定を確認してください。")
+        st.stop()
+    
+    # デフォルトで最初のモデルを選択
+    default_selection = [list(embedding_options.values())[0]]
+    
+    # マルチセレクトでモデルを選択
+    selected_embeddings = st.multiselect(
+        "Embeddingモデルを選択（複数選択可）",
+        options=list(embedding_options.values()),
+        format_func=lambda x: [k for k, v in embedding_options.items() if v == x][0],
+        default=default_selection,
         key="bulk_embeddings_tab3"
     )
-    selected_embeddings = [embedding_options[label] for label in selected_labels]
 
     # チャンク分割方法の選択
     chunk_methods = st.multiselect(
@@ -2034,9 +2117,16 @@ with tab3:
                     plot_data['bubble_size'] = bubble_sizes
                     
                     # 戦略名をフォーマット
-                    plot_data['formatted_strategy'] = plot_data['chunk_strategy'].apply(
-                        lambda x: x.split('-')[0].lower() if x.split('-')[0].lower() in ['semantic', 'sentence', 'paragraph'] else x
-                    )
+                    def safe_strategy_format(x):
+                        if not isinstance(x, str):
+                            return x
+                        try:
+                            prefix = x.split('-')[0].lower()
+                            return prefix if prefix in ['semantic', 'sentence', 'paragraph'] else x
+                        except (AttributeError, IndexError):
+                            return x
+                            
+                    plot_data['formatted_strategy'] = plot_data['chunk_strategy'].apply(safe_strategy_format)
                     
                     # バブルチャートの説明を表示
                     with st.expander(f"{model_name} - バブルチャートの見方", expanded=False):

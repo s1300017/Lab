@@ -1,12 +1,15 @@
+volumes:
+  docker_lab_pgdata:
+  models:
+  data:
+  ollama_data:
+
 services:
   db:
     image: pgvector/pgvector:pg16
     container_name: rag_db
     ports:
       - "55332:5432"
-    volumes:
-      - ./docker_lab_pgdata:/var/lib/postgresql/data
-      - ./postgresql.conf:/etc/postgresql/postgresql.conf # JST用設定ファイルをマウント
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -20,6 +23,9 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    volumes:
+      - docker_lab_pgdata:/var/lib/postgresql/data
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf # JST用設定ファイルをマウント
 
   ollama:
     # 自作ビルドした最新版Ollamaイメージを使用
@@ -28,9 +34,10 @@ services:
     container_name: rag_ollama
     ports:
       - "11435:11434"
-    volumes:
-      - ./ollama_data:/root/.ollama
-    # Ollamaサーバーのみ常時起動
+    environment:
+      - OLLAMA_NUM_THREADS=2
+      - OLLAMA_HOST=0.0.0.0
+      - TZ=Asia/Tokyo # JST化
     command: serve
     pull_policy: always
     restart: always
@@ -40,11 +47,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    # ↑Ollama APIのバージョンエンドポイントでヘルスチェック（interval=60sでログ激減）
-    environment:
-      - OLLAMA_NUM_THREADS=2
-      - OLLAMA_HOST=0.0.0.0
-      - TZ=Asia/Tokyo # JST化
+    volumes:
+      - ollama_data:/root/.ollama
     deploy:
       resources:
         limits:
@@ -55,9 +59,6 @@ services:
     container_name: rag_frontend
     ports:
       - "8501:8501"
-    volumes:
-      - ./frontend:/app
-      - ./.env:/app/.env  # .envファイルをマウント
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
@@ -67,36 +68,51 @@ services:
       - ollama
       - backend
     restart: always
+    volumes:
+      - ./frontend:/app
+      - ./.env:/app/.env  # .envファイルをマウント
+      - models:/app/models  # モデルの永続化
 
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      # ビルド時の引数を設定
+      args:
+        - PYTHONUNBUFFERED=1
+        - PIP_CACHE_DIR=/root/.cache/pip
     image: rag_backend_debug
     container_name: rag_backend
     ports:
       - "8000:8000"
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
-    volumes:
-      - ./backend/models.yaml:/models.yaml  # パスを /models.yaml に変更
-      - ./backend/strategies.yaml:/app/strategies.yaml
-      - ./models:/app/models # ホストのmodelsディレクトリをコンテナにマウント
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - TRANSFORMERS_CACHE=/app/.cache/huggingface/hub
+      - HF_HOME=/app/.cache/huggingface
+      - TORCH_HOME=/app/.cache/torch
+      - TZ=Asia/Tokyo
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     depends_on:
       db:
         condition: service_healthy
       ollama:
         condition: service_healthy
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - TRANSFORMERS_CACHE=/app/models
-      - HF_HOME=/app/models
-      - TZ=Asia/Tokyo # JST化
-      - POSTGRES_DB=rag_db
-      - POSTGRES_USER=rag_user
-      - POSTGRES_PASSWORD=rag_password
-      - DATABASE_URL=postgresql://rag_user:rag_password@db:5432/rag_db
     restart: always
-
-volumes:
-  data:
-  ollama_data:
+    volumes:
+      # モデルキャッシュを永続化
+      - models:/app/.cache
+      # アプリケーションコードのホットリロード用（開発時のみ）
+      - ./backend/app:/app/app
+      - ./backend/models.yaml:/app/models.yaml
+      - ./backend/strategies.yaml:/app/strategies.yaml
+      - ./backend/logs:/app/logs
+      - ./backend/uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
