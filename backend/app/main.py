@@ -998,6 +998,7 @@ def get_available_models():
 # --- 一括評価API（ダミー実装） ---
 from fastapi.responses import JSONResponse
 from fastapi import Request
+import asyncio
 
 @app.post("/bulk_evaluate/")
 async def bulk_evaluate(request: Request):
@@ -1028,8 +1029,13 @@ async def bulk_evaluate(request: Request):
                         return found
                 return {}
 
+        # 並列処理の最大数を制限するセマフォを作成
+        MAX_PARALLEL_TASKS = 5  # APIリクエスト制限に基づいて調整
+        semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
+
         async def evaluate_one_bulk(data):
             try:
+                print("[進捗] 評価データを処理中...")
                 embedding_model = data.get("embedding_model")
                 chunk_methods = data.get("chunk_methods", [data.get("chunk_method", "recursive")])
                 chunk_sizes = data.get("chunk_sizes", [data.get("chunk_size", 1000)])
@@ -1066,8 +1072,10 @@ async def bulk_evaluate(request: Request):
                 # モデル名がopenaiの場合は、最新モデルを使用するように警告
                 if embedding_model == "openai":
                     print("警告: 'openai' モデルは非推奨です。代わりに 'text-embedding-3-small' または 'text-embedding-3-large' の使用を検討してください。")
+
                 questions = data.get("questions")
-                answers = data.get("answers")
+                # ground_truthキーまたはanswersキーのどちらかを使用（互換性のため）
+                answers = data.get("ground_truth", data.get("answers"))
                 if not questions or not answers:
                     raise ValueError("questions/answersが指定されていません。PDFアップロード時の自動生成結果をそのまま送信してください。")
                 if not (sample_text and questions and answers):
@@ -1075,12 +1083,14 @@ async def bulk_evaluate(request: Request):
 
                 results = []
                 # embedding_modelのインスタンスを一度だけロードし再利用
+                print(f"[進捗] 埋め込みモデル '{embedding_model}' をロード中...")
                 embedder = get_embeddings(embedding_model)
                 
                 # chunk_method/chunk_size/chunk_overlapごとに完全に独立してチャンク分割→ベクトルストア→retriever→RAG回答生成→評価→スコア集計を実行
                 for i in range(len(chunk_methods)):
                     try:
                         chunk_method = chunk_methods[i]
+                        print(f"[進捗] チャンク方法 '{chunk_method}' の処理を開始...")
                         
                         # セマンティックチャンキングの場合、チャンクサイズとオーバーラップは無視する
                         if chunk_method == "semantic":
@@ -1091,14 +1101,16 @@ async def bulk_evaluate(request: Request):
                                 })
                                 continue
                                 
-                            print(f"セマンティックチャンキングを開始します（chunk_sizeとchunk_overlapは無視されます）...")
+                            print(f"[進捗] セマンティックチャンキングを開始します（chunk_sizeとchunk_overlapは無視されます）...")
                             
                             # セマンティックチャンキングのパラメータを取得
                             semantic_params = data.get("semantic_params", {})
                             similarity_threshold = float(semantic_params.get("similarity_threshold", 0.7))
                             
-                            print(f"セマンティックチャンキングを実行: similarity_threshold={similarity_threshold}")
-                            chunks = semantic_chunk_text(
+                            print(f"[進捗] セマンティックチャンキングを実行: similarity_threshold={similarity_threshold}")
+                            # セマンティックチャンキングを非同期実行に変更
+                            chunks = await asyncio.to_thread(
+                                semantic_chunk_text,
                                 text=sample_text,
                                 chunk_size=None,  # 無視される
                                 chunk_overlap=None,  # 無視される
@@ -1115,23 +1127,27 @@ async def bulk_evaluate(request: Request):
                             chunk_size = chunk_sizes[i] if i < len(chunk_sizes) else 1000
                             chunk_overlap = chunk_overlaps[i] if i < len(chunk_overlaps) else 200
                             # チャンク分割
+                            print(f"[進捗] チャンク分割を実行: 方式={chunk_method}, サイズ={chunk_size}, オーバーラップ={chunk_overlap}")
+                            
+                            # 非同期でチャンク分割を実行
                             if chunk_method == "recursive":
                                 text_splitter = RecursiveCharacterTextSplitter(
-                                    chunk_size=chunk_sizes[i],
-                                    chunk_overlap=chunk_overlaps[i],
+                                    chunk_size=chunk_size,
+                                    chunk_overlap=chunk_overlap,
                                     length_function=len,
                                 )
-                                chunks = text_splitter.split_text(sample_text)
+                                chunks = await asyncio.to_thread(text_splitter.split_text, sample_text)
                             elif chunk_method == "fixed":
-                                chunks = fixed_chunk_text(
+                                chunks = await asyncio.to_thread(
+                                    fixed_chunk_text,
                                     sample_text, 
-                                    chunk_size=chunk_sizes[i], 
-                                    chunk_overlap=chunk_overlaps[i]
+                                    chunk_size=chunk_size, 
+                                    chunk_overlap=chunk_overlap
                                 )
                             elif chunk_method == "sentence":
-                                chunks = sentence_chunk_text(sample_text)
+                                chunks = await asyncio.to_thread(sentence_chunk_text, sample_text)
                             elif chunk_method == "paragraph":
-                                chunks = paragraph_chunk_text(sample_text)
+                                chunks = await asyncio.to_thread(paragraph_chunk_text, sample_text)
                             # semanticチャンキングは上記のif文で既に処理済み
                             else:
                                 raise ValueError(f"未対応のchunk_method: {chunk_method}")
@@ -1145,43 +1161,55 @@ async def bulk_evaluate(request: Request):
                             else:
                                 chunk_strategy = f"{chunk_method}-{chunk_size_val}-{chunk_overlap_val}"
 
+                        print(f"[進捗] {len(chunks)}個のチャンクを作成しました。平均長さ: {sum(len(c) for c in chunks) / max(len(chunks), 1):.1f}文字")
+                        print(f"[進捗] ベクトルストアを構築中...")
+                        
                         # ベクトルストア構築
                         vectorstore = PGVector.from_documents(
                             documents=[],  # 空で初期化
                             embedding=embedder,
                             collection_name=get_collection_name(embedding_model)
                         )
-                        vectorstore.add_texts(texts=chunks)
+                        # チャンクをベクトルストアに追加（大量の場合はバッチ処理）
+                        await asyncio.to_thread(vectorstore.add_texts, texts=chunks)
                         retriever = vectorstore.as_retriever()
 
                         # RAG回答生成＆コンテキスト取得
                         contexts = []
                         pred_answers = []
-                        import asyncio
+                        
+                        print(f"[進捗] RAG回答生成を開始（{len(questions)}個の質問を処理中）...")
+                        
+                        # 各質問に対して非同期でコンテキスト取得と回答生成を行う
                         async def get_context_and_answer(q):
-                            # 各質問ごとにリトリーバーで文脈取得
-                            retrieved_docs = retriever.get_relevant_documents(q)
-                            context_texts = [doc.page_content for doc in retrieved_docs]
-                            # LLMインスタンス・プロンプト生成
-                            llm_instance = get_llm("openai")  # 必ずOpenAIモデルを使用
-                            prompt = ChatPromptTemplate.from_template("""Answer the question based only on the following context:\n{context}\n\nQuestion: {question}""")
-                            chain = (
-                                {"context": lambda _: context_texts, "question": lambda _: q}
-                                | prompt
-                                | llm_instance
-                                | StrOutputParser()
-                            )
-                            # 非同期で回答生成
-                            answer = await chain.ainvoke(q)
-                            return context_texts, answer
-                        results_async = asyncio.get_event_loop()
-                        results_list = results_async.run_until_complete(asyncio.gather(*[get_context_and_answer(q) for q in questions]))
+                            async with semaphore:  # セマフォで並列処理数を制限
+                                # 各質問ごとにリトリーバーで文脈取得（非同期化）
+                                retrieved_docs = await asyncio.to_thread(retriever.get_relevant_documents, q)
+                                context_texts = [doc.page_content for doc in retrieved_docs]
+                                # LLMインスタンス・プロンプト生成
+                                llm_instance = get_llm("openai")  # 必ずOpenAIモデルを使用
+                                prompt = ChatPromptTemplate.from_template("""Answer the question based only on the following context:\n{context}\n\nQuestion: {question}""")
+                                chain = (
+                                    {"context": lambda _: context_texts, "question": lambda _: q}
+                                    | prompt
+                                    | llm_instance
+                                    | StrOutputParser()
+                                )
+                                # 非同期で回答生成
+                                answer = await chain.ainvoke(q)
+                                return context_texts, answer
+                        
+                        # 非同期で全質問の回答を生成
+                        results_list = await asyncio.gather(*[get_context_and_answer(q) for q in questions])
                         for context_texts, answer in results_list:
                             contexts.append(context_texts)
                             pred_answers.append(answer)
+                        print(f"[進捗] RAG回答生成完了。評価処理を開始...")
                         # --- ここまで並列化 ---
 
                         # RAGAS等で自動評価
+                        print(f"[進捗] 評価メトリクスの計算を開始...")
+                        
                         dataset_dict = {
                             "question": questions,
                             "answer": pred_answers,
@@ -1190,47 +1218,38 @@ async def bulk_evaluate(request: Request):
                         }
                         dataset = Dataset.from_dict(dataset_dict)
                         llm_instance_eval = get_llm("openai")
-                        async def eval_one(idx, llm_instance):
-                            single_dataset = Dataset.from_dict({
-                                "question": [questions[idx]],
-                                "answer": [pred_answers[idx]],
-                                "contexts": [contexts[idx]],
-                                "ground_truth": [answers[idx]],
-                            })
-                            return evaluate(
-                                dataset=single_dataset,
-                                metrics=[faithfulness, answer_relevancy, context_recall, context_precision, answer_correctness],
-                                llm=llm_instance,
-                            )
-                        eval_results = results_async.run_until_complete(asyncio.gather(*[eval_one(i, llm_instance_eval) for i in range(len(questions))]))
+                        
+                        # 評価関数を非同期化
+                        async def eval_one(idx):
+                            async with semaphore:  # セマフォで並列処理数を制限
+                                print(f"[進捗] 評価 {idx+1}/{len(questions)} 件目を処理中...") 
+                                single_dataset = Dataset.from_dict({
+                                    "question": [questions[idx]],
+                                    "answer": [pred_answers[idx]],
+                                    "contexts": [contexts[idx]],
+                                    "ground_truth": [answers[idx]],
+                                })
+                                return idx, evaluate(
+                                    dataset=single_dataset,
+                                    metrics=[faithfulness, answer_relevancy, context_recall, context_precision, answer_correctness],
+                                    llm=llm_instance_eval,
+                                )
+                        
+                        # 非同期で評価を実行
+                        eval_results_with_idx = await asyncio.gather(*[eval_one(i) for i in range(len(questions))])
+                        # 結果を元の順番に整理
+                        eval_results = [None] * len(questions)
+                        for idx, result in eval_results_with_idx:
+                            eval_results[idx] = result
 
+                        # 評価メトリクスの定義
                         metrics_keys = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
                         metrics_sum = {k: 0.0 for k in metrics_keys}
                         metrics_count = {k: 0 for k in metrics_keys}
-                        for res in eval_results:
-                            scores = res.scores if hasattr(res, "scores") else {}
-                            for k in metrics_keys:
-                                if k in scores and isinstance(scores[k], (float, int)):
-                                    metrics_sum[k] += float(scores[k])
-                                    metrics_count[k] += 1
-                        metrics_avg = {k: safe_val(metrics_sum[k] / metrics_count[k] if metrics_count[k] > 0 else 0.0) for k in metrics_keys}
-                        overall_score = (
-                            metrics_avg["answer_relevancy"] * 0.25 +
-                            metrics_avg["faithfulness"] * 0.25 +
-                            metrics_avg["context_precision"] * 0.2 +
-                            metrics_avg["context_recall"] * 0.2 +
-                            metrics_avg["answer_correctness"] * 0.1
-                        )
-                        overall_score = safe_val(overall_score)
-                        num_chunks = len(chunks)
-                        avg_chunk_len = int(sum(len(c) for c in chunks) / num_chunks) if num_chunks > 0 else 0
-                        required_keys = [
-                            "overall_score", "faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness", "avg_chunk_len", "num_chunks"
-                        ]
                         metrics_per_qa = []
-                        total = len(eval_results)
+                        
+                        # 各質問のメトリクスを収集
                         for idx, res in enumerate(eval_results):
-                            print(f"[進捗] 評価 {idx+1}/{total} 件目を処理中...")  # 進捗ログを出力
                             scores = res.scores if hasattr(res, "scores") else {}
                             # scoresがlist型ならdictに変換（防御的処理）
                             if isinstance(scores, list):
@@ -1238,6 +1257,8 @@ async def bulk_evaluate(request: Request):
                                     scores = scores[0]
                                 else:
                                     scores = {}
+                                    
+                            # 各質問ごとのメトリクスを格納
                             qa_metric = {
                                 "question": questions[idx],
                                 "answer": pred_answers[idx],
@@ -1248,11 +1269,17 @@ async def bulk_evaluate(request: Request):
                                 "answer_correctness": safe_val(scores.get("answer_correctness", 0.0)),
                             }
                             metrics_per_qa.append(qa_metric)
+                            
+                            # 合計を計算
                             for k in metrics_keys:
                                 if k in scores and isinstance(scores[k], (float, int)):
                                     metrics_sum[k] += float(scores[k])
                                     metrics_count[k] += 1
+                        
+                        # 平均値を計算
                         metrics_avg = {k: safe_val(metrics_sum[k] / metrics_count[k] if metrics_count[k] > 0 else 0.0) for k in metrics_keys}
+                        
+                        # 総合スコアの計算
                         overall_score = (
                             metrics_avg["answer_relevancy"] * 0.25 +
                             metrics_avg["faithfulness"] * 0.25 +
@@ -1261,24 +1288,17 @@ async def bulk_evaluate(request: Request):
                             metrics_avg["answer_correctness"] * 0.1
                         )
                         overall_score = safe_val(overall_score)
+                        
+                        # チャンク関連の統計情報
                         num_chunks = len(chunks)
                         avg_chunk_len = int(sum(len(c) for c in chunks) / num_chunks) if num_chunks > 0 else 0
+                        
+                        # 必須キーのリスト
                         required_keys = [
                             "overall_score", "faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness", "avg_chunk_len", "num_chunks"
                         ]
                         
-                        # チャンク戦略を設定
-                        if chunk_method == "semantic":
-                            chunk_strategy = "semantic"
-                        else:
-                            chunk_size_val = chunk_sizes[i] if i < len(chunk_sizes) else chunk_sizes[0]
-                            chunk_overlap_val = chunk_overlaps[i] if i < len(chunk_overlaps) else chunk_overlaps[0]
-                            chunk_strategies = data.get("chunk_strategies", []) if isinstance(data, dict) else []
-                            if chunk_strategies and i < len(chunk_strategies):
-                                chunk_strategy = chunk_strategies[i]
-                            else:
-                                chunk_strategy = f"{chunk_method}-{chunk_size_val}-{chunk_overlap_val}"
-                        
+                        print(f"[進捗] 評価メトリクスの計算が完了しました。総合スコア: {overall_score:.4f}")
                         # 評価結果を格納する辞書を作成
                         response_dict = {
                             "embedding_model": embedding_model,
@@ -1300,43 +1320,82 @@ async def bulk_evaluate(request: Request):
                         # セマンティックチャンキングの場合は類似度閾値を追加
                         if chunk_method == "semantic":
                             response_dict["similarity_threshold"] = similarity_threshold
+                        
+                        # 必須キーが含まれているか確認、なければデフォルト値を設定
                         for k in required_keys:
                             if k not in response_dict:
                                 response_dict[k] = 0.0
+                                
+                        print(f"[進捗] チャンク方法 '{chunk_method}' の処理が完了しました。スコア: {overall_score:.4f}")
                         results.append(response_dict)
                     except Exception as e:
                         # エラー時も必ずエラー内容を返す
                         import traceback
+                        error_detail = traceback.format_exc()
+                        print(f"[エラー] チャンク方法 '{chunk_method}' の処理中にエラーが発生しました: {str(e)}")
                         traceback.print_exc()
-                        results.append({"error": str(e), "input_data": data})
+                        results.append({
+                            "error": str(e), 
+                            "chunk_method": chunk_method,
+                            "error_detail": error_detail,
+                            "input_data": data
+                        })
+                
+                print(f"[進捗] すべてのチャンク方法の評価が完了しました。結果数: {len(results)}")
                 return results
             except Exception as e:
                 # エラー時も必ずエラー内容を返す
                 import traceback
+                error_detail = traceback.format_exc()
+                print(f"[重要エラー] evaluate_one_bulk処理全体で例外が発生: {str(e)}")
                 traceback.print_exc()
-                return {"error": str(e), "input_data": data}
+                return {
+                    "error": str(e), 
+                    "error_detail": error_detail,
+                    "input_data": data
+                }
 
         # --- 本体分岐 ---
+        print(f"[進捗] bulk_evaluate APIが呼び出されました")
         if isinstance(data, list):
+            print(f"[進捗] リストデータを処理します。データ数: {len(data)}")
             results = []
-            for d in data:
+            for i, d in enumerate(data):
                 try:
+                    print(f"[進捗] データ {i+1}/{len(data)} を処理中...")
                     if not isinstance(d, dict):
                         d = find_first_dict(d)
                     res = await evaluate_one_bulk(d)
                     results.append(res)
+                    print(f"[進捗] データ {i+1}/{len(data)} の処理が完了しました")
                 except Exception as e:
                     # 個別データでエラーが発生しても全体を止めず、エラー内容を追加
                     import traceback
+                    error_detail = traceback.format_exc()
+                    print(f"[エラー] データ {i+1}/{len(data)} の処理中にエラーが発生: {str(e)}")
                     traceback.print_exc()
-                    results.append({"error": str(e), "input_data": d})
+                    results.append({
+                        "error": str(e), 
+                        "error_detail": error_detail,
+                        "input_data": d
+                    })
+            print(f"[進捗] すべてのデータ処理が完了しました。結果数: {len(results)}")
             return results
         else:
-            return await evaluate_one_bulk(data)
+            print(f"[進捗] 単一データを処理します")
+            result = await evaluate_one_bulk(data)
+            print(f"[進捗] 処理が完了しました")
+            return result
     except Exception as e:
         # 異常時も辞書を直接返す（JSONResponse不使用）
-        print(f"[重要] bulk_evaluate全体例外: {e}")
-        return {"error": str(e)}
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"[重要エラー] bulk_evaluate全体例外: {str(e)}")
+        traceback.print_exc()
+        return {
+            "error": str(e),
+            "error_detail": error_detail
+        }
 
 # --- PDFアップロード＆QA自動生成API ---
 from fastapi import UploadFile, File
