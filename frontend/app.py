@@ -139,41 +139,52 @@ def plot_overlap_comparison(results_df: pd.DataFrame) -> None:
                             
                             # 各チャンクサイズのデータを追加
                             for i, chunk_size in enumerate(chunk_sizes):
-                                size_data = model_data[model_data['chunk_size'] == chunk_size]
-                                if len(size_data) > 0:
-                                    color_idx = i % len(colors)
-                                    
-                                    # ラベル列を使用して戦略名を取得
-                                    if 'label' in size_data.columns:
-                                        display_strategy = size_data['label'].iloc[0]
-                                    else:
-                                        # ラベル列が存在しない場合は元のロジックを使用
-                                        strategy = size_data['chunk_strategy'].iloc[0]
-                                        if isinstance(strategy, str):
-                                            base_strategy = strategy.split('-')[0].lower()
-                                            if base_strategy in ['semantic', 'sentence', 'paragraph']:
-                                                display_strategy = base_strategy
-                                            else:
-                                                display_strategy = f"{base_strategy}-{chunk_size}"
+                                # 同じチャンクサイズ内で重複する overlap ごとの値を平均で集約
+                                size_data_raw = model_data[model_data['chunk_size'] == chunk_size]
+                                if len(size_data_raw) == 0:
+                                    continue
+
+                                # 重複している (overlap) をまとめて平均値を算出
+                                size_data = (
+                                    size_data_raw
+                                    .groupby('overlap', as_index=False)[metric]
+                                    .mean()
+                                )
+
+                                color_idx = i % len(colors)
+
+                                # ラベル列を使用して戦略名を取得（重複データがある場合も1つにまとめる）
+                                if 'label' in size_data_raw.columns:
+                                    display_strategy = size_data_raw['label'].iloc[0]
+                                else:
+                                    # ラベル列が存在しない場合は元のロジックを使用
+                                    strategy = size_data_raw['chunk_strategy'].iloc[0]
+                                    if isinstance(strategy, str):
+                                        base_strategy = strategy.split('-')[0].lower()
+                                        if base_strategy in ['semantic', 'sentence', 'paragraph']:
+                                            display_strategy = base_strategy
                                         else:
-                                            display_strategy = str(strategy)
-                                    
-                                    # ホバーテキストのフォーマットを決定
-                                    if isinstance(display_strategy, str) and any(s in display_strategy for s in ['semantic', 'sentence', 'paragraph']):
-                                        hover_text = f'<b>{display_strategy}</b><br>オーバーラップ: %{{x}}<br>スコア: %{{y:.3f}}<extra></extra>'
+                                            display_strategy = f"{base_strategy}-{chunk_size}"
                                     else:
-                                        hover_text = f'<b>{display_strategy} (チャンク: {chunk_size})</b><br>オーバーラップ: %{{x}}<br>スコア: %{{y:.3f}}<extra></extra>'
-                                    
-                                    fig.add_trace(go.Scatter(
-                                        x=size_data['overlap'],
-                                        y=size_data[metric],
-                                        name=display_strategy,
-                                        mode='lines+markers',
-                                        line=dict(width=3, color=colors[color_idx]),
-                                        marker=dict(size=10, color=colors[color_idx]),
-                                        hovertemplate=hover_text,
-                                        showlegend=True
-                                    ))
+                                        display_strategy = str(strategy)
+
+                                # ホバーテキストのフォーマットを決定
+                                if isinstance(display_strategy, str) and any(s in display_strategy for s in ['semantic', 'sentence', 'paragraph']):
+                                    hover_text = f'<b>{display_strategy}</b><br>オーバーラップ: %{{x}}<br>スコア: %{{y:.3f}}<extra></extra>'
+                                else:
+                                    hover_text = f'<b>{display_strategy} (チャンク: {chunk_size})</b><br>オーバーラップ: %{{x}}<br>スコア: %{{y:.3f}}<extra></extra>'
+
+                                # 集約後のデータで描画
+                                fig.add_trace(go.Scatter(
+                                    x=size_data['overlap'],
+                                    y=size_data[metric],
+                                    name=display_strategy,
+                                    mode='lines+markers',
+                                    line=dict(width=3, color=colors[color_idx]),
+                                    marker=dict(size=10, color=colors[color_idx]),
+                                    hovertemplate=hover_text,
+                                    showlegend=True
+                                ))
                             
                             # レイアウトを設定
                             # チャンク戦略名を取得（create_label関数を使用）
