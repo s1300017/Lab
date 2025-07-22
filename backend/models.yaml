@@ -9,11 +9,21 @@ models:
     category: "LLM"
     display_name: "GPT-4o-mini (OpenAI)"
     description: "OpenAIのGPT-4o-miniモデル。高品質な応答を提供します。"
-  - name: openai
+  - name: text-embedding-3-small
     type: openai
     category: "Embedding"
-    display_name: "OpenAI Embedding"
-    description: "OpenAIの埋め込みモデル。高品質な埋め込みを提供します。"
+    display_name: "OpenAI text-embedding-3-small"
+    description: "OpenAIの最新の埋め込みモデル（小規模）。高効率な埋め込みを提供します。"
+  - name: text-embedding-3-large
+    type: openai
+    category: "Embedding"
+    display_name: "OpenAI text-embedding-3-large"
+    description: "OpenAIの最新の埋め込みモデル（大規模）。より高精度な埋め込みを提供します。"
+  - name: text-embedding-ada-002
+    type: openai
+    category: "Embedding"
+    display_name: "OpenAI text-embedding-ada-002"
+    description: "OpenAIの従来の埋め込みモデル。広く利用されています。"
   - name: huggingface_bge_small
     type: huggingface
     category: "Embedding"

@@ -494,8 +494,19 @@ def get_embeddings(model_name: str):
         }
     }
     
-    if model_name == "openai":
-        return OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
+    # OpenAIモデルのマッピング
+    openai_models = {
+        "openai": "text-embedding-ada-002",  # 旧モデル名との互換性のため
+        "text-embedding-3-small": "text-embedding-3-small",
+        "text-embedding-3-large": "text-embedding-3-large",
+        "text-embedding-ada-002": "text-embedding-ada-002"
+    }
+    
+    if model_name in openai_models:
+        return OpenAIEmbeddings(
+            model=openai_models[model_name],
+            openai_api_key=os.getenv("OPENAI_API_KEY")
+        )
     
     # HuggingFaceモデルのマッピング
     hf_models = {
@@ -1037,6 +1048,24 @@ async def bulk_evaluate(request: Request):
                 sample_text = data.get("text")
                 if not sample_text:
                     raise ValueError("textが指定されていません")
+                    
+                # サポートされているモデルかチェック
+                supported_models = {
+                    # OpenAIモデル
+                    'openai', 'text-embedding-3-small', 'text-embedding-3-large', 'text-embedding-ada-002',
+                    # HuggingFaceモデル
+                    'huggingface_bge_small', 'huggingface_miniLM', 'huggingface_mpnet_base',
+                    'huggingface_multi_qa_minilm', 'huggingface_multi_qa_mpnet',
+                    'huggingface_paraphrase_multilingual', 'huggingface_distiluse_multilingual',
+                    'huggingface_xlm_r'
+                }
+                
+                if embedding_model not in supported_models:
+                    raise ValueError(f"未サポートの埋め込みモデルが指定されました: {embedding_model}")
+                    
+                # モデル名がopenaiの場合は、最新モデルを使用するように警告
+                if embedding_model == "openai":
+                    print("警告: 'openai' モデルは非推奨です。代わりに 'text-embedding-3-small' または 'text-embedding-3-large' の使用を検討してください。")
                 questions = data.get("questions")
                 answers = data.get("answers")
                 if not questions or not answers:
