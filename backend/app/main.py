@@ -581,13 +581,7 @@ class QueryRequest(BaseModel):
     llm_model: str = "mistral"  # デフォルト値を設定
     embedding_model: str = "huggingface_bge_small"  # デフォルト値を設定
 
-class EvalRequest(BaseModel):
-    questions: list[str]
-    answers: list[str]
-    contexts: list[list[str]]
-    llm_model: str # Added for dynamic selection
-    embedding_model: str # Added for dynamic selection
-    include_overlap_metrics: bool = False
+# 単一評価リクエストは一括評価に統合されました
 
 class ModelSelection(BaseModel):
     llm_model: str
@@ -838,82 +832,8 @@ def calculate_overlap_metrics(contexts: list[list[str]], embedder=None) -> dict:
         "semantic_overlap": semantic_overlap
     }
 
-@app.post("/evaluate/")
-def evaluate_ragas(request: EvalRequest):
-    try:
-        llm_instance = get_llm(request.llm_model)
-        embeddings_instance = get_embeddings(request.embedding_model)
-
-        dataset_dict = {
-            "question": request.questions,
-            "answer": request.answers,
-            "contexts": request.contexts,
-            "ground_truth": request.answers 
-        }
-        dataset = Dataset.from_dict(dataset_dict)
-
-        # 評価メトリクスの定義
-        metrics = [
-            faithfulness,
-            answer_relevancy,
-            context_recall,
-            context_precision,
-        ]
-
-        # オーバーラップメトリクスを追加
-        if request.include_overlap_metrics:
-            # 拡張されたオーバーラップメトリクスを計算
-            overlap_metrics = calculate_overlap_metrics(request.contexts, embeddings_instance)
-            
-            # 各質問のコンテキストに対してオーバーラップを計算
-            per_question_overlaps = []
-            for ctx_list in request.contexts:
-                metrics = calculate_overlap_metrics(ctx_list, embeddings_instance)
-                per_question_overlaps.append(metrics)
-            
-            # 平均オーバーラップを計算
-            avg_overlap = overlap_metrics["overlap_ratio"]
-            avg_adjacent_overlap = overlap_metrics.get("avg_adjacent_overlap", 0.0)
-            semantic_overlap = overlap_metrics.get("semantic_overlap", 0.0)
-        else:
-            avg_overlap = 0.0
-            avg_adjacent_overlap = 0.0
-            semantic_overlap = 0.0
-            per_question_overlaps = [{"overlap_ratio": 0.0, "adjacent_overlap": [0.0], "semantic_overlap": 0.0} for _ in request.contexts]
-
-        # 評価を実行
-        result = evaluate(
-            dataset=dataset,
-            metrics=metrics,
-            llm=llm_instance,
-            embeddings=embeddings_instance,
-        )
-
-        # 必須評価指標キーを全て含める（欠損時は0.0で埋める）
-        required_keys = [
-            "overall_score", "faithfulness", "answer_relevancy", 
-            "context_recall", "context_precision", "answer_correctness", 
-            "avg_chunk_len", "num_chunks"
-        ]
-        
-        # ragasのscoresはdictで返る
-        scores = result.scores if isinstance(result.scores, dict) else {}
-        
-        # 欠損キーを0.0で補完
-        for k in required_keys:
-            if k not in scores:
-                scores[k] = 0.0
-        
-        # オーバーラップメトリクスを追加
-        if request.include_overlap_metrics:
-            scores["overlap_ratio"] = avg_overlap
-            scores["avg_adjacent_overlap"] = avg_adjacent_overlap
-            scores["semantic_overlap"] = semantic_overlap
-            scores["per_question_overlaps"] = per_question_overlaps
-        
-        return scores
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# /evaluate/エンドポイントは一括評価に統合されました
+# 代わりに/bulk_evaluate/エンドポイントを使用してください
 
 @app.post("/clear_db/")
 def clear_db():

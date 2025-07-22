@@ -1528,7 +1528,9 @@ with st.sidebar:
             st.rerun()
 
 # メインコンテンツのタブ定義
-tab1, tab2, tab3, tab4, tab_chatbot, tab_thesis = st.tabs(["チャンキング設定", "評価", "一括評価", "比較", "チャットボット", "卒論向け分析"])
+tab1, tab2, tab3, tab4 = st.tabs(["チャンキング設定", "一括評価", "チャットボット", "卒論向け分析"])
+tab_chatbot = tab3  # チャットボットタブ
+tab_thesis = tab4   # 卒論向け分析タブ
 
 # タブ1: チャンキング設定
 with tab1:
@@ -1540,7 +1542,7 @@ with tab1:
         # 埋め込みモデルの選択肢と特徴説明
         embedding_models = {
             "huggingface_bge_small": "軽量モデル。リソースに制限がある場合に適しています。\n- サイズ: 約1GB\n- 用途: リソース制限がある環境での文書理解",
-            "huggingface_bge_large": "高性能モデル。より正確な文書理解が可能です。\n- サイズ: 約8GB\n- 用途: 高精度な文書理解が必要な場合",
+            "huggingface_bge_large": "高性能モデル。より正確な文書理解が可能です。\n- サイズ: 約8GB\n- 用途: 高精度な文書理解",
             "sentence_transformers_all-MiniLM-L6-v2": "軽量で高速なモデル。基本的な文書理解に適しています。\n- サイズ: 約170MB\n- 用途: 一般的な文書理解、リソース制限がある環境",
             "sentence_transformers_all-mpnet-base-v2": "高性能なモデル。複雑な文書理解に適しています。\n- サイズ: 約420MB\n- 用途: 高精度な文書理解、複雑な文脈理解",
             "sentence_transformers_multi-qa-MiniLM-L6-cos-v1": "QAタスクに特化したモデル。質問応答の精度が向上します。\n- サイズ: 約170MB\n- 用途: 質問応答の精度を重視する場合",
@@ -1557,10 +1559,11 @@ with tab1:
         }
         
         # モデル選択UI
-        selected_model = st.selectbox("埋め込みモデル (semantic時必須)", 
-                                    list(embedding_models.keys()),
-                                    format_func=lambda x: f"{x} - {embedding_models[x]}",
-                                    index=0)
+        selected_model = st.selectbox(
+            "埋め込みモデル (semantic時必須)", 
+            list(embedding_models.keys()),
+            format_func=lambda x: f"{x} - {embedding_models[x]}",
+            index=0)
         
         # 選択されたモデルの特徴を表示
         st.write(f"選択されたモデルの特徴: {embedding_models[selected_model]}")
@@ -1596,104 +1599,8 @@ if not st.session_state.text:
     st.info("サイドバーでPDFファイルをアップロードし、設定を行ってください。")
     st.stop()
 
-# タブ2: 評価
-# PDFがアップロードされていない場合はチャット画面のみ表示
-if 'uploaded_file_bytes' not in st.session_state:
-    st.warning("PDFをアップロードしてください。")
-    st.stop()
-
+# タブ2: 一括評価
 with tab2:
-    st.header("評価の実行と結果")
-    
-    # 評価実行セクション
-    with st.expander("評価を実行", expanded=True):
-        st.subheader("評価の実行")
-        
-        # 質問と回答の入力
-        questions = st.text_area("評価する質問を入力（1行に1つ）", 
-        value="\n".join(st.session_state.get('qa_questions', [])), 
-        height=150,
-        help="評価したい質問を1行ずつ入力してください")
-                
-        answers = st.text_area("回答を入力（1行に1つ、質問と順番を合わせてください）", 
-        value="\n".join(st.session_state.get('qa_answers', [])), 
-        height=150,
-        help="質問に対する回答を1行ずつ入力してください")
-                
-        # 評価実行ボタン
-        if st.button("評価を実行", key="evaluate_button_evaluation_tab"):
-            questions = [q.strip() for q in questions.split('\n') if q.strip()]
-            answers = [a.strip() for a in answers.split('\n') if a.strip()]
-                        
-            if not questions:
-                st.warning("評価する質問を入力してください。")
-            elif len(questions) != len(answers):
-                st.warning("質問と回答の数が一致しません。")
-            else:
-                with st.spinner("評価を実行中... しばらくお待ちください。"):
-                    try:
-                        evaluation_payload = {
-                            "questions": questions,
-                            "answers": answers,
-                            "contexts": ["" for _ in questions],
-                            "model": st.session_state.llm_model
-                        }
-                        
-                        response = requests.post(
-                            f"{BACKEND_URL}/evaluate/", 
-                            json=evaluation_payload
-                        )
-                        
-                        if response.status_code == 200:
-                            st.session_state.evaluation_results = response.json()
-                            st.session_state.qa_questions = questions
-                            st.session_state.qa_answers = answers
-                            st.success("評価が完了しました！")
-                            st.rerun()
-                        else:
-                            st.error(f"評価の実行中にエラーが発生しました: {response.text}")
-                    except Exception as e:
-                        st.error(f"評価の実行中にエラーが発生しました: {str(e)}")
-    
-    # 評価結果表示セクション
-    st.subheader("評価結果")
-    if 'evaluation_results' in st.session_state and st.session_state.evaluation_results:
-        eval_results = st.session_state.evaluation_results
-        
-        # 評価結果を表形式で表示
-        st.subheader("評価結果サマリー")
-        
-        # スコアの表示
-        if 'scores' in eval_results:
-            scores = eval_results['scores']
-            st.write("### スコア")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("ファクト整合性", f"{scores.get('faithfulness', 0):.2f}")
-            with col2:
-                st.metric("回答関連性", f"{scores.get('answer_relevancy', 0):.2f}")
-            with col3:
-                st.metric("文脈再現率", f"{scores.get('context_recall', 0):.2f}")
-            with col4:
-                st.metric("文脈適合率", f"{scores.get('context_precision', 0):.2f}")
-            
-            # 詳細な評価結果を表示
-            if 'results' in eval_results and eval_results['results']:
-                st.write("### 質問ごとの詳細")
-                for i, result in enumerate(eval_results['results']):
-                    if not isinstance(result, dict):
-                        continue
-                    with st.expander(f"質問 {i+1}: {result.get('question', '')}"):
-                        st.write(f"**質問**: {result.get('question', '')}")
-                        st.write(f"**回答**: {result.get('answer', '')}")
-                        st.write(f"**スコア**: {result.get('score', 'N/A')}")
-                        if 'details' in result and result['details']:
-                            st.json(result['details'])
-        else:
-            st.info("評価結果がありません。上記のフォームから評価を実行してください。")
-
-# 一括評価タブ
-with tab3:
     st.header("一括評価")
     st.markdown("Embeddingモデル・チャンク分割方式・サイズ・オーバーラップの全組み合わせで一括自動評価を行います。")
     
@@ -1753,7 +1660,7 @@ with tab3:
         options=list(embedding_options.values()),
         format_func=lambda x: [k for k, v in embedding_options.items() if v == x][0],
         default=default_selection,
-        key="bulk_embeddings_tab3"
+        key="bulk_embeddings_tab2"
     )
 
     # チャンク分割方法の選択
@@ -1917,12 +1824,7 @@ with tab3:
                             
                         return result
                     else:
-                        st.error("評価に失敗しました。詳細:")
-                        st.json({
-                            "status_code": response.status_code,
-                            "error": response.text,
-                            "request_payload": payload
-                        })
+                        st.error(f"評価の実行中にエラーが発生しました: {response.text}")
                         return None
                         
                 except requests.exceptions.RequestException as e:
@@ -2267,7 +2169,14 @@ with tab3:
                             ```
                             総合スコア = (faithfulness + answer_relevancy + context_recall + context_precision + answer_correctness) / 5
                             ```
-                          - 各メトリクスは0〜1の値を取り、1に近いほど良い結果です
+                          - 各メトリクスは以下の5つの指標から構成されます：
+                            - 信頼性 (Faithfulness)
+                            - 回答の関連性 (Answer Relevancy)
+                            - コンテキストの再現性 (Context Recall)
+                            - コンテキストの正確性 (Context Precision)
+                            - 回答の正確性 (Answer Correctness)
+                          
+                          - 同じチャンク戦略内でモデル間比較が可能です
                         - バーの色はスコアの高さを表し、青に近いほどスコアが高いです
                         - バーの上に表示されている数値が平均スコアです
                         """)
@@ -2456,202 +2365,6 @@ with tab3:
                 else:
                     st.error("グラフの生成中にエラーが発生しました。もう一度お試しください。")
 
-with tab4:
-    if 'uploaded_file_bytes' not in st.session_state:
-        st.warning("PDFをアップロードしてください。")
-        st.stop()
-        
-    st.header("評価結果の比較")
-    
-    if 'evaluation_results' in st.session_state and st.session_state.evaluation_results:
-        st.subheader("評価結果の比較")
-        
-        # 評価結果をDataFrameに変換
-        eval_results = st.session_state.evaluation_results
-        if 'results' in eval_results:
-            df_data = []
-            for i, result in enumerate(eval_results['results']):
-                row = {
-                    '質問番号': i+1,
-                    '質問': result.get('question', ''),
-                    '回答': result.get('answer', '')
-                }
-                if 'details' in result:
-                    for k, v in result['details'].items():
-                        if isinstance(v, (int, float)):
-                            row[k] = v
-                df_data.append(row)
-            
-            if df_data:
-                df = pd.DataFrame(df_data)
-                st.dataframe(df)
-                
-                # スコアの可視化
-                score_cols = [col for col in df.columns if col not in ['質問番号', '質問', '回答']]
-                if score_cols:
-                    st.subheader("スコアの比較")
-                    fig = px.bar(df, x='質問番号', y=score_cols, 
-                                title="質問ごとのスコア比較",
-                                labels={'value': 'スコア', 'variable': '評価項目', '質問番号': '質問番号'})
-                    st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("比較する評価結果がありません。評価または一括評価を実行してください。")
-        # --- 自動生成QAセット優先で利用 ---
-        auto_questions = st.session_state.get('qa_questions', None)
-        auto_answers = st.session_state.get('qa_answers', None)
-        if auto_questions:
-            st.markdown("#### アップロードPDFから自動生成された質問セットを利用します")
-            questions = auto_questions
-            st.write("\n".join([f"Q{i+1}: {q}" for i, q in enumerate(questions)]))
-        else:
-            questions_input = st.text_area("1行に1つの質問を入力してください", height=150, 
-                                           value="主なチャンキング技術には何がありますか？\nセマンティックチャンキングと再帰的文字分割の違いは何ですか？")
-            questions = [q.strip() for q in questions_input.split('\n') if q.strip()]
-
-        if st.button("評価を実行", key="evaluate_button_evaluation"):
-            if not questions:
-                st.warning("最低1つの質問を入力してください。")
-            else:
-                with st.spinner("評価を実行中... これには数分かかる場合があります。"):
-                    try:
-                        # 1. 質問に対する回答とコンテキストを取得
-                        answers = []
-                        contexts = []
-                        # --- アップロードPDFから自動生成された回答セットがあれば利用 ---
-                        if auto_answers and len(auto_answers) == len(questions):
-                            answers = auto_answers
-                            st.success("自動生成された回答セットを使用します。")
-                        else:
-                            # 回答を生成するコードをここに追加
-                            st.warning("自動生成された回答セットがありません。")
-                            st.stop()
-
-                        # 2. 評価を実行
-                        evaluation_payload = {
-                            "questions": questions,
-                            "answers": answers,
-                            "contexts": ["" for _ in questions],  # コンテキストは空で仮設定
-                            "model": st.session_state.llm_model
-                        }
-                        
-                        eval_response = requests.post(f"{BACKEND_URL}/evaluate/", json=evaluation_payload)
-                        if eval_response.status_code == 200:
-                            st.session_state.evaluation_results = eval_response.json()
-                            st.success("評価が完了しました！")
-                            # 評価結果を表示するタブに移動
-                            st.session_state.active_tab = "評価"
-                            st.rerun()
-                        else:
-                            st.error(f"評価の実行中にエラーが発生しました: {eval_response.text}")
-                    except Exception as e:
-                        st.error(f"評価の実行中にエラーが発生しました: {str(e)}")
-                    st.warning(f"chunk_size <= overlap となる不正な組み合わせは自動的に除外しました: ({embedding}, {strategy}, {size}, {overlap})")
-                    # 進捗バーの設定
-                    progress_bar = st.progress(0)
-                    total_tasks = len(futures)
-                    completed_tasks = 0
-                    for future in concurrent.futures.as_completed(futures):
-                        result = future.result()
-                        if result is not None:
-                            answers.append(result['answer'])
-                            contexts.append(result['context'])
-                        completed_tasks += 1
-                        progress_bar.progress(min(completed_tasks / total_tasks, 1.0))
-                    progress_bar.empty()
-                    st.session_state.evaluation_results = {"answers": answers, "contexts": contexts}
-                    st.success("評価が完了しました！")
-
-        if st.session_state.evaluation_results:
-            st.subheader("評価指標")
-            st.write("評価APIの返却内容:", st.session_state.evaluation_results)  # 返却内容を確認用に表示
-            # evaluation_resultsがリスト形式の場合に対応
-            eval_results = st.session_state.evaluation_results
-            if isinstance(eval_results, list):
-                results_df = pd.DataFrame(eval_results)
-            else:
-                results_df = pd.DataFrame([eval_results])
-            # 英語→日本語の指標名マッピング
-            METRIC_JA = {
-                "faithfulness": "ファクト整合性",
-                "answer_relevancy": "回答関連性",
-                "context_recall": "文脈再現率",
-                "context_precision": "文脈適合率"
-            }
-
-            # DataFrameのカラム名も日本語に変換して表示
-            results_df_ja = results_df.rename(columns=METRIC_JA)
-            st.dataframe(results_df_ja)
-
-            # Plotting
-            metrics = ['faithfulness', 'answer_relevancy', 'context_recall', 'context_precision']
-            available_metrics = [m for m in metrics if m in results_df.columns]
-
-            if available_metrics:
-                plot_df = results_df[available_metrics].T.reset_index()
-                plot_df['index'] = plot_df['index'].map(METRIC_JA)
-                plot_df.columns = ['指標', 'スコア']
-
-                # Performance Ranking風 横棒グラフ
-                fig_bar = px.bar(
-                    plot_df,
-                    y='指標',
-                    x='スコア',
-                    orientation='h',
-                    text='スコア',
-                    title="Performance Ranking",
-                    labels={"指標": "Metric", "スコア": "Score"},
-                )
-                fig_bar.update_traces(texttemplate='%{x:.3f}', textposition='outside')
-                fig_bar.update_layout(
-                    title={
-                        'text': "RAG Strategy Performance Ranking<br><sup>Error bars show standard deviation • * indicates statistical significance</sup>",
-                        'x':0.5,
-                        'xanchor': 'center'
-                    },
-                    font=dict(size=16),
-                    height=550,
-                    margin=dict(l=40, r=40, t=80, b=40),
-                    showlegend=False
-                )
-                st.plotly_chart(fig_bar, use_container_width=True)
-                if 'eval_figs' not in st.session_state:
-                    st.session_state['eval_figs'] = []
-                if len(st.session_state['eval_figs']) == 0 or st.session_state['eval_figs'][-1] != fig_bar:
-                    st.session_state['eval_figs'].append(fig_bar)
-                st.markdown('<br>', unsafe_allow_html=True)
-
-                # RAGAS Metrics Comparison風 レーダーチャート
-                import plotly.graph_objects as go
-                metrics_en = ['Faithfulness', 'Answer Relevancy', 'Context Recall', 'Context Precision']
-                metrics = ['faithfulness', 'answer_relevancy', 'context_recall', 'context_precision']
-                r_values = [results_df[m].iloc[0] if m in results_df.columns else 0 for m in metrics]
-                fig_radar = go.Figure()
-                fig_radar.add_trace(go.Scatterpolar(
-                    r=r_values,
-                    theta=metrics_en,
-                    fill='toself',
-                    name='Sample'
-                ))
-                fig_radar.update_layout(
-                    title={
-                        'text': "RAGAS Metrics Comparison<br><sup>All metrics normalized to 0-1 scale</sup>",
-                        'x':0.5,
-                        'xanchor': 'center'
-                    },
-                    polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
-                    showlegend=True,
-                    font=dict(size=16),
-                    height=600,
-                    margin=dict(l=40, r=40, t=80, b=40)
-                )
-                st.plotly_chart(fig_radar, use_container_width=True)
-                if 'eval_figs' not in st.session_state:
-                    st.session_state['eval_figs'] = []
-                if len(st.session_state['eval_figs']) == 0 or st.session_state['eval_figs'][-1] != fig_radar:
-                    st.session_state['eval_figs'].append(fig_radar)
-                st.markdown('<br>', unsafe_allow_html=True)
-            else:
-                st.warning("評価指標が見つかりません。評価APIの返却内容をご確認ください。")
 
 # チャットボットタブ
 with tab_chatbot:
@@ -2719,8 +2432,8 @@ with tab_chatbot:
         
         # 画面を更新
         st.rerun()
-        
-# タブ6: 卒論向け分析
+
+# 卒論向け分析タブ
 with tab_thesis:
     st.header("卒論向け分析")
     
