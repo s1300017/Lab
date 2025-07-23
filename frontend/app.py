@@ -1109,6 +1109,10 @@ def init_session_state():
         st.session_state.llm_model = "ollama_llama2" # Default to Ollama
     if 'embedding_model' not in st.session_state:
         st.session_state.embedding_model = "huggingface_bge_small" # Default to HuggingFace
+    # --- chat_modelもllm_modelと同期して初期化 ---
+    if 'chat_model' not in st.session_state:
+        st.session_state.chat_model = st.session_state.llm_model
+
 
 init_session_state()
 
@@ -1375,12 +1379,14 @@ with st.sidebar:
     # LLMモデル選択UI
     if llm_models:
         llm_model = st.selectbox(
-            "LLMモデル",
+            "LLMモデルを選択",
             llm_options,
             index=default_llm_idx,
             key="llm_model_select"
         )
         st.session_state.llm_model = llm_names[llm_options.index(llm_model)]
+        # --- チャット用モデルも必ず同期（未定義エラー防止） ---
+        st.session_state.chat_model = st.session_state.llm_model
     else:
         st.warning("利用可能なLLMモデルが見つかりません")
         llm_model = None
@@ -1536,9 +1542,22 @@ tab_thesis = tab4   # 卒論向け分析タブ
 with tab1:
     if st.session_state.text:
         st.subheader("チャンキング設定")
-        chunk_method = st.radio("チャンク化方式", ["recursive", "semantic"], index=0, help="recursive: 文字数ベース, semantic: 意味ベース")
-        chunk_size = st.slider("チャンクサイズ", 200, 4000, 1000, 100)
-        chunk_overlap = st.slider("チャンクオーバーラップ", 0, 1000, 200, 50)
+        # 一括評価と同じチャンク方式選択肢に統一
+        chunk_method = st.radio(
+            "チャンク化方式",
+            ["recursive", "fixed", "semantic", "sentence", "paragraph"],
+            index=0,
+            help="recursive: 文字数ベース, fixed: 固定長, semantic: 意味ベース, sentence: 文単位, paragraph: 段落単位"
+        )
+        # semantic, sentence, paragraphのときはサイズ・オーバーラップを無効化
+        size_methods = ["recursive", "fixed"]
+        if chunk_method in size_methods:
+            chunk_size = st.slider("チャンクサイズ", 200, 4000, 1000, 100, disabled=False)
+            chunk_overlap = st.slider("チャンクオーバーラップ", 0, 1000, 200, 50, disabled=False)
+        else:
+            chunk_size = st.slider("チャンクサイズ", 200, 4000, 1000, 100, disabled=True)
+            chunk_overlap = st.slider("チャンクオーバーラップ", 0, 1000, 200, 50, disabled=True)
+            st.info(f"{chunk_method}方式ではチャンクサイズ・オーバーラップは自動的に決定されます。サイズ・オーバーラップの指定は不要です。")
         # 埋め込みモデルの選択肢と特徴説明
         embedding_models = {
             "huggingface_bge_small": "軽量モデル。リソースに制限がある場合に適しています。\n- サイズ: 約1GB\n- 用途: リソース制限がある環境での文書理解",
@@ -1585,7 +1604,11 @@ with tab1:
                 if chunk_response.status_code == 200:
                     st.session_state.chunks = chunk_response.json()['chunks']
                     # 2. Embed
-                    embed_payload = {"chunks": st.session_state.chunks, "embedding_model": st.session_state.embedding_model}
+                    embed_payload = {
+                        "chunks": st.session_state.chunks,
+                        "embedding_model": st.session_state.embedding_model,
+                        "chunk_method": chunk_method  # チャンク方式を追加
+                    }
                     embed_response = requests.post(f"{BACKEND_URL}/embed_and_store/", json=embed_payload)
                     if embed_response.status_code == 200:
                         st.success(f"{len(st.session_state.chunks)}個のチャンクを生成し、ベクトル化しました。")
@@ -2387,48 +2410,34 @@ with tab_chatbot:
             st.markdown(prompt)
         
         # 選択されたモデルで応答を生成
+        # 必ずst.session_state.chat_model（llm_model）を参照
         response_text = ""
-        with st.chat_message("assistant"):
+        chat_model = st.session_state.get("chat_model") or st.session_state.get("llm_model")
+        if not chat_model:
+            response_text = "エラー: チャットボットモデルが未選択です。設定タブでモデルを選択してください。"
+        else:
+            # --- RAGバックエンドAPIを呼び出して実際の応答を取得 ---
             try:
-                if not os.getenv("OPENAI_API_KEY"):
-                    st.error("APIキーが設定されていません。.envファイルにOPENAI_API_KEYを設定してください。")
-                    response_text = "APIキーが設定されていません。設定を確認してください。"
-                
-                # プロンプトを準備
-                messages = [{"role": "system", "content": "あなたは親切で役立つアシスタントです。"}]
-                messages.extend([{"role": m["role"], "content": m["content"]} for m in st.session_state.chat_messages])
-                
-                # モデルに応じてAPIを呼び出し
-                if st.session_state.chat_model in ["gpt-4o-mini", "gpt-3.5-turbo"]:
-                    # OpenAI APIを使用
-                    api_key = os.getenv("OPENAI_API_KEY")
-                    if not api_key:
-                        response_text = "エラー: APIキーが設定されていません。"
-                    else:
-                        try:
-                            client = OpenAI(api_key=api_key)
-                            response = client.chat.completions.create(
-                                model=st.session_state.chat_model,
-                                messages=messages,
-                                temperature=0.7,
-                                max_tokens=1000
-                            )
-                            response_text = response.choices[0].message.content
-                        except Exception as e:
-                            response_text = f"APIエラーが発生しました: {str(e)}"
+                import requests
+                BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+                query_payload = {
+                    "query": prompt,
+                    "llm_model": st.session_state.get("llm_model", "ollama_llama2"),
+                    "embedding_model": st.session_state.get("embedding_model", "huggingface_bge_small")
+                }
+                response = requests.post(f"{BACKEND_URL}/query/", json=query_payload, timeout=120)
+                if response.status_code == 200:
+                    data = response.json()
+                    response_text = data.get("answer", "（応答がありません）")
                 else:
-                    # 無料モデルの場合（例としての実装）
-                    response_text = f"{st.session_state.chat_model} からの応答: あなたのメッセージ「{prompt}」を受け取りました。\n\n（注: 無料モデルの場合はダミー応答です）"
-                
-                st.markdown(response_text)
-                
-                # アシスタントのメッセージを履歴に追加
-                st.session_state.chat_messages.append({"role": "assistant", "content": response_text})
-                
+                    response_text = f"APIエラー: {response.status_code} - {response.text}"
             except Exception as e:
-                error_msg = f"エラーが発生しました: {str(e)}"
-                st.error(error_msg)
-                st.session_state.chat_messages.append({"role": "assistant", "content": error_msg})
+                response_text = f"リクエストエラー: {str(e)}"
+        # --- バックエンドAPIの応答のみを表示・履歴追加 ---
+        with st.chat_message("assistant"):
+            st.markdown(response_text)
+            st.session_state.chat_messages.append({"role": "assistant", "content": response_text})
+
         
         # 画面を更新
         st.rerun()

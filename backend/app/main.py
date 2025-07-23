@@ -574,7 +574,8 @@ class ChunkRequest(BaseModel):
 
 class EmbedRequest(BaseModel):
     chunks: list[str]
-    embedding_model: str # Added for dynamic selection
+    embedding_model: str # 埋め込みモデル名
+    chunk_method: str    # チャンク方式（recursive, semantic, fixed, sentence, paragraph など）
 
 class QueryRequest(BaseModel):
     query: str
@@ -595,7 +596,10 @@ def chunk_text(request: ChunkRequest):
     """
     chunk_methodに応じて適切な方法でテキストをチャンク分割
     - recursive: 再帰的にテキストを分割（デフォルト）
+    - fixed: 固定長で分割
     - semantic: 意味的なまとまりで分割（embeddingモデルが必要）
+    - sentence: 文単位で分割
+    - paragraph: 段落単位で分割
     """
     if request.chunk_method == 'semantic':
         # embedding_modelが指定されていることを確認
@@ -605,45 +609,46 @@ def chunk_text(request: ChunkRequest):
                 detail="semanticチャンキングにはembedding_modelの指定が必要です"
             )
         try:
-            # 埋め込みモデルを取得
+            # モデル名から埋め込みインスタンスを生成
             embedder = get_embeddings(request.embedding_model)
-            print(f"セマンティックチャンキングを開始します（chunk_sizeとchunk_overlapは無視されます）...")
-            # セマンティックチャンキングを実行（chunk_sizeとchunk_overlapは無視）
             chunks = semantic_chunk_text(
                 text=request.text,
-                chunk_size=None,  # 無視される
-                chunk_overlap=None,  # 無視される
-                embedding_model=embedder
+                chunk_size=None,
+                chunk_overlap=None,
+                embedding_model=embedder  # インスタンスを渡す
             )
             return {"chunks": chunks}
-            
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"セマンティックチャンキング中にエラーが発生しました: {str(e)}"
-            )
-            
-    elif request.chunk_method == 'recursive':
-        # 再帰的チャンキング（デフォルト）
-        try:
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=request.chunk_size,
-                chunk_overlap=request.chunk_overlap,
-                length_function=len,
-            )
-            chunks = text_splitter.split_text(request.text)
-            return {"chunks": chunks}
-            
         except Exception as e:
             raise HTTPException(
                 status_code=500,
                 detail=f"テキストのチャンキング中にエラーが発生しました: {str(e)}"
             )
+    elif request.chunk_method == 'recursive':
+        # 再帰的な文字数分割
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=request.chunk_size,
+            chunk_overlap=request.chunk_overlap,
+            length_function=len,
+        )
+        chunks = text_splitter.split_text(request.text)
+        return {"chunks": chunks}
+    elif request.chunk_method == 'fixed':
+        # 固定長で分割
+        chunks = fixed_chunk_text(request.text, request.chunk_size, request.chunk_overlap)
+        return {"chunks": chunks}
+    elif request.chunk_method == 'sentence':
+        # 文単位で分割
+        chunks = sentence_chunk_text(request.text)
+        return {"chunks": chunks}
+    elif request.chunk_method == 'paragraph':
+        # 段落単位で分割
+        chunks = paragraph_chunk_text(request.text)
+        return {"chunks": chunks}
     else:
-        # 未対応のチャンキング方法が指定された場合
         raise HTTPException(
             status_code=400,
-            detail=f"未対応のchunk_method: {request.chunk_method}。'recursive' または 'semantic' を指定してください。"
+            detail=f"未対応のchunk_method: {request.chunk_method}。'recursive', 'fixed', 'semantic', 'sentence', 'paragraph' のいずれかを指定してください。"
         )
 
 
@@ -656,8 +661,12 @@ def embed_and_store(request: EmbedRequest):
             embedding=embeddings_instance,
             collection_name=get_collection_name(request.embedding_model)  # embeddingモデルごとにコレクションを切り替え
         )
-        vectorstore.add_texts(texts=request.chunks)
-        return {"message": f"Successfully embedded and stored {len(request.chunks)} chunks using {request.embedding_model}."}
+        # chunk_methodを全チャンクのmetadataに付与して保存
+        chunk_method = getattr(request, 'chunk_method', None)
+        # chunk_methodがEmbedRequestにない場合は、各チャンクのメタ情報としてNoneになる
+        metadatas = [{"chunk_method": chunk_method} for _ in request.chunks]
+        vectorstore.add_texts(texts=request.chunks, metadatas=metadatas)
+        return {"message": f"Successfully embedded and stored {len(request.chunks)} chunks using {request.embedding_model} (method={chunk_method}) ."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
