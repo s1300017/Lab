@@ -1554,6 +1554,7 @@ with tab1:
         if chunk_method in size_methods:
             chunk_size = st.slider("チャンクサイズ", 200, 4000, 1000, 100, disabled=False)
             chunk_overlap = st.slider("チャンクオーバーラップ", 0, 1000, 200, 50, disabled=False)
+            similarity_threshold = 0.7  # デフォルト値（使わない）
         else:
             chunk_size = st.slider("チャンクサイズ", 200, 4000, 1000, 100, disabled=True)
             chunk_overlap = st.slider("チャンクオーバーラップ", 0, 1000, 200, 50, disabled=True)
@@ -1564,7 +1565,14 @@ with tab1:
             elif chunk_method == "sentence":
                 st.info("【sentence方式】日本語文をspaCy（ja_core_news_smモデル）で高精度に文単位で分割します。\n\nチャンクサイズ・オーバーラップは自動的に決定されます。サイズ・オーバーラップの指定は不要です。\n\n※使用ライブラリ: spaCy（ja_core_news_sm）")
             elif chunk_method == "semantic":
-                st.info("【semantic方式】意味的なまとまりで分割します（embedding類似度ベース、チャンクサイズ・オーバーラップ指定不可）。")
+                st.info("【semantic方式】意味的なまとまりで分割します（embedding類似度ベース、チャンクサイズ・オーバーラップ指定不可）。\n\n日本語文をspaCyで文単位に分割し、多言語対応embeddingで意味的なまとまりをコサイン類似度で判定します。\n\n下記の閾値を調整すると、チャンクの粒度が変わります。\n（値を下げると大きなチャンク、上げると細かいチャンクになります）")
+                similarity_threshold = st.slider(
+                    "類似度閾値（semantic分割用）",
+                    min_value=0.3, max_value=0.95, value=0.7, step=0.01,
+                    help="この値より類似度が低いと新しいチャンクが始まります（値を下げると大きなチャンクになりやすい）"
+                )
+            else:
+                similarity_threshold = 0.7  # デフォルト値（使わない）
         # 埋め込みモデルの選択肢と特徴説明
         embedding_models = {
             "huggingface_bge_small": "軽量モデル。リソースに制限がある場合に適しています。\n- サイズ: 約1GB\n- 用途: リソース制限がある環境での文書理解",
@@ -1606,6 +1614,7 @@ with tab1:
                 }
                 if chunk_method == "semantic":
                     payload["embedding_model"] = embedding_model
+                    payload["similarity_threshold"] = similarity_threshold
 
                 chunk_response = requests.post(f"{BACKEND_URL}/chunk/", json=payload)
                 if chunk_response.status_code == 200:
@@ -1707,7 +1716,17 @@ with tab2:
     # 選択されたチャンク方法から、サイズ/オーバーラップが必要かどうかを判定
     needs_size_overlap = any(method in chunk_methods for method in NEEDS_SIZE_OVERLAP)
     has_semantic = "semantic" in chunk_methods
-    
+    # semantic方式選択時のみ閾値スライダー
+    if has_semantic:
+        st.info("semantic方式では、embeddingによる意味的分割の閾値を調整できます。\n値を下げると大きなチャンク、上げると細かいチャンクになります。")
+        bulk_similarity_threshold = st.slider(
+            "類似度閾値（semantic分割用）",
+            min_value=0.3, max_value=0.95, value=0.7, step=0.01,
+            help="この値より類似度が低いと新しいチャンクが始まります（値を下げると大きなチャンクになりやすい）",
+            key="bulk_similarity_threshold"
+        )
+    else:
+        bulk_similarity_threshold = 0.7  # デフォルト値
     # チャンクサイズの選択（必要な場合のみ有効化）
     chunk_sizes = st.multiselect(
         "チャンクサイズ（文字数）",
@@ -1817,6 +1836,9 @@ with tab2:
                         "questions": qa_questions,
                         "answers": qa_answers,
                     }
+                    
+                    if method == "semantic":
+                        payload["similarity_threshold"] = bulk_similarity_threshold
                     
                     response = requests.post(
                         f"{BACKEND_URL}/bulk_evaluate/", 

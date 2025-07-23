@@ -356,54 +356,43 @@ def semantic_chunk_text(text, chunk_size=None, chunk_overlap=None, embedding_mod
     import numpy as np
     from sklearn.metrics.pairwise import cosine_similarity
     
-    # 文単位で分割
-    sentences = nltk.sent_tokenize(text)
+    # spaCy日本語モデルで文単位に分割
+    try:
+        import spacy
+        nlp = spacy.load("ja_core_news_sm")
+    except OSError:
+        raise RuntimeError("spaCyの日本語モデル 'ja_core_news_sm' がインストールされていません。\n\npython -m spacy download ja_core_news_sm\n")
+    doc = nlp(text)
+    sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
     if not sentences:
         return [text]
-        
     print(f"セマンティックチャンキング: {len(sentences)}文を処理中...")
-    
-    # 各文のembedding取得
     if embedding_model is None:
         raise ValueError("embedding_modelが指定されていません")
-    
-    # バッチ処理で埋め込みを取得（大量の文がある場合に備えて）
     batch_size = 32
     embeddings = []
     for i in range(0, len(sentences), batch_size):
         batch = sentences[i:i+batch_size]
         batch_embeddings = embedding_model.embed_documents(batch)
         embeddings.extend(batch_embeddings)
-    
-    # チャンク生成
     chunks = []
     current_chunk = []
-    
     for i in range(len(sentences)):
         current_sentence = sentences[i]
         current_embedding = np.array(embeddings[i]).reshape(1, -1)
-        
-        # 現在のチャンクが空の場合は追加
         if not current_chunk:
             current_chunk.append(current_sentence)
             continue
-            
-        # 現在のチャンクの最後の文との類似度を計算
         last_embedding = np.array(embeddings[i-1]).reshape(1, -1)
         similarity = cosine_similarity(last_embedding, current_embedding)[0][0]
-        
-        # 類似度が閾値より低い場合にのみ新しいチャンクを開始
         if similarity < similarity_threshold:
-            if current_chunk:  # 現在のチャンクを保存
+            if current_chunk:
                 chunks.append(' '.join(current_chunk))
-                current_chunk = [current_sentence]  # 新しいチャンクを開始
+                current_chunk = [current_sentence]
         else:
             current_chunk.append(current_sentence)
-    
-    # 最後のチャンクを追加
     if current_chunk:
         chunks.append(' '.join(current_chunk))
-    
     print(f"セマンティックチャンキング完了: {len(chunks)}個のチャンクを生成")
     return chunks
 
