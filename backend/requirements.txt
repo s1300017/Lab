@@ -75,9 +75,14 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.1.1
 python-multipart==0.0.20
 pytz==2025.2
-PyYAML==6.0.2
+
+spacy
 ragas==0.2.15
-regex==2024.11.6
+# --- spaCy日本語モデルのインストール案内 ---
+# Dockerfileに以下を追加するとキャッシュされます:
+# RUN python -m spacy download ja_core_news_sm
+# または手動で: python -m spacy download ja_core_news_sm
+
 reportlab==4.0.9
 requests==2.32.4
 requests-toolbelt==1.0.0

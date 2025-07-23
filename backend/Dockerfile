@@ -23,18 +23,24 @@ FROM base AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
+    curl \
+    && curl https://sh.rustup.rs -sSf | sh -s -- -y \
+    && . $HOME/.cargo/env \
     && rm -rf /var/lib/apt/lists/*
 
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 # Poetryのインストール
-RUN pip install --no-cache-dir poetry==$POETRY_VERSION
+RUN pip install --upgrade pip && pip install --no-cache-dir poetry==$POETRY_VERSION
 
 # 依存関係をインストール
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    # 不要なキャッシュを削除
-    find /usr/local -type f -name '*.pyc' -delete && \
-    find /usr/local -type d -name '__pycache__' -exec rm -rf {} +
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -m spacy download ja_core_news_sm \
+    && find /usr/local -type f -name '*.pyc' -delete \
+    && find /usr/local -type d -name '__pycache__' -exec rm -rf {} +
+# ↑ spaCy日本語モデル(ja_core_news_sm)をキャッシュに保存
 
 # モデルダウンロード用のステージ
 FROM base AS model-downloader
@@ -73,9 +79,24 @@ WORKDIR /app
 
 # 依存関係をインストール
 COPY requirements.txt .
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    && curl https://sh.rustup.rs -sSf | sh -s -- -y \
+    && . $HOME/.cargo/env \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 # モデルをコピー
+COPY --from=builder /usr/local/lib/python3.10/site-packages/ja_core_news_sm /usr/local/lib/python3.10/site-packages/ja_core_news_sm
+
+# spaCy日本語モデルを本番イメージでも登録
+RUN python -m spacy download ja_core_news_sm
+
 COPY --from=model-downloader /app/.cache /app/.cache
 
 # NLTKリソースをダウンロード

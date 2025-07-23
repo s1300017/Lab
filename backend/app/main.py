@@ -310,10 +310,18 @@ def fixed_chunk_text(text, chunk_size=1000, chunk_overlap=0):
 
 def sentence_chunk_text(text):
     """
-    文単位で分割
+    spaCy日本語モデルで文単位に分割
     """
-    import nltk
-    return nltk.sent_tokenize(text)
+    try:
+        import spacy
+        try:
+            nlp = spacy.load("ja_core_news_sm")
+        except OSError:
+            raise RuntimeError("spaCyの日本語モデル 'ja_core_news_sm' がインストールされていません。\n\n下記コマンドでインストールしてください:\n\npython -m spacy download ja_core_news_sm\n")
+        doc = nlp(text)
+        return [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+    except Exception as e:
+        raise RuntimeError(f"spaCyによる日本語文分割時にエラー: {str(e)}")
 
 def paragraph_chunk_text(text):
     """
