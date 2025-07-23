@@ -4,3 +4,4 @@ chunk-cache/
 
 # PostgreSQL data
 docker_lab_pgdata/
+backend_uvicorn.log
