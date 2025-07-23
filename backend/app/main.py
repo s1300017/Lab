@@ -317,10 +317,11 @@ def sentence_chunk_text(text):
 
 def paragraph_chunk_text(text):
     """
-    段落単位で分割（空行または改行2つで区切る）
+    段落単位で分割（1つ以上の改行（\n+）で区切る）
+    例：章・条文ごとに1つの改行でも分割されます。
     """
     import re
-    paras = re.split(r'\n\s*\n', text)
+    paras = re.split(r'\n+', text)
     return [p.strip() for p in paras if p.strip()]
 
 def semantic_chunk_text(text, chunk_size=None, chunk_overlap=None, embedding_model=None, similarity_threshold=0.7):

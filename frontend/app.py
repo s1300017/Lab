@@ -1558,6 +1558,13 @@ with tab1:
             chunk_size = st.slider("チャンクサイズ", 200, 4000, 1000, 100, disabled=True)
             chunk_overlap = st.slider("チャンクオーバーラップ", 0, 1000, 200, 50, disabled=True)
             st.info(f"{chunk_method}方式ではチャンクサイズ・オーバーラップは自動的に決定されます。サイズ・オーバーラップの指定は不要です。")
+            # 分割ロジックの説明を方式ごとに表示
+            if chunk_method == "paragraph":
+                st.info("【paragraph方式】1つ以上の改行（\\n+）で段落ごとに分割します。章や条文ごとに改行があれば自動的に区切られます。")
+            elif chunk_method == "sentence":
+                st.info("【sentence方式】日本語の文区切り判定で文ごとに分割します。")
+            elif chunk_method == "semantic":
+                st.info("【semantic方式】意味的なまとまりで分割します（embedding類似度ベース、チャンクサイズ・オーバーラップ指定不可）。")
         # 埋め込みモデルの選択肢と特徴説明
         embedding_models = {
             "huggingface_bge_small": "軽量モデル。リソースに制限がある場合に適しています。\n- サイズ: 約1GB\n- 用途: リソース制限がある環境での文書理解",
