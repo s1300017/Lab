@@ -1562,7 +1562,7 @@ with tab1:
             if chunk_method == "paragraph":
                 st.info("【paragraph方式】1つ以上の改行（\\n+）で段落ごとに分割します。章や条文ごとに改行があれば自動的に区切られます。")
             elif chunk_method == "sentence":
-                st.info("【sentence方式】日本語の文区切り判定で文ごとに分割します。")
+                st.info("【sentence方式】日本語文をspaCy（ja_core_news_smモデル）で高精度に文単位で分割します。\n\nチャンクサイズ・オーバーラップは自動的に決定されます。サイズ・オーバーラップの指定は不要です。\n\n※使用ライブラリ: spaCy（ja_core_news_sm）")
             elif chunk_method == "semantic":
                 st.info("【semantic方式】意味的なまとまりで分割します（embedding類似度ベース、チャンクサイズ・オーバーラップ指定不可）。")
         # 埋め込みモデルの選択肢と特徴説明
