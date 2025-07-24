@@ -1364,8 +1364,11 @@ with st.sidebar:
 
     # デフォルト選択ロジック
     default_llm_idx = 0
-    if 'llm_model' in st.session_state and st.session_state.llm_model in llm_names:
-        default_llm_idx = llm_names.index(st.session_state.llm_model)
+    # セッション内llm_modelが'mistral'など未サポートの場合は自動で利用可能なモデルに置き換え
+    if 'llm_model' in st.session_state:
+        if st.session_state.llm_model not in llm_names:
+            st.session_state.llm_model = llm_names[0] if llm_names else None
+        default_llm_idx = llm_names.index(st.session_state.llm_model) if st.session_state.llm_model in llm_names else 0
     
     # モデル設定
     st.subheader("モデル設定")
@@ -1386,19 +1389,30 @@ with st.sidebar:
         )
         st.session_state.llm_model = llm_names[llm_options.index(llm_model)]
         # --- チャット用モデルも必ず同期（未定義エラー防止） ---
-        st.session_state.chat_model = st.session_state.llm_model
+        if "chat_model" not in st.session_state or st.session_state.chat_model not in llm_names:
+            st.session_state.chat_model = st.session_state.llm_model
     else:
         st.warning("利用可能なLLMモデルが見つかりません")
+        st.session_state.llm_model = None
         llm_model = None
     
-    # チャットボットモデル選択
-    chat_model_options = ["gpt-4o-mini", "gpt-3.5-turbo", "llama3-70b-8192"]
+    # チャットボットモデル選択肢をllm_modelsから自動生成
+    chat_model_options = [
+        m["display_name"] if "display_name" in m else m["name"] for m in llm_models
+    ] if llm_models else ["ollama_llama2"]
+    chat_model_names = [
+        m["name"] for m in llm_models
+    ] if llm_models else ["ollama_llama2"]
+    default_chat_idx = 0
+    if "chat_model" in st.session_state and st.session_state.chat_model in chat_model_names:
+        default_chat_idx = chat_model_names.index(st.session_state.chat_model)
     chat_model = st.selectbox(
         "チャットボットモデル",
         options=chat_model_options,
-        index=0,
+        index=default_chat_idx,
         key="chat_model_select"
     )
+    st.session_state.chat_model = chat_model_names[chat_model_options.index(chat_model)]
     
     # Embeddingモデル選択
     if embedding_models:
@@ -2439,9 +2453,9 @@ with tab_chatbot:
             st.markdown(prompt)
         
         # 選択されたモデルで応答を生成
-        # 必ずst.session_state.chat_model（llm_model）を参照
         response_text = ""
-        chat_model = st.session_state.get("chat_model") or st.session_state.get("llm_model")
+        # llm_modelは常にst.session_state["chat_model"]を利用
+        chat_model = st.session_state.get("chat_model")
         if not chat_model:
             response_text = "エラー: チャットボットモデルが未選択です。設定タブでモデルを選択してください。"
         else:
@@ -2451,7 +2465,7 @@ with tab_chatbot:
                 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
                 query_payload = {
                     "query": prompt,
-                    "llm_model": st.session_state.get("llm_model", "ollama_llama2"),
+                    "llm_model": chat_model,
                     "embedding_model": st.session_state.get("embedding_model", "huggingface_bge_small")
                 }
                 response = requests.post(f"{BACKEND_URL}/query/", json=query_payload, timeout=120)

@@ -38,7 +38,10 @@ services:
       - OLLAMA_NUM_THREADS=2
       - OLLAMA_HOST=0.0.0.0
       - TZ=Asia/Tokyo # JST化
-    command: serve
+    entrypoint: ["/bin/sh", "/ollama-init-entry.sh"]
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./ollama-init-entry.sh:/ollama-init-entry.sh
     pull_policy: always
     restart: always
     healthcheck:
@@ -47,8 +50,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    volumes:
-      - ollama_data:/root/.ollama
     deploy:
       resources:
         limits:

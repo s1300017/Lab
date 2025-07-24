@@ -34,6 +34,12 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # FastAPIアプリケーションの初期化
 app = FastAPI()
 
+# --- Dockerヘルスチェック用エンドポイント ---
+@app.get("/health")
+def health_check():
+    """Docker用のシンプルなヘルスチェックAPI"""
+    return {"status": "ok"}
+
 # サーバ起動時にデータベースを初期化
 @app.on_event("startup")
 async def startup_event():
@@ -154,12 +160,10 @@ async def uploadfile(file: UploadFile = File(...)):
             print(f"[重要] PDF処理エラー: {pdf_error}")
             return {"error": f"PDF処理エラー: {str(pdf_error)}"}
         print("[重要] LLM質問生成開始")
-        llm_instance = get_llm("openai")
-        prompt_q = f"""
-以下の内容に関する代表的な質問を日本語で5つ作成してください。\n---\n{text[:1500]}\n---\n質問：
-"""
+        llm_q_instance = get_llm("gpt-4o")
+        prompt_q = f"""以下の内容に関する代表的な質問を日本語で5つ作成してください。\n---\n{text[:1500]}\n---\n質問："""
         try:
-            questions_resp = llm_instance.invoke(prompt_q)
+            questions_resp = llm_q_instance.invoke(prompt_q)
             print(f"[重要] LLM質問生成レスポンス取得: {len(questions_resp.content)}文字")
             questions = [q.strip() for q in questions_resp.content.split('\n') if q.strip()]
             print(f"[重要] 質問リスト生成完了: {len(questions)}件")
@@ -183,17 +187,27 @@ async def uploadfile(file: UploadFile = File(...)):
                 answers = ["該当内容を本文から要約してください。"] * len(questions)
         else:
             answers = []
+            llm_a_instance = get_llm("gpt-4o")
             for i, q in enumerate(questions):
                 try:
                     prompt_a = f"""
 以下の内容に基づいて、次の質問に日本語で簡潔に答えてください。\n---\n{sample_text}\n---\n質問: {q}\n回答：
 """
-                    answer_resp = llm_instance.invoke(prompt_a)
-                    print(f"[重要] LLM回答{i+1}生成完了: {len(answer_resp.content)}文字")
-                    answer = answer_resp.content.strip().split('\n')[0]
+                    answer_resp = llm_a_instance.invoke(prompt_a)
+                    print(f"[DEBUG] answer_resp={{answer_resp}}, type={{type(answer_resp)}}")
+                    # 型ガード: content属性・str型対応
+                    if hasattr(answer_resp, "content"):
+                        answer = answer_resp.content.strip().split('\n')[0]
+                    elif isinstance(answer_resp, str):
+                        answer = answer_resp.strip().split('\n')[0]
+                    else:
+                        answer = str(answer_resp)
+                    print(f"[重要] LLM回答{{i+1}}生成完了: {{len(answer)}}文字")
                     answers.append(answer)
                 except Exception as e:
-                    print(f"[重要] LLM回答{i+1}生成例外: {e}")
+                    import traceback
+                    print(f"[重要] LLM回答{{i+1}}生成例外: {{e}}")
+                    traceback.print_exc()
                     answers.append("該当内容を本文から要約してください。")
         if not questions or not answers:
             print("[重要] ダミーQAセットを返却（questions/answersが空）")
@@ -450,15 +464,23 @@ def get_llm(model_name: str):
     models.yamlのname（例: 'mistral', 'gpt-4o-mini'）にも対応。
     未対応モデルは詳細付きで例外。
     """
-    if model_name in ["openai", "gpt-4o-mini"]:
+    # OpenAI系モデル名はすべてこの分岐で返す
+    openai_models = ["gpt-4o", "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"]
+    if model_name in openai_models:
         openai_api_key = os.getenv("OPENAI_API_KEY")
         if openai_api_key is None:
             raise ValueError("OPENAI_API_KEY environment variable is not set")
-        # gpt-4o-mini も openai も同じChatOpenAIで返す
-        return ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=openai_api_key)
-    elif model_name in ["ollama_llama2", "mistral"]:
-        # mistral も ollama_llama2 もOllamaで返す
-        return OllamaLLM(model="mistral", base_url="http://ollama:11434")
+        # モデル名に応じてChatOpenAIインスタンスを返す
+        return ChatOpenAI(model=model_name, temperature=0, openai_api_key=openai_api_key)
+    elif model_name == "ollama_llama2":
+        # llama2:7bモデルをOllamaで呼び出す
+        return OllamaLLM(model="llama2:7b", base_url="http://ollama:11434")
+    elif model_name == "llama3":
+        # llama3:latestモデルをOllamaで呼び出す
+        return OllamaLLM(model="llama3:latest", base_url="http://ollama:11434")
+    elif model_name == "mistral":
+        # mistral:latestモデルをOllamaで呼び出す
+        return OllamaLLM(model="mistral:latest", base_url="http://ollama:11434")
     else:
         # 日本語で詳細も返す
         raise ValueError(f"未対応のLLMモデルが指定されました: {model_name}")
@@ -494,7 +516,7 @@ def get_embeddings(model_name: str):
     
     # OpenAIモデルのマッピング
     openai_models = {
-        "openai": "text-embedding-ada-002",  # 旧モデル名との互換性のため
+        "gpt-4o": "text-embedding-ada-002",  # 旧モデル名との互換性のため
         "text-embedding-3-small": "text-embedding-3-small",
         "text-embedding-3-large": "text-embedding-3-large",
         "text-embedding-ada-002": "text-embedding-ada-002"
@@ -671,8 +693,16 @@ def embed_and_store(request: EmbedRequest):
 @app.post("/query/")
 def query_rag(request: QueryRequest):
     try:
-        # モデルを初期化
-        llm_instance = get_llm(request.llm_model)
+        # 利用可能なモデルリストを定義
+        # 利用可能なモデルリストを拡張（OpenAI系も含める）
+        available_llm_models = [
+            "ollama_llama2", "gpt-4o", "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"
+        ]
+        # llm_modelが未サポートの場合は自動で置き換え
+        llm_model = request.llm_model
+        if llm_model not in available_llm_models:
+            llm_model = available_llm_models[0]  # ollama_llama2優先
+        llm_instance = get_llm(llm_model)
         embeddings_instance = get_embeddings(request.embedding_model)
 
         # データベースからテキストを取得
@@ -683,9 +713,17 @@ def query_rag(request: QueryRequest):
             texts = [row[0] for row in result.fetchall()]
             
             if not texts:
+                # 文書が存在しない場合は通常のLLM応答のみを返す
+                # OpenAI系モデルの応答が辞書型の場合はcontent部分だけ抽出
+                ai_response = llm_instance.invoke(request.query)
+                if isinstance(ai_response, dict) and "content" in ai_response:
+                    answer = ai_response["content"]
+                else:
+                    answer = str(ai_response)
                 return {
-                    "answer": "データベースにテストデータが見つかりません。先にテストデータを挿入してください。", 
-                    "contexts": []
+                    "answer": answer,
+                    "contexts": [],
+                    "source_documents": []
                 }
 
             # ベクトルストアを初期化
@@ -856,7 +894,7 @@ def clear_db():
                 "model_exists": False
             }
         # 削除対象embeddingモデルリスト
-        embedding_models = ["huggingface_bge_small", "openai"]
+        embedding_models = ["huggingface_bge_small", "gpt-4o"]
         results = []
         for emb_model in embedding_models:
             try:
@@ -866,7 +904,7 @@ def clear_db():
                         model_kwargs={'device': 'cpu', 'trust_remote_code': True},
                         encode_kwargs={'normalize_embeddings': True}
                     )
-                elif emb_model == "openai":
+                elif emb_model == "gpt-4o":
                     from langchain_openai import OpenAIEmbeddings
                     dummy_embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
                 else:
@@ -909,8 +947,8 @@ def get_available_models():
     }
     
     return {
-        "llm_models": ["ollama_llama2", "openai"],
-        "embedding_models": ["huggingface_bge_small", "openai"],
+        "llm_models": ["ollama_llama2", "gpt-4o"],
+        "embedding_models": ["huggingface_bge_small", "gpt-4o"],
         "current_embedding_model": {
             "name": "huggingface_bge_small",
             "type": "local" if model_exists else "remote",
@@ -997,7 +1035,7 @@ async def bulk_evaluate(request: Request):
                     raise ValueError(f"未サポートの埋め込みモデルが指定されました: {embedding_model}")
                     
                 # モデル名がopenaiの場合は、最新モデルを使用するように警告
-                if embedding_model == "openai":
+                if embedding_model == "gpt-4o":
                     print("警告: 'openai' モデルは非推奨です。代わりに 'text-embedding-3-small' または 'text-embedding-3-large' の使用を検討してください。")
 
                 questions = data.get("questions")
@@ -1114,7 +1152,7 @@ async def bulk_evaluate(request: Request):
                                 retrieved_docs = await asyncio.to_thread(retriever.get_relevant_documents, q)
                                 context_texts = [doc.page_content for doc in retrieved_docs]
                                 # LLMインスタンス・プロンプト生成
-                                llm_instance = get_llm("openai")  # 必ずOpenAIモデルを使用
+                                llm_instance = get_llm("gpt-4o")  # 必ずOpenAIモデルを使用
                                 prompt = ChatPromptTemplate.from_template("""Answer the question based only on the following context:\n{context}\n\nQuestion: {question}""")
                                 chain = (
                                     {"context": lambda _: context_texts, "question": lambda _: q}
@@ -1144,7 +1182,7 @@ async def bulk_evaluate(request: Request):
                             "ground_truth": answers
                         }
                         dataset = Dataset.from_dict(dataset_dict)
-                        llm_instance_eval = get_llm("openai")
+                        llm_instance_eval = get_llm("gpt-4o")
                         
                         # 評価関数を非同期化
                         async def eval_one(idx):
@@ -1373,7 +1411,7 @@ async def uploadfile(file: UploadFile = File(...)):
 
         # 2. LLMで質問セット自動生成
         print("[重要] LLM質問生成開始")
-        llm_instance = get_llm("openai")
+        llm_instance = get_llm("gpt-4o")
         prompt_q = f"""
 以下の内容に関する代表的な質問を日本語で5つ作成してください。\n---\n{text[:1500]}\n---\n質問：
 """
