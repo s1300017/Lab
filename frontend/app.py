@@ -1486,7 +1486,8 @@ with st.sidebar:
             del st.session_state["file_id"]
     # すでにアップロード済みかどうかでUIを分岐
     if "uploaded_file_bytes" in st.session_state and "uploaded_file_name" in st.session_state:
-        st.info(f"アップロード済: {st.session_state['uploaded_file_name']}")
+        cleanse_used = st.session_state.get("cleanse_used", False)
+        st.info(f"アップロード済: {st.session_state['uploaded_file_name']}（クレンジング処理: {'あり' if cleanse_used else 'なし'}）")
         # 再アップロードしたい場合のリセットボタン
         if st.button("アップロードをやり直す"):
             for key in ["uploaded_file_bytes", "uploaded_file_name", "uploaded_file_size", "text", "qa_questions", "qa_answers", "file_id"]:
@@ -1501,10 +1502,13 @@ with st.sidebar:
         uploaded_file.name = st.session_state["uploaded_file_name"]
         # まだテキストやQAがセッションに無ければPDF処理を実行
         if not st.session_state.get("text"):
+            # --- クレンジング処理チェックボックスを追加 ---
+            cleanse = st.checkbox("表・ノイズ除去クレンジング処理を行う", value=False, help="PDF内の表やノイズを自動で除去します")
             with st.spinner('PDFを処理中...'):
                 files = {'file': (uploaded_file.name, uploaded_file, 'application/pdf')}
+                data = {'cleanse': str(cleanse)}
                 try:
-                    response = requests.post(f"{BACKEND_URL}/uploadfile/", files=files)
+                    response = requests.post(f"{BACKEND_URL}/uploadfile/", files=files, data=data)
                     if response.status_code == 200:
                         data = response.json()
                         if "file_id" in data:
@@ -1538,12 +1542,14 @@ with st.sidebar:
                 st.write(f"A{i+1}: {a}")
         save_state_to_localstorage()
     else:
-        # まだアップロードされていない場合はfile_uploaderを表示
+        # まだアップロードされていない場合はfile_uploaderとクレンジングチェックボックスを表示
+        cleanse = st.checkbox("表・ノイズ除去クレンジング処理を行う", value=False, help="PDF内の表やノイズを自動で除去します")
         uploaded_file = st.file_uploader("PDFをアップロード", type=["pdf"])
         if uploaded_file is not None:
             st.session_state["uploaded_file_bytes"] = uploaded_file.getvalue()
             st.session_state["uploaded_file_name"] = uploaded_file.name
             st.session_state["uploaded_file_size"] = uploaded_file.size
+            st.session_state["cleanse_used"] = cleanse
             save_state_to_localstorage()
             st.rerun()
 

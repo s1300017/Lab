@@ -5,7 +5,7 @@ import os
 def jst_now_str():
     return datetime.now(timezone('Asia/Tokyo')).strftime('%Y-%m-%d %H:%M:%S JST')
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 import threading
@@ -131,7 +131,7 @@ from fastapi import UploadFile, File
 from PyPDF2 import PdfReader
 
 @app.post("/uploadfile/")
-async def uploadfile(file: UploadFile = File(...)):
+async def uploadfile(file: UploadFile = File(...), cleanse: bool = Form(False)):
     """
     PDFアップロード時にテキスト抽出→LLMで質問自動生成→LLMで回答自動生成まで行い、
     質問・回答セットを返すAPI。
@@ -154,6 +154,10 @@ async def uploadfile(file: UploadFile = File(...)):
                 page_text = page.extract_text() or ""
                 text += page_text
                 print(f"[重要] ページ抽出: {len(page_text)}文字")
+            # クレンジング処理（オプション）
+            if cleanse:
+                print("[重要] クレンジング処理を実施します")
+                text = cleanse_pdf_text(text)
             sample_text = text[:3000] if len(text) > 3000 else text
             print(f"[重要] PDF抽出完了: 合計{len(text)}文字, サンプル={sample_text[:100]}...")
         except Exception as pdf_error:
@@ -238,6 +242,28 @@ async def uploadfile(file: UploadFile = File(...)):
     except Exception as e:
         print(f"[重要] uploadfile全体例外: {e}")
         return {"error": str(e)}
+
+# --- PDFクレンジング関数 ---
+def cleanse_pdf_text(text: str) -> str:
+    import re
+    lines = text.split('\n')
+    # 表形式やノイズ行の除去例
+    cleansed = [
+        line for line in lines
+        if not re.match(r'^\s*[\|\-]{2,}', line) and len(re.findall(r'\|', line)) < 3
+    ]
+    # 連続空白行の削除
+    result = []
+    prev_blank = False
+    for line in cleansed:
+        if line.strip() == "":
+            if not prev_blank:
+                result.append("")
+            prev_blank = True
+        else:
+            result.append(line)
+            prev_blank = False
+    return '\n'.join(result)
 
 # --- 新規: file_idで抽出済みデータ取得API ---
 from fastapi import HTTPException
