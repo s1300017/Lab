@@ -1524,9 +1524,35 @@ with st.sidebar:
                             qa_tuples = list(zip(data['questions'], data['answers'], qa_meta))
                             # スコア降順でソート
                             qa_tuples_sorted = sorted(qa_tuples, key=lambda x: x[2].get('score', 0) if x[2] else 0, reverse=True)
-                            st.write('### 自動生成QAセット（信頼性スコア順）')
-                            with st.expander("信頼性スコアの計算式・説明", expanded=False):
-                                st.markdown('''
+                            # --- 質問生成方法の説明を追加 ---
+                        with st.expander("🤖 自動質問生成の仕組み", expanded=False):
+                            st.markdown("""
+                            ### 質問生成プロセス
+                            
+                            **1. 主要手法: LLM（GPT-4o）による生成**
+                            - PDFテキストの最初の1,500文字を抽出
+                            - プロンプト: "以下の内容に関する代表的な質問を日本語で5つ作成してください"
+                            - GPT-4oが文書内容を理解して適切な質問を自動生成
+                            
+                            **2. フォールバック手法（LLM失敗時）**
+                            - **QA形式抽出**: 既存のQ&A形式テキストから質問を抽出
+                            - **箇条書き抽出**: 「・」「-」「1.」などの箇条書きを質問化
+                            - **段落要約**: 各段落の先頭文から「〜について説明してください」形式で生成
+                            
+                            **3. 回答生成**
+                            - 各質問に対してGPT-4oが文書内容に基づいて回答を生成
+                            - プロンプト: "以下の内容に基づいて、次の質問に日本語で簡潔に答えてください"
+                            - 文書の最初の3,000文字をコンテキストとして使用
+                            
+                            **4. 品質保証**
+                            - 信頼性スコア計算（候補回答間の類似度）
+                            - 自動修正機能（複数候補から最適回答を選択）
+                            - 必ずダミー質問で最低1件は保証
+                            """)
+                        
+                        st.write('### 自動生成QAセット（信頼性スコア順）')
+                        with st.expander("信頼性スコアの計算式・説明", expanded=False):
+                            st.markdown('''
 - **信頼性スコア = 出現回数スコア + 回答長スコア**
     - 出現回数スコア：同じ質問・同じ回答ペアが何回出現したか（多いほど信頼性が高い）
     - 回答長スコア：回答の文字数を全体で正規化（最短=0, 最長=1）
@@ -1541,20 +1567,20 @@ qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
 - スコアが高いほど「多く出現し長い回答」＝信頼性が高いと判定されます。
 - 詳細なロジックはバックエンド`main.py`の該当箇所をご参照ください。
 ''')
-                            for idx, (q, a, meta) in enumerate(qa_tuples_sorted):
-                                with st.expander(f"Q{idx+1}: {q}"):
-                                    score = meta.get('score') if meta else None
-                                    is_auto_fixed = meta.get('is_auto_fixed') if meta else False
-                                    badge = ':red[自動修正済み]' if is_auto_fixed else ':blue[一意回答]'
-                                    st.markdown(f"**A:** {a}")
-                                    st.markdown(f"{badge}｜信頼性スコア: {score:.3f}" if score is not None else f"{badge}｜信頼性スコア: -")
-                                    # 候補回答リスト
-                                    candidates = meta.get('candidates', []) if meta else []
-                                    candidate_scores = meta.get('candidate_scores', []) if meta else []
-                                    if candidates:
-                                        with st.expander('候補回答リスト（スコア付き）'):
-                                            for cand, cs in zip(candidates, candidate_scores):
-                                                st.markdown(f"- {cand}（スコア: {cs:.3f}）")
+                        for idx, (q, a, meta) in enumerate(qa_tuples_sorted):
+                            with st.expander(f"Q{idx+1}: {q}"):
+                                score = meta.get('score') if meta else None
+                                is_auto_fixed = meta.get('is_auto_fixed') if meta else False
+                                badge = ':red[自動修正済み]' if is_auto_fixed else ':blue[一意回答]'
+                                st.markdown(f"**A:** {a}")
+                                st.markdown(f"{badge}｜信頼性スコア: {score:.3f}" if score is not None else f"{badge}｜信頼性スコア: -")
+                                # 候補回答リスト
+                                candidates = meta.get('candidates', []) if meta else []
+                                candidate_scores = meta.get('candidate_scores', []) if meta else []
+                                if candidates:
+                                    with st.expander('候補回答リスト（スコア付き）'):
+                                        for cand, cs in zip(candidates, candidate_scores):
+                                            st.markdown(f"- {cand}（スコア: {cs:.3f}）")
                         else:
                             st.error(f"PDF処理APIの返却内容にquestions/answersが含まれていません: {data}")
                         save_state_to_localstorage()
