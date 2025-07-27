@@ -34,6 +34,14 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # FastAPIアプリケーションの初期化
 app = FastAPI()
 
+# 評価履歴管理APIを統合
+try:
+    from .evaluation_history_api import router as history_router
+    app.include_router(history_router, prefix="/api/v1", tags=["evaluation_history"])
+    print(f"[{jst_now_str()}] [INFO] 評価履歴管理APIを統合しました")
+except ImportError as e:
+    print(f"[{jst_now_str()}] [WARNING] 評価履歴管理APIのインポートに失敗: {e}")
+
 # --- Dockerヘルスチェック用エンドポイント ---
 @app.get("/health")
 def health_check():
@@ -97,12 +105,56 @@ def init_db():
                             context_recall FLOAT,
                             context_precision FLOAT,
                             answer_correctness FLOAT,
+                            experiment_id INTEGER,
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         );
                     """))
                     print(f"[{jst_now_str()}] [INFO] embeddingsテーブルを作成しました")
                 else:
                     print(f"[{jst_now_str()}] [INFO] embeddingsテーブルは既に存在します")
+                    
+                    # 既存のembeddingsテーブルにexperiment_idカラムが存在するかチェック
+                    column_check = conn.execute(text("""
+                        SELECT EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name = 'embeddings' AND column_name = 'experiment_id'
+                        )
+                    """))
+                    experiment_id_exists = column_check.scalar()
+                    
+                    if not experiment_id_exists:
+                        print(f"[{jst_now_str()}] [INFO] embeddingsテーブルにexperiment_idカラムを追加します")
+                        conn.execute(text("ALTER TABLE embeddings ADD COLUMN experiment_id INTEGER"))
+                        print(f"[{jst_now_str()}] [INFO] experiment_idカラムを追加しました")
+                    else:
+                        print(f"[{jst_now_str()}] [INFO] experiment_idカラムは既に存在します")
+                
+                # experimentsテーブルの作成
+                result_exp = conn.execute(text(
+                    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'experiments');"
+                ))
+                exp_table_exists = result_exp.scalar()
+                
+                if not exp_table_exists:
+                    print(f"[{jst_now_str()}] [INFO] experimentsテーブルを作成します")
+                    conn.execute(text("""
+                        CREATE TABLE experiments (
+                            id SERIAL PRIMARY KEY,
+                            session_id TEXT NOT NULL,
+                            experiment_name TEXT,
+                            file_id TEXT,
+                            file_name TEXT,
+                            parameters JSONB,
+                            status TEXT DEFAULT 'running',
+                            total_combinations INTEGER DEFAULT 0,
+                            completed_combinations INTEGER DEFAULT 0,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """))
+                    print(f"[{jst_now_str()}] [INFO] experimentsテーブルを作成しました")
+                else:
+                    print(f"[{jst_now_str()}] [INFO] experimentsテーブルは既に存在します")
                     
                 # コミットは自動的に行われる
                 
@@ -1441,6 +1493,80 @@ async def bulk_evaluate(request: Request):
                                 response_dict[k] = 0.0
                                 
                         print(f"[進捗] チャンク方法 '{chunk_method}' の処理が完了しました。スコア: {overall_score:.4f}")
+                        
+                        # 評価結果をデータベースに永続化
+                        try:
+                            # 実験セッションIDを生成（ユニークな実験を識別）
+                            import uuid
+                            session_id = data.get('session_id', str(uuid.uuid4()))
+                            experiment_name = f"{embedding_model}_{chunk_method}_{chunk_size_val}_{chunk_overlap_val}"
+                            
+                            with engine.connect() as db_conn:
+                                with db_conn.begin():
+                                    # 1. 実験セッションをexperimentsテーブルに記録
+                                    exp_result = db_conn.execute(text("""
+                                        INSERT INTO experiments (
+                                            session_id, experiment_name, file_id, file_name, parameters, 
+                                            status, total_combinations, completed_combinations
+                                        ) VALUES (
+                                            :session_id, :experiment_name, :file_id, :file_name, :parameters,
+                                            'completed', 1, 1
+                                        ) RETURNING id
+                                    """), {
+                                        'session_id': session_id,
+                                        'experiment_name': experiment_name,
+                                        'file_id': data.get('file_id', 'unknown'),
+                                        'file_name': data.get('file_name', 'unknown'),
+                                        'parameters': json.dumps({
+                                            'embedding_model': embedding_model,
+                                            'chunk_method': chunk_method,
+                                            'chunk_size': chunk_size_val,
+                                            'chunk_overlap': chunk_overlap_val,
+                                            'similarity_threshold': similarity_threshold if chunk_method == 'semantic' else None
+                                        })
+                                    })
+                                    experiment_id = exp_result.fetchone()[0]
+                                    
+                                    # 2. 評価結果をembeddingsテーブルに保存
+                                    db_conn.execute(text("""
+                                        INSERT INTO embeddings (
+                                            text, embedding_model, chunk_strategy, chunk_size, chunk_overlap,
+                                            avg_chunk_len, num_chunks, overall_score, faithfulness, answer_relevancy,
+                                            context_recall, context_precision, answer_correctness, experiment_id
+                                        ) VALUES (
+                                            :text, :embedding_model, :chunk_strategy, :chunk_size, :chunk_overlap,
+                                            :avg_chunk_len, :num_chunks, :overall_score, :faithfulness, :answer_relevancy,
+                                            :context_recall, :context_precision, :answer_correctness, :experiment_id
+                                        )
+                                    """), {
+                                        'text': sample_text[:1000],  # テキストは最初の1000文字のみ保存
+                                        'embedding_model': embedding_model,
+                                        'chunk_strategy': chunk_strategy,
+                                        'chunk_size': chunk_size_val if chunk_method != 'semantic' else None,
+                                        'chunk_overlap': chunk_overlap_val if chunk_method != 'semantic' else None,
+                                        'avg_chunk_len': avg_chunk_len,
+                                        'num_chunks': num_chunks,
+                                        'overall_score': overall_score,
+                                        'faithfulness': metrics_avg['faithfulness'],
+                                        'answer_relevancy': metrics_avg['answer_relevancy'],
+                                        'context_recall': metrics_avg['context_recall'],
+                                        'context_precision': metrics_avg['context_precision'],
+                                        'answer_correctness': metrics_avg['answer_correctness'],
+                                        'experiment_id': experiment_id
+                                    })
+                                    
+                                    print(f"[進捗] 評価結果をデータベースに保存しました。experiment_id: {experiment_id}")
+                                    
+                                    # response_dictに実験IDを追加
+                                    response_dict['experiment_id'] = experiment_id
+                                    response_dict['session_id'] = session_id
+                                    
+                        except Exception as db_error:
+                            print(f"[警告] データベース保存エラー: {str(db_error)}")
+                            # データベースエラーがあっても評価結果は返却する
+                            import traceback
+                            traceback.print_exc()
+                        
                         results.append(response_dict)
                     except Exception as e:
                         # エラー時も必ずエラー内容を返す

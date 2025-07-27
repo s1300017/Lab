@@ -1603,9 +1603,10 @@ qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
             st.rerun()
 
 # メインコンテンツのタブ定義
-tab1, tab2, tab3, tab4 = st.tabs(["チャンキング設定", "一括評価", "チャットボット", "卒論向け分析"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["チャンキング設定", "一括評価", "チャットボット", "卒論向け分析", "評価履歴"])
 tab_chatbot = tab3  # チャットボットタブ
 tab_thesis = tab4   # 卒論向け分析タブ
+tab_history = tab5  # 評価履歴タブ
 
 # タブ1: チャンキング設定
 with tab1:
@@ -2716,3 +2717,15 @@ with tab_thesis:
         - チャンク戦略の最適化
         - 評価データセットの拡充
         """)
+
+# タブ5: 評価履歴タブ
+with tab_history:
+    try:
+        from evaluation_history_ui import show_evaluation_history
+        show_evaluation_history(BACKEND_URL)
+    except ImportError as e:
+        st.error(f"評価履歴UIのインポートエラー: {e}")
+        st.info("評価履歴機能は現在利用できません。")
+    except Exception as e:
+        st.error(f"評価履歴表示エラー: {e}")
+        st.info("評価履歴機能でエラーが発生しました。バックエンドの状態を確認してください。")
