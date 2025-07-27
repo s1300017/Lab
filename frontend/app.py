@@ -1517,13 +1517,44 @@ with st.sidebar:
                             st.session_state.text = data['text']
                             st.session_state.qa_questions = data['questions']
                             st.session_state.qa_answers = data['answers']
+                            st.session_state.qa_meta = data.get('qa_meta', [])
                             st.success("PDFからテキスト・質問・回答セットを自動生成しました。以降の評価処理でこのセットが使われます。")
-                            st.write("### 自動生成された質問:")
-                            for i, q in enumerate(data['questions']):
-                                st.write(f"Q{i+1}: {q}")
-                            st.write("### 自動生成された回答:")
-                            for i, a in enumerate(data['answers']):
-                                st.write(f"A{i+1}: {a}")
+                            # --- QA表示をスコア順で拡張表示 ---
+                            qa_meta = data.get('qa_meta', [])
+                            qa_tuples = list(zip(data['questions'], data['answers'], qa_meta))
+                            # スコア降順でソート
+                            qa_tuples_sorted = sorted(qa_tuples, key=lambda x: x[2].get('score', 0) if x[2] else 0, reverse=True)
+                            st.write('### 自動生成QAセット（信頼性スコア順）')
+                            with st.expander("信頼性スコアの計算式・説明", expanded=False):
+                                st.markdown('''
+- **信頼性スコア = 出現回数スコア + 回答長スコア**
+    - 出現回数スコア：同じ質問・同じ回答ペアが何回出現したか（多いほど信頼性が高い）
+    - 回答長スコア：回答の文字数を全体で正規化（最短=0, 最長=1）
+    
+**計算式（Python/pandasロジック）**
+```python
+qa_df["count_score"] = qa_df.groupby(["question", "answer"])['answer'].transform('count')
+qa_df["len_score"] = qa_df["answer"].apply(len)
+qa_df["len_score"] = (qa_df["len_score"] - qa_df["len_score"].min()) / (qa_df["len_score"].max() - qa_df["len_score"].min() + 1e-6)
+qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
+```
+- スコアが高いほど「多く出現し長い回答」＝信頼性が高いと判定されます。
+- 詳細なロジックはバックエンド`main.py`の該当箇所をご参照ください。
+''')
+                            for idx, (q, a, meta) in enumerate(qa_tuples_sorted):
+                                with st.expander(f"Q{idx+1}: {q}"):
+                                    score = meta.get('score') if meta else None
+                                    is_auto_fixed = meta.get('is_auto_fixed') if meta else False
+                                    badge = ':red[自動修正済み]' if is_auto_fixed else ':blue[一意回答]'
+                                    st.markdown(f"**A:** {a}")
+                                    st.markdown(f"{badge}｜信頼性スコア: {score:.3f}" if score is not None else f"{badge}｜信頼性スコア: -")
+                                    # 候補回答リスト
+                                    candidates = meta.get('candidates', []) if meta else []
+                                    candidate_scores = meta.get('candidate_scores', []) if meta else []
+                                    if candidates:
+                                        with st.expander('候補回答リスト（スコア付き）'):
+                                            for cand, cs in zip(candidates, candidate_scores):
+                                                st.markdown(f"- {cand}（スコア: {cs:.3f}）")
                         else:
                             st.error(f"PDF処理APIの返却内容にquestions/answersが含まれていません: {data}")
                         save_state_to_localstorage()
@@ -1534,12 +1565,30 @@ with st.sidebar:
         else:
             # 既にテキスト・QAがある場合は表示のみ
             st.success("PDFからテキスト・質問・回答セットは既に抽出済みです。")
-            st.write("### 自動生成された質問:")
-            for i, q in enumerate(st.session_state.qa_questions):
-                st.write(f"Q{i+1}: {q}")
-            st.write("### 自動生成された回答:")
-            for i, a in enumerate(st.session_state.qa_answers):
-                st.write(f"A{i+1}: {a}")
+            # --- QA表示をスコア順で拡張表示（リロード後も統一） ---
+            qa_questions = st.session_state.get('qa_questions', [])
+            qa_answers = st.session_state.get('qa_answers', [])
+            qa_meta = st.session_state.get('qa_meta', [{}]*len(qa_questions))
+            # --- qa_metaが空や長さ不一致ならダミーで補完 ---
+            if not qa_meta or len(qa_meta) != len(qa_questions):
+                qa_meta = [{"score": 1.0, "is_auto_fixed": False, "candidates": [a], "candidate_scores": [1.0]} for a in qa_answers]
+            qa_tuples = list(zip(qa_questions, qa_answers, qa_meta))
+            qa_tuples_sorted = sorted(qa_tuples, key=lambda x: x[2].get('score', 0) if x[2] else 0, reverse=True)
+            st.write('### 自動生成QAセット（信頼性スコア順）')
+            for idx, (q, a, meta) in enumerate(qa_tuples_sorted):
+                with st.expander(f"Q{idx+1}: {q}"):
+                    score = meta.get('score') if meta else None
+                    is_auto_fixed = meta.get('is_auto_fixed') if meta else False
+                    badge = ':red[自動修正済み]' if is_auto_fixed else ':blue[一意回答]'
+                    st.markdown(f"**A:** {a}")
+                    # スコアを必ず明示表示
+                    st.markdown(f"{badge}｜<span style='color:gray'>信頼性スコア: {score:.3f}</span>" if score is not None else badge, unsafe_allow_html=True)
+                    candidates = meta.get('candidates', []) if meta else []
+                    candidate_scores = meta.get('candidate_scores', []) if meta else []
+                    if candidates:
+                        with st.expander('候補回答リスト（スコア付き）'):
+                            for cand, cs in zip(candidates, candidate_scores):
+                                st.markdown(f"- {cand}（スコア: {cs:.3f}）")
         save_state_to_localstorage()
     else:
         # まだアップロードされていない場合はfile_uploaderとクレンジングチェックボックスを表示

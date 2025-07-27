@@ -136,7 +136,15 @@ async def uploadfile(file: UploadFile = File(...), cleanse: bool = Form(False)):
     PDFアップロード時にテキスト抽出→LLMで質問自動生成→LLMで回答自動生成まで行い、
     質問・回答セットを返すAPI。
     """
+    qa_meta = []
+    questions = []
+    answers = []
+    sample_text = ""
+    file_id = None
     print(f"[{jst_now_str()}][重要] uploadfile関数実行開始: ファイル名={file.filename}, サイズ={getattr(file, 'size', '不明')}")
+    # ファイル型チェック（UploadFile型でなければ即エラー返却）
+    if not hasattr(file, "read"):
+        return {"error": "PDFファイルが正しくアップロードされていません。もう一度アップロードし直してください。"}
     print(f"[{jst_now_str()}][重要] ファイル情報: {file=}, タイプ={type(file)}")
     import io
     try:
@@ -218,6 +226,41 @@ async def uploadfile(file: UploadFile = File(...), cleanse: bool = Form(False)):
             questions = ["この文書の主題は何ですか？"]
             answers = ["本文を要約してください。"]
         print(f"[重要] API返却直前: questions={questions}, answers={answers}")
+        # --- qa_metaを必ず生成（pandasスコア計算）---
+        try:
+            import pandas as pd
+            if questions and answers and len(questions) == len(answers):
+                qa_df = pd.DataFrame({"question": questions, "answer": answers})
+                print(f"[DEBUG] qa_df内容:\n{qa_df}")
+                qa_df["count_score"] = qa_df.groupby(["question", "answer"])['answer'].transform('count')
+                qa_df["len_score"] = qa_df["answer"].apply(len)
+                qa_df["len_score"] = (qa_df["len_score"] - qa_df["len_score"].min()) / (qa_df["len_score"].max() - qa_df["len_score"].min() + 1e-6)
+                qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
+                qa_meta = []
+                for q, group in qa_df.groupby("question"):
+                    print(f"[DEBUG] groupbyループ: q={q}, group=\n{group}")
+                    candidates = group[["answer", "total_score"]].to_dict("records")
+                    best_idx = group["total_score"].idxmax()
+                    best_answer = group.loc[best_idx, "answer"]
+                    best_score = group.loc[best_idx, "total_score"]
+                    is_auto_fixed = len(group) > 1
+                    qa_meta.append({
+                        "score": float(best_score),
+                        "is_auto_fixed": bool(is_auto_fixed),
+                        "candidates": [c["answer"] for c in candidates],
+                        "candidate_scores": [float(c["total_score"]) for c in candidates]
+                    })
+                print(f"[DEBUG] qa_meta生成結果: {qa_meta}")
+        except Exception as e:
+            print(f"[警告] QAメタ生成例外: {e}, questions={questions}, answers={answers}")
+            qa_meta = []
+        # --- qa_metaが空ならダミーで補完 ---
+        if (not qa_meta) and questions and answers and len(questions) == len(answers):
+            print("[DEBUG] qa_metaが空なのでダミー補完を実施")
+            qa_meta = [
+                {"score": 1.0, "is_auto_fixed": False, "candidates": [a], "candidate_scores": [1.0]}
+                for a in answers
+            ]
         # 4. 抽出データ保存
         extracted_path = EXTRACTED_DIR / f"{file_id}.json"
         with open(extracted_path, "w", encoding="utf-8") as f_json:
@@ -232,27 +275,69 @@ async def uploadfile(file: UploadFile = File(...), cleanse: bool = Form(False)):
         with open(pdf_path, "wb") as f_pdf:
             f_pdf.write(contents)
         # 5. file_id付きで返却
+        print(f"[DEBUG] qa_meta最終: {qa_meta}")
         return {
             "file_id": file_id,
             "text": sample_text,
             "questions": questions,
             "answers": answers,
             "file_name": file.filename,  # ←file_nameで統一
+            "qa_meta": qa_meta  # 信頼性スコア・修正履歴・候補リスト
         }
     except Exception as e:
+        print(f"[警告] QAメタ生成例外: {e}, questions={questions}, answers={answers}")
+        # --- 例外時は全変数を必ず無条件で初期化（ローカルスコープの罠回避） ---
+        qa_meta = []
+        questions = []
+        answers = []
+        sample_text = ""
+        file_id = None
+        # file未定義時のみダミー型で補完（通常はUploadFile型を前提）
+        if not hasattr(file, "filename"):
+            file = type('dummy', (), {'filename': ''})()
         print(f"[重要] uploadfile全体例外: {e}")
-        return {"error": str(e)}
+        # 例外時も必ずqa_meta, questions, answersを返す
+        return {
+            "error": str(e),
+            "file_id": file_id if 'file_id' in locals() else None,
+            "text": sample_text if 'sample_text' in locals() else "",
+            "questions": questions if 'questions' in locals() else [],
+            "answers": answers if 'answers' in locals() else [],
+            "file_name": file.filename if 'file' in locals() else "",
+            "qa_meta": qa_meta if 'qa_meta' in locals() else []
+        }
 
 # --- PDFクレンジング関数 ---
 def cleanse_pdf_text(text: str) -> str:
+    """
+    PDFテキストから表記号を日本語に変換し、ノイズ行や連続空白行を除去します。
+    表記号変換はAIが扱いやすいように日本語へ置換します。
+    Qiita記事（https://qiita.com/UKI_datascience/items/ba610c83c8f942f4b538）準拠。
+    """
     import re
+    # 1. 表記号→日本語変換
+    table_symbol_map = {
+        "│": "たて", "┃": "ふとたて", "─": "よこ", "━": "ふとよこ", "┏": "ひだりうえ", "┓": "みぎうえ",
+        "┗": "ひだりした", "┛": "みぎした", "├": "ひだり", "┤": "みぎ", "┬": "うえ", "┴": "した", "┼": "てん",
+        "|": "たて", "-": "よこ", "+": "てん", "＝": "よこ", "＝": "ふとよこ"
+    }
+    def replace_table_symbols(s):
+        for k, v in table_symbol_map.items():
+            s = s.replace(k, v)
+        return s
+    text = replace_table_symbols(text)
+    # 2. ノイズ行除去（Qiita記事例: 表形式や記号が多い行・短い行など）
     lines = text.split('\n')
-    # 表形式やノイズ行の除去例
-    cleansed = [
-        line for line in lines
-        if not re.match(r'^\s*[\|\-]{2,}', line) and len(re.findall(r'\|', line)) < 3
-    ]
-    # 連続空白行の削除
+    cleansed = []
+    for line in lines:
+        # 罫線や記号が多い行の除去
+        if re.match(r'^[\sたてよこふとてんうえしたひだりみぎ]+$', line):
+            continue
+        # 3文字以下の短い行も除去（必要なら）
+        if len(line.strip()) <= 2:
+            continue
+        cleansed.append(line)
+    # 3. 連続空白行の削除
     result = []
     prev_blank = False
     for line in cleansed:
@@ -264,6 +349,7 @@ def cleanse_pdf_text(text: str) -> str:
             result.append(line)
             prev_blank = False
     return '\n'.join(result)
+
 
 # --- 新規: file_idで抽出済みデータ取得API ---
 from fastapi import HTTPException
@@ -1064,9 +1150,46 @@ async def bulk_evaluate(request: Request):
                 if embedding_model == "gpt-4o":
                     print("警告: 'openai' モデルは非推奨です。代わりに 'text-embedding-3-small' または 'text-embedding-3-large' の使用を検討してください。")
 
+                qa_meta = []  # ←必ず初期化（関数のtryより前に移動）
                 questions = data.get("questions")
                 # ground_truthキーまたはanswersキーのどちらかを使用（互換性のため）
                 answers = data.get("ground_truth", data.get("answers"))
+                print(f"[DEBUG] qa_meta前: questions={questions}, answers={answers}, len_q={len(questions)}, len_a={len(answers)}")
+                try:
+                    import pandas as pd
+                    if questions and answers and len(questions) == len(answers):
+                        print("[DEBUG] qa_metaスコア計算ロジックに入る")
+                    else:
+                        print("[DEBUG] qa_metaスコア計算条件を満たさずスキップ")
+                    if questions and answers and len(questions) == len(answers):
+                        qa_df = pd.DataFrame({"question": questions, "answer": answers})
+                        print(f"[DEBUG] qa_df内容: {qa_df}")
+                        # 出現回数スコア
+                        qa_df["count_score"] = qa_df.groupby(["question", "answer"])['answer'].transform('count')
+                        qa_df["len_score"] = qa_df["answer"].apply(len)
+                        qa_df["len_score"] = (qa_df["len_score"] - qa_df["len_score"].min()) / (qa_df["len_score"].max() - qa_df["len_score"].min() + 1e-6)
+                        qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
+                        for q, group in qa_df.groupby("question"):
+                            print(f"[DEBUG] groupbyループ: q={q}, group={group}")
+                            candidates = group[["answer", "total_score"]].to_dict("records")
+                            # スコア最大の回答を選択
+                            best_idx = group["total_score"].idxmax()
+                            best_answer = group.loc[best_idx, "answer"]
+                            best_score = group.loc[best_idx, "total_score"]
+                            is_auto_fixed = len(group) > 1
+                            qa_meta.append({
+                                "score": float(best_score),
+                                "is_auto_fixed": bool(is_auto_fixed),
+                                "candidates": [c["answer"] for c in candidates],
+                                "candidate_scores": [float(c["total_score"]) for c in candidates]
+                            })
+                    else:
+                        # 質問・回答が空や不一致の場合はqa_metaも空リスト
+                        qa_meta = []
+                except Exception as e:
+                    print(f"[警告] QA矛盾自動修正処理で例外: {e}")
+                    qa_meta = []
+                
                 if not questions or not answers:
                     raise ValueError("questions/answersが指定されていません。PDFアップロード時の自動生成結果をそのまま送信してください。")
                 if not (sample_text and questions and answers):
