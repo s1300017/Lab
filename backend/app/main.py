@@ -182,182 +182,7 @@ threading.Thread(target=print_routes, daemon=True).start()
 from fastapi import UploadFile, File
 from PyPDF2 import PdfReader
 
-@app.post("/uploadfile/")
-async def uploadfile(file: UploadFile = File(...), cleanse: bool = Form(False)):
-    """
-    PDFアップロード時にテキスト抽出→LLMで質問自動生成→LLMで回答自動生成まで行い、
-    質問・回答セットを返すAPI。
-    """
-    qa_meta = []
-    questions = []
-    answers = []
-    sample_text = ""
-    file_id = None
-    print(f"[{jst_now_str()}][重要] uploadfile関数実行開始: ファイル名={file.filename}, サイズ={getattr(file, 'size', '不明')}")
-    # ファイル型チェック（UploadFile型でなければ即エラー返却）
-    if not hasattr(file, "read"):
-        return {"error": "PDFファイルが正しくアップロードされていません。もう一度アップロードし直してください。"}
-    print(f"[{jst_now_str()}][重要] ファイル情報: {file=}, タイプ={type(file)}")
-    import io
-    try:
-        file_id = str(uuid.uuid4())  # ← ここで必ずfile_idを発行
-        # 1. PDFからテキスト抽出
-        contents = await file.read()
-        print(f"[{jst_now_str()}][重要] ファイル読み込み完了: {len(contents)}バイト")
-        pdf_stream = io.BytesIO(contents)
-        print(f"[重要] BytesIOストリーム作成完了: {pdf_stream.getbuffer().nbytes}バイト")
-        try:
-            reader = PdfReader(pdf_stream)
-            print(f"[重要] PdfReader初期化成功: {len(reader.pages)}ページ")
-            text = ""
-            for page in reader.pages:
-                page_text = page.extract_text() or ""
-                text += page_text
-                print(f"[重要] ページ抽出: {len(page_text)}文字")
-            # クレンジング処理（オプション）
-            if cleanse:
-                print("[重要] クレンジング処理を実施します")
-                text = cleanse_pdf_text(text)
-            sample_text = text[:3000] if len(text) > 3000 else text
-            print(f"[重要] PDF抽出完了: 合計{len(text)}文字, サンプル={sample_text[:100]}...")
-        except Exception as pdf_error:
-            print(f"[重要] PDF処理エラー: {pdf_error}")
-            return {"error": f"PDF処理エラー: {str(pdf_error)}"}
-        print("[重要] LLM質問生成開始")
-        llm_q_instance = get_llm("gpt-4o")
-        prompt_q = f"""以下の内容に関する代表的な質問を日本語で5つ作成してください。\n---\n{text[:1500]}\n---\n質問："""
-        try:
-            questions_resp = llm_q_instance.invoke(prompt_q)
-            print(f"[重要] LLM質問生成レスポンス取得: {len(questions_resp.content)}文字")
-            questions = [q.strip() for q in questions_resp.content.split('\n') if q.strip()]
-            print(f"[重要] 質問リスト生成完了: {len(questions)}件")
-        except Exception as e:
-            print(f"[重要] LLM質問生成例外: {e}")
-            questions = []
-        if not questions:
-            import re
-            print("[重要] 正規表現によるQA/箇条書き抽出開始")
-            bullets = re.findall(r'^[\*\-\d\.]+\s*(.+)', text, re.MULTILINE)
-            qas = re.findall(r'Q[\d：: ]*(.+?)\nA[\d：: ]*(.+?)(?=\nQ|\n\Z)', text, re.DOTALL)
-            if qas:
-                questions = [q.strip() for q, a in qas]
-                answers = [a.strip() for q, a in qas]
-            elif bullets:
-                questions = bullets[:5]
-                answers = ["該当内容を本文から要約してください。"] * len(questions)
-            else:
-                paras = [p.strip() for p in text.split('\n') if p.strip()]
-                questions = [f"{p[:20]}について説明してください。" for p in paras[:5]]
-                answers = ["該当内容を本文から要約してください。"] * len(questions)
-        else:
-            answers = []
-            llm_a_instance = get_llm("gpt-4o")
-            for i, q in enumerate(questions):
-                try:
-                    prompt_a = f"""
-以下の内容に基づいて、次の質問に日本語で簡潔に答えてください。\n---\n{sample_text}\n---\n質問: {q}\n回答：
-"""
-                    answer_resp = llm_a_instance.invoke(prompt_a)
-                    print(f"[DEBUG] answer_resp={{answer_resp}}, type={{type(answer_resp)}}")
-                    # 型ガード: content属性・str型対応
-                    if hasattr(answer_resp, "content"):
-                        answer = answer_resp.content.strip().split('\n')[0]
-                    elif isinstance(answer_resp, str):
-                        answer = answer_resp.strip().split('\n')[0]
-                    else:
-                        answer = str(answer_resp)
-                    print(f"[重要] LLM回答{{i+1}}生成完了: {{len(answer)}}文字")
-                    answers.append(answer)
-                except Exception as e:
-                    import traceback
-                    print(f"[重要] LLM回答{{i+1}}生成例外: {{e}}")
-                    traceback.print_exc()
-                    answers.append("該当内容を本文から要約してください。")
-        if not questions or not answers:
-            print("[重要] ダミーQAセットを返却（questions/answersが空）")
-            questions = ["この文書の主題は何ですか？"]
-            answers = ["本文を要約してください。"]
-        print(f"[重要] API返却直前: questions={questions}, answers={answers}")
-        # --- qa_metaを必ず生成（pandasスコア計算）---
-        try:
-            import pandas as pd
-            if questions and answers and len(questions) == len(answers):
-                qa_df = pd.DataFrame({"question": questions, "answer": answers})
-                print(f"[DEBUG] qa_df内容:\n{qa_df}")
-                qa_df["count_score"] = qa_df.groupby(["question", "answer"])['answer'].transform('count')
-                qa_df["len_score"] = qa_df["answer"].apply(len)
-                qa_df["len_score"] = (qa_df["len_score"] - qa_df["len_score"].min()) / (qa_df["len_score"].max() - qa_df["len_score"].min() + 1e-6)
-                qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
-                qa_meta = []
-                for q, group in qa_df.groupby("question"):
-                    print(f"[DEBUG] groupbyループ: q={q}, group=\n{group}")
-                    candidates = group[["answer", "total_score"]].to_dict("records")
-                    best_idx = group["total_score"].idxmax()
-                    best_answer = group.loc[best_idx, "answer"]
-                    best_score = group.loc[best_idx, "total_score"]
-                    is_auto_fixed = len(group) > 1
-                    qa_meta.append({
-                        "score": float(best_score),
-                        "is_auto_fixed": bool(is_auto_fixed),
-                        "candidates": [c["answer"] for c in candidates],
-                        "candidate_scores": [float(c["total_score"]) for c in candidates]
-                    })
-                print(f"[DEBUG] qa_meta生成結果: {qa_meta}")
-        except Exception as e:
-            print(f"[警告] QAメタ生成例外: {e}, questions={questions}, answers={answers}")
-            qa_meta = []
-        # --- qa_metaが空ならダミーで補完 ---
-        if (not qa_meta) and questions and answers and len(questions) == len(answers):
-            print("[DEBUG] qa_metaが空なのでダミー補完を実施")
-            qa_meta = [
-                {"score": 1.0, "is_auto_fixed": False, "candidates": [a], "candidate_scores": [1.0]}
-                for a in answers
-            ]
-        # 4. 抽出データ保存
-        extracted_path = EXTRACTED_DIR / f"{file_id}.json"
-        with open(extracted_path, "w", encoding="utf-8") as f_json:
-            json.dump({
-                "text": sample_text,
-                "questions": questions,
-                "answers": answers,
-                "file_name": file.filename,  # ←file_nameで統一
-            }, f_json, ensure_ascii=False)
-        # PDFファイル保存
-        pdf_path = PDF_DIR / f"{file_id}.pdf"
-        with open(pdf_path, "wb") as f_pdf:
-            f_pdf.write(contents)
-        # 5. file_id付きで返却
-        print(f"[DEBUG] qa_meta最終: {qa_meta}")
-        return {
-            "file_id": file_id,
-            "text": sample_text,
-            "questions": questions,
-            "answers": answers,
-            "file_name": file.filename,  # ←file_nameで統一
-            "qa_meta": qa_meta  # 信頼性スコア・修正履歴・候補リスト
-        }
-    except Exception as e:
-        print(f"[警告] QAメタ生成例外: {e}, questions={questions}, answers={answers}")
-        # --- 例外時は全変数を必ず無条件で初期化（ローカルスコープの罠回避） ---
-        qa_meta = []
-        questions = []
-        answers = []
-        sample_text = ""
-        file_id = None
-        # file未定義時のみダミー型で補完（通常はUploadFile型を前提）
-        if not hasattr(file, "filename"):
-            file = type('dummy', (), {'filename': ''})()
-        print(f"[重要] uploadfile全体例外: {e}")
-        # 例外時も必ずqa_meta, questions, answersを返す
-        return {
-            "error": str(e),
-            "file_id": file_id if 'file_id' in locals() else None,
-            "text": sample_text if 'sample_text' in locals() else "",
-            "questions": questions if 'questions' in locals() else [],
-            "answers": answers if 'answers' in locals() else [],
-            "file_name": file.filename if 'file' in locals() else "",
-            "qa_meta": qa_meta if 'qa_meta' in locals() else []
-        }
+
 
 # --- PDFクレンジング関数 ---
 def cleanse_pdf_text(text: str) -> str:
@@ -1745,18 +1570,110 @@ async def uploadfile(file: UploadFile = File(...)):
             questions = ["この文書の主題は何ですか？"]
             answers = ["本文を要約してください。"]
 
-        # 4. 結果を辞書形式で返却（正常時は全キー、JSONResponseは使わない）
-        print(f"[重要] API返却直前: {len(questions)}質問, {len(answers)}回答")
+        # 4. qa_metaを生成（信頼性スコア計算とダミー回答フラグ付き）
+        print(f"[重要] qa_meta生成開始: {len(questions)}質問, {len(answers)}回答")
+        
+        try:
+            import pandas as pd
+            if questions and answers and len(questions) == len(answers):
+                # pandasで信頼性スコアを計算
+                qa_df = pd.DataFrame({"question": questions, "answer": answers})
+                print(f"[重要] qa_df内容:\n{qa_df}")
+                
+                # 出現回数スコア計算
+                qa_df["count_score"] = qa_df.groupby(["question", "answer"])['answer'].transform('count')
+                
+                # 回答長スコア計算
+                qa_df["len_score"] = qa_df["answer"].apply(len)
+                if qa_df["len_score"].max() > qa_df["len_score"].min():
+                    qa_df["len_score"] = (qa_df["len_score"] - qa_df["len_score"].min()) / (qa_df["len_score"].max() - qa_df["len_score"].min())
+                else:
+                    qa_df["len_score"] = 0.5  # 全て同じ長さの場合
+                
+                # 総合スコア計算
+                qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
+                
+                print(f"[重要] スコア計算結果:\n{qa_df[['question', 'answer', 'count_score', 'len_score', 'total_score']]}")
+                
+                # qa_metaを質問ごとに生成
+                qa_meta = []
+                for q, group in qa_df.groupby("question"):
+                    print(f"[重要] groupbyループ: q={q}, group=\n{group}")
+                    candidates = group[["answer", "total_score"]].to_dict("records")
+                    best_idx = group["total_score"].idxmax()
+                    best_answer = group.loc[best_idx, "answer"]
+                    best_score = group.loc[best_idx, "total_score"]
+                    is_auto_fixed = len(group) > 1
+                    
+                    # ダミー回答判定パターンを拡張
+                    dummy_patterns = [
+                        "該当内容を本文から要約してください。",
+                        "本文を要約してください。",
+                        "以下の条件が必要です：",
+                        "条件が必要です",
+                        "条件は以下の通りです",
+                        "条件について説明してください"
+                    ]
+                    is_dummy_answer = any(pattern in best_answer for pattern in dummy_patterns) or best_answer.endswith("です：") or len(best_answer.strip()) < 10
+                    
+                    qa_meta.append({
+                        "score": float(best_score),
+                        "is_auto_fixed": bool(is_auto_fixed),
+                        "is_dummy_answer": bool(is_dummy_answer),
+                        "candidates": [c["answer"] for c in candidates],
+                        "candidate_scores": [float(c["total_score"]) for c in candidates]
+                    })
+                    
+                print(f"[重要] qa_meta生成結果: {qa_meta}")
+            else:
+                print(f"[警告] qa_meta生成スキップ: questions={len(questions)}, answers={len(answers)}")
+                qa_meta = []
+        except Exception as e:
+            print(f"[警告] qa_meta生成例外: {e}")
+            import traceback
+            traceback.print_exc()
+            qa_meta = []
+        
+        # qa_metaが空の場合のフォールバック
+        if not qa_meta and questions and answers and len(questions) == len(answers):
+            print("[重要] qa_metaが空なのでフォールバック処理を実行")
+            dummy_patterns = [
+                "該当内容を本文から要約してください。",
+                "本文を要約してください。",
+                "以下の条件が必要です：",
+                "条件が必要です",
+                "条件は以下の通りです",
+                "条件について説明してください"
+            ]
+            qa_meta = [
+                {
+                    "score": 1.0 + (len(a) / 100.0),  # 回答長に応じてスコアを変化
+                    "is_auto_fixed": False,
+                    "is_dummy_answer": any(pattern in a for pattern in dummy_patterns) or a.endswith("です：") or len(a.strip()) < 10,
+                    "candidates": [a],
+                    "candidate_scores": [1.0 + (len(a) / 100.0)]
+                }
+                for a in answers
+            ]
+        
+        # 5. 結果を辞書形式で返却（正常時は全キー、JSONResponseは使わない）
+        print(f"[重要] API返却直前: {len(questions)}質問, {len(answers)}回答, {len(qa_meta)}meta")
         for i, (q, a) in enumerate(zip(questions, answers)):
             print(f"[重要] Q{i+1}: {q}")
             print(f"[重要] A{i+1}: {a}")
+            if i < len(qa_meta):
+                meta = qa_meta[i]
+                print(f"[重要] Meta{i+1}: score={meta.get('score', 'N/A')}, is_dummy={meta.get('is_dummy_answer', 'N/A')}, is_auto_fixed={meta.get('is_auto_fixed', 'N/A')}")
         
         # dictを直接返す（JSONResponse不使用）
-        return {
+        result = {
             "text": sample_text,
             "questions": questions,
-            "answers": answers
+            "answers": answers,
+            "qa_meta": qa_meta
         }
+        print(f"[重要] 最終返却結果: qa_meta長={len(qa_meta)}, サンプル={qa_meta[:1] if qa_meta else 'None'}")
+        return result
     except Exception as e:
         # 異常時も辞書を直接返す（JSONResponse不使用）
         print(f"[重要] uploadfile全体例外: {e}")

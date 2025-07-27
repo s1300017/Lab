@@ -401,7 +401,7 @@ def plot_overlap_comparison(results_df: pd.DataFrame) -> None:
                     # サマリー表もダウンロード用リストに追加
                     all_tables.append(("summary.csv", summary_df))
                 else:
-                    st.info("最適なオーバーラップサイズを計算するための十分なデータがありません。")
+                    st.info("📄 PDFファイルをアップロードしてください")
         
         # 詳細データ（集計済みデータフレーム）もダウンロード用リストに追加
         all_tables.append(("detail.csv", overlap_scores))
@@ -1521,38 +1521,63 @@ with st.sidebar:
                             st.success("PDFからテキスト・質問・回答セットを自動生成しました。以降の評価処理でこのセットが使われます。")
                             # --- QA表示をスコア順で拡張表示 ---
                             qa_meta = data.get('qa_meta', [])
+                            
+                            # デバッグ情報を表示
+                            st.write(f"**デバッグ情報**: questions={len(data['questions'])}, answers={len(data['answers'])}, qa_meta={len(qa_meta)}")
+                            if qa_meta:
+                                st.write(f"**qa_metaサンプル**: {qa_meta[0]}")
+                            
+                            # qa_metaの長さをquestions/answersに合わせる
+                            if len(qa_meta) < len(data['questions']):
+                                # qa_metaが不足している場合はダミーで補完
+                                missing_count = len(data['questions']) - len(qa_meta)
+                                for i in range(missing_count):
+                                    qa_meta.append({
+                                        'score': 1.0,
+                                        'is_auto_fixed': False,
+                                        'is_dummy_answer': True,
+                                        'candidates': [data['answers'][len(qa_meta) + i] if len(qa_meta) + i < len(data['answers']) else 'データ不足'],
+                                        'candidate_scores': [1.0]
+                                    })
+                                st.warning(f"qa_metaが{missing_count}件不足していたため、ダミーデータで補完しました")
+                            
                             qa_tuples = list(zip(data['questions'], data['answers'], qa_meta))
                             # スコア降順でソート
                             qa_tuples_sorted = sorted(qa_tuples, key=lambda x: x[2].get('score', 0) if x[2] else 0, reverse=True)
                             # --- 質問生成方法の説明を追加 ---
-                        with st.expander("🤖 自動質問生成の仕組み", expanded=False):
-                            st.markdown("""
-                            ### 質問生成プロセス
+                            with st.expander("🤖 自動質問生成の仕組み", expanded=False):
+                                st.markdown("""
+                                ### 質問生成プロセス
+                                
+                                **1. 主要手法: LLM（GPT-4o）による生成**
+                                - PDFテキストの最初の1,500文字を抽出
+                                - プロンプト: "以下の内容に関する代表的な質問を日本語で5つ作成してください"
+                                - GPT-4oが文書内容を理解して適切な質問を自動生成
+                                
+                                **2. フォールバック手法（LLM失敗時）**
+                                - **QA形式抽出**: 既存のQ&A形式テキストから質問を抽出
+                                - **箇条書き抽出**: 「・」「-」「1.」などの箇条書きを質問化
+                                - **段落要約**: 各段落の先頭文から「〜について説明してください」形式で生成
+                                
+                                **3. 回答生成**
+                                - 各質問に対してGPT-4oが文書内容に基づいて回答を生成
+                                - プロンプト: "以下の内容に基づいて、次の質問に日本語で簡潔に答えてください"
+                                - 文書の最初の3,000文字をコンテキストとして使用
+                                
+                                **4. 品質保証**
+                                - 信頼性スコア計算（候補回答間の類似度）
+                                - 自動修正機能（複数候補から最適回答を選択）
+                                - 必ずダミー質問で最低1件は保証
+                                
+                                **5. ダミー回答の識別**
+                                - 「該当内容を本文から要約してください」などのパターンをダミー回答と判定
+                                - オレンジ色の「ダミー回答」バッジで表示
+                                - LLMの回答生成に失敗した場合やフォールバック手法で生成
+                                """)
                             
-                            **1. 主要手法: LLM（GPT-4o）による生成**
-                            - PDFテキストの最初の1,500文字を抽出
-                            - プロンプト: "以下の内容に関する代表的な質問を日本語で5つ作成してください"
-                            - GPT-4oが文書内容を理解して適切な質問を自動生成
-                            
-                            **2. フォールバック手法（LLM失敗時）**
-                            - **QA形式抽出**: 既存のQ&A形式テキストから質問を抽出
-                            - **箇条書き抽出**: 「・」「-」「1.」などの箇条書きを質問化
-                            - **段落要約**: 各段落の先頭文から「〜について説明してください」形式で生成
-                            
-                            **3. 回答生成**
-                            - 各質問に対してGPT-4oが文書内容に基づいて回答を生成
-                            - プロンプト: "以下の内容に基づいて、次の質問に日本語で簡潔に答えてください"
-                            - 文書の最初の3,000文字をコンテキストとして使用
-                            
-                            **4. 品質保証**
-                            - 信頼性スコア計算（候補回答間の類似度）
-                            - 自動修正機能（複数候補から最適回答を選択）
-                            - 必ずダミー質問で最低1件は保証
-                            """)
-                        
-                        st.write('### 自動生成QAセット（信頼性スコア順）')
-                        with st.expander("信頼性スコアの計算式・説明", expanded=False):
-                            st.markdown('''
+                            st.write('### 自動生成QAセット（信頼性スコア順）')
+                            with st.expander("信頼性スコアの計算式・説明", expanded=False):
+                                st.markdown('''
 - **信頼性スコア = 出現回数スコア + 回答長スコア**
     - 出現回数スコア：同じ質問・同じ回答ペアが何回出現したか（多いほど信頼性が高い）
     - 回答長スコア：回答の文字数を全体で正規化（最短=0, 最長=1）
@@ -1567,22 +1592,44 @@ qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
 - スコアが高いほど「多く出現し長い回答」＝信頼性が高いと判定されます。
 - 詳細なロジックはバックエンド`main.py`の該当箇所をご参照ください。
 ''')
-                        for idx, (q, a, meta) in enumerate(qa_tuples_sorted):
-                            with st.expander(f"Q{idx+1}: {q}"):
-                                score = meta.get('score') if meta else None
-                                is_auto_fixed = meta.get('is_auto_fixed') if meta else False
-                                badge = ':red[自動修正済み]' if is_auto_fixed else ':blue[一意回答]'
-                                st.markdown(f"**A:** {a}")
-                                st.markdown(f"{badge}｜信頼性スコア: {score:.3f}" if score is not None else f"{badge}｜信頼性スコア: -")
-                                # 候補回答リスト
-                                candidates = meta.get('candidates', []) if meta else []
-                                candidate_scores = meta.get('candidate_scores', []) if meta else []
-                                if candidates:
-                                    with st.expander('候補回答リスト（スコア付き）'):
-                                        for cand, cs in zip(candidates, candidate_scores):
-                                            st.markdown(f"- {cand}（スコア: {cs:.3f}）")
+                            for idx, (q, a, meta) in enumerate(qa_tuples_sorted):
+                                with st.expander(f"Q{idx+1}: {q}"):
+                                    score = meta.get('score') if meta else None
+                                    is_auto_fixed = meta.get('is_auto_fixed') if meta else False
+                                    is_dummy_answer = meta.get('is_dummy_answer') if meta else False
+                                    
+                                    # デバッグ情報を表示
+                                    st.write(f"**デバッグ**: meta={meta}, is_dummy={is_dummy_answer}, is_auto_fixed={is_auto_fixed}")
+                                    
+                                    # バッジの設定（ダミー回答を優先表示）
+                                    if is_dummy_answer:
+                                        badge_text = '🟠 ダミー回答'
+                                        badge_color = 'orange'
+                                    elif is_auto_fixed:
+                                        badge_text = '🔴 自動修正済み'
+                                        badge_color = 'red'
+                                    else:
+                                        badge_text = '🔵 一意回答'
+                                        badge_color = 'blue'
+                                    
+                                    st.markdown(f"**A:** {a}")
+                                    
+                                    # バッジとスコアを表示
+                                    col1, col2 = st.columns([1, 3])
+                                    with col1:
+                                        st.markdown(f":{badge_color}[{badge_text}]")
+                                    with col2:
+                                        st.markdown(f"信頼性スコア: {score:.3f}" if score is not None else "信頼性スコア: -")
+                                    # 候補回答リスト
+                                    candidates = meta.get('candidates', []) if meta else []
+                                    candidate_scores = meta.get('candidate_scores', []) if meta else []
+                                    if candidates and len(candidates) > 1:
+                                        with st.expander('候補回答リスト（スコア付き）'):
+                                            for cand, cs in zip(candidates, candidate_scores):
+                                                st.markdown(f"- {cand}（スコア: {cs:.3f}）")
                         else:
-                            st.error(f"PDF処理APIの返却内容にquestions/answersが含まれていません: {data}")
+                            st.error(f"PDF処理APIの返却内容にquestions/answersが含まれていません")
+                            st.write(f"デバッグ: APIレスポンス = {data}")
                         save_state_to_localstorage()
                     else:
                         st.error(f"ファイル処理エラー: {response.text}")
@@ -1597,7 +1644,18 @@ qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
             qa_meta = st.session_state.get('qa_meta', [{}]*len(qa_questions))
             # --- qa_metaが空や長さ不一致ならダミーで補完 ---
             if not qa_meta or len(qa_meta) != len(qa_questions):
-                qa_meta = [{"score": 1.0, "is_auto_fixed": False, "candidates": [a], "candidate_scores": [1.0]} for a in qa_answers]
+                # ダミー回答のパターンを判定
+                dummy_patterns = ["該当内容を本文から要約", "本文を要約して"]
+                qa_meta = [
+                    {
+                        "score": 1.0, 
+                        "is_auto_fixed": False, 
+                        "is_dummy_answer": any(pattern in a for pattern in dummy_patterns),
+                        "candidates": [a], 
+                        "candidate_scores": [1.0]
+                    } 
+                    for a in qa_answers
+                ]
             qa_tuples = list(zip(qa_questions, qa_answers, qa_meta))
             qa_tuples_sorted = sorted(qa_tuples, key=lambda x: x[2].get('score', 0) if x[2] else 0, reverse=True)
             st.write('### 自動生成QAセット（信頼性スコア順）')
@@ -1605,7 +1663,16 @@ qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
                 with st.expander(f"Q{idx+1}: {q}"):
                     score = meta.get('score') if meta else None
                     is_auto_fixed = meta.get('is_auto_fixed') if meta else False
-                    badge = ':red[自動修正済み]' if is_auto_fixed else ':blue[一意回答]'
+                    is_dummy_answer = meta.get('is_dummy_answer') if meta else False
+                    
+                    # バッジの設定（ダミー回答を優先表示）
+                    if is_dummy_answer:
+                        badge = ':orange[ダミー回答]'
+                    elif is_auto_fixed:
+                        badge = ':red[自動修正済み]'
+                    else:
+                        badge = ':blue[一意回答]'
+                    
                     st.markdown(f"**A:** {a}")
                     # スコアを必ず明示表示
                     st.markdown(f"{badge}｜<span style='color:gray'>信頼性スコア: {score:.3f}</span>" if score is not None else badge, unsafe_allow_html=True)
