@@ -695,6 +695,7 @@ def get_embeddings(model_name: str):
     # HuggingFaceモデルのマッピング
     hf_models = {
         "huggingface_bge_small": "BAAI/bge-small-en-v1.5",
+        "huggingface_bge_large": "BAAI/bge-large-en-v1.5",
         "huggingface_miniLM": "sentence-transformers/all-MiniLM-L6-v2",
         "huggingface_mpnet_base": "sentence-transformers/all-mpnet-base-v2",
         "huggingface_multi_qa_minilm": "sentence-transformers/multi-qa-MiniLM-L6-cos-v1",
@@ -1189,7 +1190,7 @@ async def bulk_evaluate(request: Request):
                     # OpenAIモデル
                     'openai', 'text-embedding-3-small', 'text-embedding-3-large', 'text-embedding-ada-002',
                     # HuggingFaceモデル
-                    'huggingface_bge_small', 'huggingface_miniLM', 'huggingface_mpnet_base',
+                    'huggingface_bge_small', 'huggingface_bge_large', 'huggingface_miniLM', 'huggingface_mpnet_base',
                     'huggingface_multi_qa_minilm', 'huggingface_multi_qa_mpnet',
                     'huggingface_paraphrase_multilingual', 'huggingface_distiluse_multilingual',
                     'huggingface_xlm_r'

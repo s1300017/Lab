@@ -29,6 +29,11 @@ models:
     category: "Embedding"
     display_name: "BGE-small (HuggingFace)"
     description: "BAAIのBGE-smallモデル。英語テキストの埋め込みに適しています。"
+  - name: huggingface_bge_large
+    type: huggingface
+    category: "Embedding"
+    display_name: "BGE-large (HuggingFace)"
+    description: "BAAIのBGE-largeモデル。BGE-smallより高精度な埋め込みを提供します。"
   - name: huggingface_miniLM
     type: huggingface
     category: "Embedding"
