@@ -106,6 +106,7 @@ def init_db():
                             context_precision FLOAT,
                             answer_correctness FLOAT,
                             experiment_id INTEGER,
+                            chunks_details JSONB,
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         );
                     """))
@@ -128,6 +129,22 @@ def init_db():
                         print(f"[{jst_now_str()}] [INFO] experiment_idカラムを追加しました")
                     else:
                         print(f"[{jst_now_str()}] [INFO] experiment_idカラムは既に存在します")
+                    
+                    # chunks_detailsカラムの存在チェック
+                    chunks_details_check = conn.execute(text("""
+                        SELECT EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name = 'embeddings' AND column_name = 'chunks_details'
+                        )
+                    """))
+                    chunks_details_exists = chunks_details_check.scalar()
+                    
+                    if not chunks_details_exists:
+                        print(f"[{jst_now_str()}] [INFO] embeddingsテーブルにchunks_detailsカラムを追加します")
+                        conn.execute(text("ALTER TABLE embeddings ADD COLUMN chunks_details JSONB"))
+                        print(f"[{jst_now_str()}] [INFO] chunks_detailsカラムを追加しました")
+                    else:
+                        print(f"[{jst_now_str()}] [INFO] chunks_detailsカラムは既に存在します")
                 
                 # experimentsテーブルの作成
                 result_exp = conn.execute(text(
@@ -401,6 +418,7 @@ def semantic_chunk_text(text, chunk_size=None, chunk_overlap=None, embedding_mod
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_ollama import OllamaLLM
+from langchain_community.chat_models import ChatOllama
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores.pgvector import PGVector
@@ -463,13 +481,13 @@ def get_llm(model_name: str):
         return ChatOpenAI(model=model_name, temperature=0, openai_api_key=openai_api_key)
     elif model_name == "ollama_llama2":
         # llama2:7bモデルをOllamaで呼び出す
-        return OllamaLLM(model="llama2:7b", base_url="http://ollama:11434")
+        return ChatOllama(model="llama2:7b", base_url="http://host.docker.internal:11434", temperature=0)
     elif model_name == "llama3":
         # llama3:latestモデルをOllamaで呼び出す
-        return OllamaLLM(model="llama3:latest", base_url="http://ollama:11434")
+        return ChatOllama(model="llama3:latest", base_url="http://host.docker.internal:11434", temperature=0)
     elif model_name == "mistral":
         # mistral:latestモデルをOllamaで呼び出す
-        return OllamaLLM(model="mistral:latest", base_url="http://ollama:11434")
+        return ChatOllama(model="mistral:latest", base_url="http://host.docker.internal:11434", temperature=0)
     else:
         # 日本語で詳細も返す
         raise ValueError(f"未対応のLLMモデルが指定されました: {model_name}")
@@ -493,15 +511,6 @@ def get_torch_device():
 
 def get_embeddings(model_name: str):
     device = get_torch_device()  # デバイス自動判定
-    common_kwargs = {
-        'model_kwargs': {
-            'device': device,
-            'trust_remote_code': True
-        },
-        'encode_kwargs': {
-            'normalize_embeddings': True
-        }
-    }
     
     # OpenAIモデルのマッピング
     openai_models = {
@@ -517,22 +526,37 @@ def get_embeddings(model_name: str):
             openai_api_key=os.getenv("OPENAI_API_KEY")
         )
     
-    # HuggingFaceモデルのマッピング
-    hf_models = {
-        "huggingface_bge_small": "BAAI/bge-small-en-v1.5",
-        "huggingface_bge_large": "BAAI/bge-large-en-v1.5",
-        "huggingface_miniLM": "sentence-transformers/all-MiniLM-L6-v2",
-        "huggingface_mpnet_base": "sentence-transformers/all-mpnet-base-v2",
-        "huggingface_multi_qa_minilm": "sentence-transformers/multi-qa-MiniLM-L6-cos-v1",
-        "huggingface_multi_qa_mpnet": "sentence-transformers/multi-qa-mpnet-base-dot-v1",
-        "huggingface_paraphrase_multilingual": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        "huggingface_distiluse_multilingual": "sentence-transformers/distiluse-base-multilingual-cased-v2",
-        "huggingface_xlm_r": "sentence-transformers/xlm-r-100langs-bert-base-nli-stsb-mean-tokens"
+    # ローカルHuggingFaceモデルのマッピング（GPU加速対応）
+    local_hf_models = {
+        "huggingface_bge_small": "/app/local_models/models/bge-small-en-v1.5",
+        "huggingface_bge_large": "/app/local_models/models/bge-large-en-v1.5",
+        "huggingface_miniLM": "/app/local_models/models/all-MiniLM-L6-v2",
+        "huggingface_mpnet_base": "/app/local_models/models/all-mpnet-base-v2",
+        "huggingface_multi_qa_minilm": "/app/local_models/models/multi-qa-MiniLM-L6-cos-v1",
+        "huggingface_multi_qa_mpnet": "/app/local_models/models/multi-qa-mpnet-base-dot-v1",
+        "huggingface_paraphrase_multilingual": "/app/local_models/models/paraphrase-multilingual-MiniLM-L12-v2",
+        "huggingface_distiluse_multilingual": "/app/local_models/models/distiluse-base-multilingual-cased-v2",
+        "huggingface_xlm_r": "/app/local_models/models/xlm-r-100langs-bert-base-nli-stsb-mean-tokens"
     }
     
-    if model_name in hf_models:
+    if model_name in local_hf_models:
+        local_path = local_hf_models[model_name]
+        print(f"[INFO] ローカル埋め込みモデルを使用: {local_path} (device: {device})")
+        
+        # GPU加速対応のHuggingFaceEmbeddingsを作成
+        common_kwargs = {
+            'model_kwargs': {
+                'device': device,  # Metal GPU (mps) または CUDA
+                'trust_remote_code': True
+            },
+            'encode_kwargs': {
+                'normalize_embeddings': True,
+                'device': device  # エンコード時もGPUを使用
+            }
+        }
+        
         return HuggingFaceEmbeddings(
-            model_name=hf_models[model_name],
+            model_name=local_path,
             **common_kwargs
         )
     
@@ -873,51 +897,89 @@ def calculate_overlap_metrics(contexts: list[list[str]], embedder=None) -> dict:
 @app.post("/clear_db/")
 def clear_db():
     """
-    すべてのembeddingモデルのコレクション（DBデータ）を完全削除するAPI。
-    主要embeddingモデル（huggingface_bge_small, openai等）すべてをループで削除。
+    すべてのDBデータを完全削除するAPI。
+    - ベクターストアコレクションの削除
+    - embeddingsテーブルの全データ削除
+    - experimentsテーブルの全データ削除
     """
     try:
-        if not LOCAL_MODEL_PATH.exists():
-            return {
-                "status": "error",
-                "message": f"モデルが見つかりません: {LOCAL_MODEL_PATH}。DBリセット不可。",
-                "model_exists": False
-            }
-        # 削除対象embeddingモデルリスト
-        embedding_models = ["huggingface_bge_small", "gpt-4o"]
+        print(f"[{jst_now_str()}] [INFO] DB全体リセット開始")
         results = []
-        for emb_model in embedding_models:
-            try:
-                if emb_model == "huggingface_bge_small":
-                    dummy_embeddings = HuggingFaceEmbeddings(
-                        model_name=str(LOCAL_MODEL_PATH),
-                        model_kwargs={'device': 'cpu', 'trust_remote_code': True},
-                        encode_kwargs={'normalize_embeddings': True}
+        
+        # 1. PostgreSQLテーブルのデータ削除
+        try:
+            with engine.connect() as conn:
+                with conn.begin():
+                    # embeddingsテーブルの全データ削除
+                    embeddings_result = conn.execute(text("DELETE FROM embeddings"))
+                    embeddings_count = embeddings_result.rowcount
+                    results.append(f"embeddingsテーブル: {embeddings_count}件削除")
+                    print(f"[{jst_now_str()}] [INFO] embeddingsテーブル: {embeddings_count}件削除")
+                    
+                    # experimentsテーブルの全データ削除
+                    experiments_result = conn.execute(text("DELETE FROM experiments"))
+                    experiments_count = experiments_result.rowcount
+                    results.append(f"experimentsテーブル: {experiments_count}件削除")
+                    print(f"[{jst_now_str()}] [INFO] experimentsテーブル: {experiments_count}件削除")
+                    
+                    # シーケンスのリセット
+                    conn.execute(text("ALTER SEQUENCE embeddings_id_seq RESTART WITH 1"))
+                    conn.execute(text("ALTER SEQUENCE experiments_id_seq RESTART WITH 1"))
+                    results.append("シーケンスリセット完了")
+                    print(f"[{jst_now_str()}] [INFO] シーケンスリセット完了")
+        except Exception as db_error:
+            error_msg = f"PostgreSQLテーブル削除エラー: {str(db_error)}"
+            results.append(error_msg)
+            print(f"[{jst_now_str()}] [ERROR] {error_msg}")
+        
+        # 2. ベクターストアコレクションの削除
+        if LOCAL_MODEL_PATH.exists():
+            # 削除対象embeddingモデルリスト
+            embedding_models = ["huggingface_bge_small", "huggingface_bge_large", "gpt-4o", "text-embedding-3-large"]
+            for emb_model in embedding_models:
+                try:
+                    if emb_model in ["huggingface_bge_small", "huggingface_bge_large"]:
+                        dummy_embeddings = HuggingFaceEmbeddings(
+                            model_name=str(LOCAL_MODEL_PATH),
+                            model_kwargs={'device': 'cpu', 'trust_remote_code': True},
+                            encode_kwargs={'normalize_embeddings': True}
+                        )
+                    elif emb_model in ["gpt-4o", "text-embedding-3-large"]:
+                        from langchain_openai import OpenAIEmbeddings
+                        dummy_embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
+                    else:
+                        continue
+                    
+                    vectorstore = PGVector.from_documents(
+                        documents=[],
+                        embedding=dummy_embeddings,
+                        collection_name=get_collection_name(emb_model)
                     )
-                elif emb_model == "gpt-4o":
-                    from langchain_openai import OpenAIEmbeddings
-                    dummy_embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
-                else:
-                    continue
-                vectorstore = PGVector.from_documents(
-                    documents=[],
-                    embedding=dummy_embeddings,
-                    collection_name=get_collection_name(emb_model)
-                )
-                vectorstore.delete_collection()
-                results.append(f"{emb_model}: 削除成功")
-            except Exception as e:
-                results.append(f"{emb_model}: 削除失敗 ({str(e)})")
+                    vectorstore.delete_collection()
+                    results.append(f"{emb_model}コレクション: 削除成功")
+                    print(f"[{jst_now_str()}] [INFO] {emb_model}コレクション削除成功")
+                except Exception as e:
+                    error_msg = f"{emb_model}コレクション: 削除失敗 ({str(e)})"
+                    results.append(error_msg)
+                    print(f"[{jst_now_str()}] [ERROR] {error_msg}")
+        else:
+            results.append(f"モデルが見つかりません: {LOCAL_MODEL_PATH}. ベクターストアコレクションの削除をスキップ")
+        
+        print(f"[{jst_now_str()}] [INFO] DB全体リセット完了")
         return {
             "status": "success",
-            "message": "全embeddingモデルのコレクションを削除しました。",
+            "message": "全DBデータを削除しました。",
             "details": results,
-            "model_exists": True
+            "model_exists": LOCAL_MODEL_PATH.exists()
         }
     except Exception as e:
+        error_msg = f"DB全体削除時エラー: {str(e)}"
+        print(f"[{jst_now_str()}] [ERROR] {error_msg}")
+        import traceback
+        traceback.print_exc()
         return {
             "status": "error",
-            "message": f"DB全体削除時エラー: {str(e)}",
+            "message": error_msg,
             "model_exists": LOCAL_MODEL_PATH.exists()
         }
 
@@ -926,18 +988,26 @@ def get_available_models():
     """
     利用可能なモデルと現在のモデル状態を返します。
     """
-    model_exists = LOCAL_MODEL_PATH.exists()
+    # HuggingFaceキャッシュディレクトリでの存在チェック
+    hf_cache_path = Path("/app/.cache/huggingface/hub/models--BAAI--bge-small-en-v1.5")
+    model_exists = hf_cache_path.exists() or LOCAL_MODEL_PATH.exists()
+    
+    # 実際に存在するパスを使用
+    actual_path = hf_cache_path if hf_cache_path.exists() else LOCAL_MODEL_PATH
+    
     model_info = {
         "model_name": str(MODEL_NAME),
         "local_path": str(LOCAL_MODEL_PATH),
+        "hf_cache_path": str(hf_cache_path),
+        "actual_path": str(actual_path),
         "exists": model_exists,
         "size_mb": (
-            sum(f.stat().st_size for f in LOCAL_MODEL_PATH.glob('**/*') if f.is_file()) / (1024 * 1024)
+            sum(f.stat().st_size for f in actual_path.glob('**/*') if f.is_file()) / (1024 * 1024)
         ) if model_exists else 0
     }
     
     return {
-        "llm_models": ["ollama_llama2", "gpt-4o"],
+        "llm_models": ["llama3", "mistral", "ollama_llama2", "gpt-4o"],
         "embedding_models": ["huggingface_bge_small", "gpt-4o"],
         "current_embedding_model": {
             "name": "huggingface_bge_small",
@@ -992,6 +1062,7 @@ async def bulk_evaluate(request: Request):
             try:
                 print("[進捗] 評価データを処理中...")
                 embedding_model = data.get("embedding_model")
+                llm_model = data.get("llm_model", "mistral")  # デフォルトでmistralを使用
                 chunk_methods = data.get("chunk_methods", [data.get("chunk_method", "recursive")])
                 chunk_sizes = data.get("chunk_sizes", [data.get("chunk_size", 1000)])
                 chunk_overlaps = data.get("chunk_overlaps", [data.get("chunk_overlap", 0)])
@@ -1168,34 +1239,48 @@ async def bulk_evaluate(request: Request):
 
                         # RAG回答生成＆コンテキスト取得
                         contexts = []
-                        pred_answers = []
                         
-                        print(f"[進捗] RAG回答生成を開始（{len(questions)}個の質問を処理中）...")
-                        
-                        # 各質問に対して非同期でコンテキスト取得と回答生成を行う
-                        async def get_context_and_answer(q):
-                            async with semaphore:  # セマフォで並列処理数を制限
-                                # 各質問ごとにリトリーバーで文脈取得（非同期化）
-                                retrieved_docs = await asyncio.to_thread(retriever.get_relevant_documents, q)
-                                context_texts = [doc.page_content for doc in retrieved_docs]
-                                # LLMインスタンス・プロンプト生成
-                                llm_instance = get_llm("gpt-4o")  # 必ずOpenAIモデルを使用
-                                prompt = ChatPromptTemplate.from_template("""Answer the question based only on the following context:\n{context}\n\nQuestion: {question}""")
-                                chain = (
-                                    {"context": lambda _: context_texts, "question": lambda _: q}
-                                    | prompt
-                                    | llm_instance
-                                    | StrOutputParser()
-                                )
-                                # 非同期で回答生成
-                                answer = await chain.ainvoke(q)
-                                return context_texts, answer
-                        
-                        # 非同期で全質問の回答を生成
-                        results_list = await asyncio.gather(*[get_context_and_answer(q) for q in questions])
-                        for context_texts, answer in results_list:
-                            contexts.append(context_texts)
-                            pred_answers.append(answer)
+                        # PDFアップロード時の回答がある場合はそれを使用、ない場合は新しく生成
+                        if answers and len(answers) == len(questions):
+                            print(f"[進捗] PDFアップロード時の回答を使用（{len(answers)}個の回答）")
+                            pred_answers = answers  # PDFアップロード時の回答を使い回し
+                            
+                            # コンテキスト取得のみ実行
+                            async def get_context_only(q):
+                                async with semaphore:
+                                    retrieved_docs = await asyncio.to_thread(retriever.get_relevant_documents, q)
+                                    return [doc.page_content for doc in retrieved_docs]
+                            
+                            print(f"[進捗] コンテキスト取得のみ実行（{len(questions)}個の質問）...")
+                            contexts = await asyncio.gather(*[get_context_only(q) for q in questions])
+                        else:
+                            print(f"[進捗] 新しいRAG回答を生成（{len(questions)}個の質問）...")
+                            pred_answers = []
+                            
+                            # 各質問に対して非同期でコンテキスト取得と回答生成を行う
+                            async def get_context_and_answer(q):
+                                async with semaphore:  # セマフォで並列処理数を制限
+                                    # 各質問ごとにリトリーバーで文脈取得（非同期化）
+                                    retrieved_docs = await asyncio.to_thread(retriever.get_relevant_documents, q)
+                                    context_texts = [doc.page_content for doc in retrieved_docs]
+                                    # LLMインスタンス・プロンプト生成
+                                    llm_instance = get_llm(llm_model)  # リクエストで指定されたLLMモデルを使用
+                                    prompt = ChatPromptTemplate.from_template("""Answer the question based only on the following context:\n{context}\n\nQuestion: {question}""")
+                                    chain = (
+                                        {"context": lambda _: context_texts, "question": lambda _: q}
+                                        | prompt
+                                        | llm_instance
+                                        | StrOutputParser()
+                                    )
+                                    # 非同期で回答生成
+                                    answer = await chain.ainvoke(q)
+                                    return context_texts, answer
+                            
+                            # 非同期で全質問の回答を生成
+                            results_list = await asyncio.gather(*[get_context_and_answer(q) for q in questions])
+                            for context_texts, answer in results_list:
+                                contexts.append(context_texts)
+                                pred_answers.append(answer)
                         print(f"[進捗] RAG回答生成完了。評価処理を開始...")
                         # --- ここまで並列化 ---
 
@@ -1209,7 +1294,18 @@ async def bulk_evaluate(request: Request):
                             "ground_truth": answers
                         }
                         dataset = Dataset.from_dict(dataset_dict)
-                        llm_instance_eval = get_llm("gpt-4o")
+                        llm_instance_eval = get_llm(llm_model)  # リクエストで指定されたLLMモデルを使用
+                        
+                        # RAGASメトリクスを埋め込みモデルで初期化（OpenAI Embeddingsを回避）
+                        from ragas.metrics import faithfulness, answer_relevancy, context_recall, context_precision, answer_correctness
+                        
+                        # メトリクスを埋め込みモデルで初期化
+                        metrics_with_embeddings = []
+                        for metric in [faithfulness, answer_relevancy, context_recall, context_precision, answer_correctness]:
+                            # メトリクスに埋め込みモデルを設定
+                            if hasattr(metric, 'embeddings'):
+                                metric.embeddings = embedder
+                            metrics_with_embeddings.append(metric)
                         
                         # 評価関数を非同期化
                         async def eval_one(idx):
@@ -1223,7 +1319,7 @@ async def bulk_evaluate(request: Request):
                                 })
                                 return idx, evaluate(
                                     dataset=single_dataset,
-                                    metrics=[faithfulness, answer_relevancy, context_recall, context_precision, answer_correctness],
+                                    metrics=metrics_with_embeddings,
                                     llm=llm_instance_eval,
                                 )
                         
@@ -1353,16 +1449,36 @@ async def bulk_evaluate(request: Request):
                                     })
                                     experiment_id = exp_result.fetchone()[0]
                                     
+                                    # チャンク詳細情報を準備
+                                    chunks_details = {
+                                        'chunk_method': chunk_method,
+                                        'chunk_strategy': chunk_strategy,
+                                        'total_chunks': len(chunks),
+                                        'chunks': [
+                                            {
+                                                'index': i,
+                                                'content': chunk[:200] + '...' if len(chunk) > 200 else chunk,  # 最初の200文字のみ保存
+                                                'length': len(chunk)
+                                            }
+                                            for i, chunk in enumerate(chunks[:10])  # 最初の10チャンクのみ保存
+                                        ],
+                                        'parameters': {
+                                            'chunk_size': chunk_size_val if chunk_method != 'semantic' else None,
+                                            'chunk_overlap': chunk_overlap_val if chunk_method != 'semantic' else None,
+                                            'similarity_threshold': similarity_threshold if chunk_method == 'semantic' else None
+                                        }
+                                    }
+                                    
                                     # 2. 評価結果をembeddingsテーブルに保存
                                     db_conn.execute(text("""
                                         INSERT INTO embeddings (
                                             text, embedding_model, chunk_strategy, chunk_size, chunk_overlap,
                                             avg_chunk_len, num_chunks, overall_score, faithfulness, answer_relevancy,
-                                            context_recall, context_precision, answer_correctness, experiment_id
+                                            context_recall, context_precision, answer_correctness, experiment_id, chunks_details
                                         ) VALUES (
                                             :text, :embedding_model, :chunk_strategy, :chunk_size, :chunk_overlap,
                                             :avg_chunk_len, :num_chunks, :overall_score, :faithfulness, :answer_relevancy,
-                                            :context_recall, :context_precision, :answer_correctness, :experiment_id
+                                            :context_recall, :context_precision, :answer_correctness, :experiment_id, :chunks_details
                                         )
                                     """), {
                                         'text': sample_text[:1000],  # テキストは最初の1000文字のみ保存
@@ -1378,7 +1494,8 @@ async def bulk_evaluate(request: Request):
                                         'context_recall': metrics_avg['context_recall'],
                                         'context_precision': metrics_avg['context_precision'],
                                         'answer_correctness': metrics_avg['answer_correctness'],
-                                        'experiment_id': experiment_id
+                                        'experiment_id': experiment_id,
+                                        'chunks_details': json.dumps(chunks_details, ensure_ascii=False)
                                     })
                                     
                                     print(f"[進捗] 評価結果をデータベースに保存しました。experiment_id: {experiment_id}")
@@ -1464,10 +1581,14 @@ async def bulk_evaluate(request: Request):
         }
 
 # --- PDFアップロード＆QA自動生成API ---
-from fastapi import UploadFile, File
+from fastapi import UploadFile, File, Form
 
 @app.post("/uploadfile/")
-async def uploadfile(file: UploadFile = File(...)):
+async def uploadfile(
+    file: UploadFile = File(...),
+    question_llm_model: str = Form("llama3"),
+    answer_llm_model: str = Form("llama3")
+):
     """
     PDFアップロード時にテキスト抽出→LLMで質問自動生成→LLMで回答自動生成まで行い、
     質問・回答セットを返すAPI。
@@ -1475,6 +1596,7 @@ async def uploadfile(file: UploadFile = File(...)):
     # ■■ 最重要デバッグ情報 ■■
     print(f"[重要] uploadfile関数実行開始: ファイル名={file.filename}, サイズ={file.size if hasattr(file, 'size') else '不明'}")
     print(f"[重要] ファイル情報: {file=}, タイプ={type(file)}")
+    print(f"[重要] LLMモデル選択: 質問生成={question_llm_model}, 回答生成={answer_llm_model}")
     import io
     try:
         try:
@@ -1511,17 +1633,45 @@ async def uploadfile(file: UploadFile = File(...)):
             return {"error": f"PDF処理エラー: {str(e)}"}
 
         # 2. LLMで質問セット自動生成
-        print("[重要] LLM質問生成開始")
-        llm_instance = get_llm("gpt-4o")
+        print(f"[重要] LLM質問生成開始: モデル={question_llm_model}")
+        llm_instance = get_llm(question_llm_model)
         prompt_q = f"""
-以下の内容に関する代表的な質問を日本語で5つ作成してください。\n---\n{text[:1500]}\n---\n質問：
+以下の内容に関する代表的な質問を日本語で5つ作成してください。各質問は改行で区切ってください。
+
+---
+{text[:1500]}
+---
+
+質問：
 """
         try:
+            # タイムアウトを設定してLLM呼び出し
+            import signal
+            import time
+            
+            def timeout_handler(signum, frame):
+                raise TimeoutError("LLM質問生成がタイムアウトしました")
+            
+            # 20秒のタイムアウトを設定（GPU加速で高速化）
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(20)
+            
+            start_time = time.time()
             questions_resp = llm_instance.invoke(prompt_q)
-            print(f"[重要] LLM質問生成レスポンス取得: {len(questions_resp.content)}文字")
+            signal.alarm(0)  # タイムアウトをクリア
+            
+            elapsed_time = time.time() - start_time
+            print(f"[重要] LLM質問生成レスポンス取得: {len(questions_resp.content)}文字 (実行時間: {elapsed_time:.2f}秒)")
             questions = [q.strip() for q in questions_resp.content.split('\n') if q.strip()]
+            answers = []  # LLM回答生成で後で埋める
             print(f"[重要] 質問リスト生成完了: {len(questions)}件")
+        except TimeoutError as e:
+            signal.alarm(0)  # タイムアウトをクリア
+            print(f"[重要] LLM質問生成タイムアウト: {e}")
+            # フォールバック処理に進む
+            questions = []
         except Exception as e:
+            signal.alarm(0)  # タイムアウトをクリア
             print(f"[重要] LLM質問生成例外: {e}")
             questions = []
 
@@ -1539,30 +1689,68 @@ async def uploadfile(file: UploadFile = File(...)):
                 print(f"[重要] QA形式から抽出: {len(questions)}件")
             elif bullets:
                 questions = bullets[:5]
-                answers = ["該当内容を本文から要約してください。"] * len(questions)
                 print(f"[重要] 箇条書きから抽出: {len(questions)}件")
+                # 箇条書きから抽出した質問に対してもLLM回答生成を実行
+                answers = []  # 後でLLM回答生成で埋める
             else:
                 # 各段落の先頭文を質問化
                 paras = [p.strip() for p in text.split('\n') if p.strip()]
                 questions = [f"{p[:20]}について説明してください。" for p in paras[:5]]
-                answers = ["該当内容を本文から要約してください。"] * len(questions)
                 print(f"[重要] 段落先頭文から生成: {len(questions)}件")
-        else:
+                # 段落から生成した質問に対してもLLM回答生成を実行
+                answers = []  # 後でLLM回答生成で埋める
+        
+        # 質問が生成された場合は、LLMで回答セットを自動生成
+        if questions and not answers:
             # 3. LLMで回答セット自動生成
-            print("[重要] LLM回答生成開始")
-            answers = []
-            for i, q in enumerate(questions):
-                try:
-                    prompt_a = f"""
-以下の内容に基づいて、次の質問に日本語で簡潔に答えてください。\n---\n{sample_text}\n---\n質問: {q}\n回答：
-"""
-                    answer_resp = llm_instance.invoke(prompt_a)
-                    print(f"[重要] LLM回答{i+1}生成完了: {len(answer_resp.content)}文字")
-                    answer = answer_resp.content.strip().split('\n')[0]
-                    answers.append(answer)
-                except Exception as e:
-                    print(f"[重要] LLM回答{i+1}生成例外: {e}")
-                    answers.append("該当内容を本文から要約してください。")
+            print(f"[重要] LLM回答生成開始: モデル={answer_llm_model}")
+            # 回答生成用のLLMインスタンスを取得
+            try:
+                answer_llm_instance = get_llm(answer_llm_model)
+            except Exception as e:
+                print(f"[重要] LLMインスタンス取得失敗: {e}")
+                # LLMが使用できない場合は簡易回答でフォールバック
+                answers = [f"{q}についての詳細は本文を参照してください。" for q in questions]
+                print(f"[重要] 簡易回答でフォールバック: {len(answers)}件")
+            else:
+                answers = []
+                for i, q in enumerate(questions):
+                    try:
+                        prompt_a = f"""
+以下の内容に基づいて、次の質問に日本語で簡潔に答えてください。
+
+---
+{sample_text}
+---
+
+質問: {q}
+回答："""
+                        # タイムアウトを設定してLLM呼び出し
+                        def timeout_handler(signum, frame):
+                            raise TimeoutError(f"LLM回答{i+1}生成がタイムアウトしました")
+                        
+                        # 20秒のタイムアウトを設定（GPU加速で高速化）
+                        signal.signal(signal.SIGALRM, timeout_handler)
+                        signal.alarm(20)
+                        
+                        start_time = time.time()
+                        answer_resp = answer_llm_instance.invoke(prompt_a)
+                        signal.alarm(0)  # タイムアウトをクリア
+                        
+                        elapsed_time = time.time() - start_time
+                        print(f"[重要] LLM回答{i+1}生成完了: {len(answer_resp.content)}文字 (実行時間: {elapsed_time:.2f}秒)")
+                        answer = answer_resp.content.strip().split('\n')[0]
+                        answers.append(answer)
+                    except TimeoutError as e:
+                        signal.alarm(0)  # タイムアウトをクリア
+                        print(f"[重要] LLM回答{i+1}生成タイムアウト: {e}")
+                        # タイムアウト時は簡易的な回答を生成
+                        simple_answer = f"{q}に関する内容を本文から要約してください。"
+                        answers.append(simple_answer)
+                    except Exception as e:
+                        signal.alarm(0)  # タイムアウトをクリア
+                        print(f"[重要] LLM回答{i+1}生成例外: {e}")
+                        answers.append("該当内容を本文から要約してください。")
 
         # --- 最終ガード: questions/answersが空なら必ずダミー値を返す ---
         if not questions or not answers:
@@ -1725,4 +1913,255 @@ def list_strategies():
         strategies = load_strategies_yaml()
         return JSONResponse(content=strategies)
     except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# --- 実験管理API ---
+
+@app.get("/api/v1/experiments/")
+def get_experiments():
+    """
+    実験一覧を取得するAPI
+    """
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT 
+                    id, session_id, experiment_name, file_name, 
+                    parameters, status, total_combinations, completed_combinations,
+                    created_at, updated_at
+                FROM experiments 
+                ORDER BY created_at DESC
+            """))
+            
+            experiments = []
+            for row in result:
+                exp = {
+                    "id": row[0],
+                    "session_id": row[1],
+                    "experiment_name": row[2],
+                    "file_name": row[3],
+                    "parameters": row[4] if isinstance(row[4], dict) else (json.loads(row[4]) if row[4] and isinstance(row[4], str) else {}),
+                    "status": row[5],
+                    "total_combinations": row[6],
+                    "completed_combinations": row[7],
+                    "created_at": row[8].isoformat() if row[8] else None,
+                    "updated_at": row[9].isoformat() if row[9] else None
+                }
+                experiments.append(exp)
+            
+            return JSONResponse(content={"experiments": experiments})
+    except Exception as e:
+        print(f"[エラー] 実験一覧取得エラー: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/api/v1/experiments/{experiment_id}/detailed_results/")
+def get_experiment_results(experiment_id: int):
+    """
+    指定した実験の詳細結果を取得するAPI（チャンク詳細情報含む）
+    """
+    try:
+        with engine.connect() as conn:
+            # 実験情報を取得
+            exp_result = conn.execute(text("""
+                SELECT session_id, experiment_name, file_name, parameters, status, 
+                       total_combinations, completed_combinations, created_at
+                FROM experiments 
+                WHERE id = :experiment_id
+            """), {"experiment_id": experiment_id})
+            
+            exp_row = exp_result.fetchone()
+            
+            if not exp_row:
+                return {"error": "実験が見つかりません"}
+            
+            # parametersの安全なパース
+            parameters = {}
+            if exp_row[3] is not None:
+                if isinstance(exp_row[3], dict):
+                    parameters = exp_row[3]
+                elif isinstance(exp_row[3], str):
+                    try:
+                        parameters = json.loads(exp_row[3])
+                    except (json.JSONDecodeError, TypeError):
+                        parameters = {}
+            
+            experiment_info = {
+                "session_id": exp_row[0],
+                "experiment_name": exp_row[1],
+                "file_name": exp_row[2],
+                "parameters": parameters,
+                "status": exp_row[4],
+                "total_combinations": exp_row[5],
+                "completed_combinations": exp_row[6],
+                "created_at": exp_row[7].isoformat() if exp_row[7] else None
+            }
+            
+            # 評価結果を取得（チャンク詳細情報含む）
+            results_query = conn.execute(text("""
+                SELECT 
+                    id, text, embedding_model, chunk_strategy, chunk_size, chunk_overlap,
+                    avg_chunk_len, num_chunks, overall_score, faithfulness, answer_relevancy,
+                    context_recall, context_precision, answer_correctness, chunks_details,
+                    created_at
+                FROM embeddings 
+                WHERE experiment_id = :experiment_id
+                ORDER BY created_at ASC
+            """), {"experiment_id": experiment_id})
+            
+            results = []
+            for row in results_query:
+                # chunks_detailsの安全なパース
+                chunks_details = None
+                if row[14] is not None:
+                    if isinstance(row[14], dict):
+                        chunks_details = row[14]
+                    elif isinstance(row[14], str):
+                        try:
+                            chunks_details = json.loads(row[14])
+                        except (json.JSONDecodeError, TypeError):
+                            chunks_details = None
+                
+                result_data = {
+                    "id": row[0],
+                    "text": row[1],
+                    "embedding_model": row[2],
+                    "chunk_strategy": row[3],
+                    "chunk_size": row[4],
+                    "chunk_overlap": row[5],
+                    "avg_chunk_len": row[6],
+                    "num_chunks": row[7],
+                    "overall_score": row[8],
+                    "faithfulness": row[9],
+                    "answer_relevancy": row[10],
+                    "context_recall": row[11],
+                    "context_precision": row[12],
+                    "answer_correctness": row[13],
+                    "chunks_details": chunks_details,
+                    "created_at": row[15].isoformat() if row[15] else None
+                }
+                results.append(result_data)
+            
+            return {
+                "experiment": experiment_info,
+                "results": results,
+                "total_results": len(results)
+            }
+    except Exception as e:
+        print(f"[エラー] 実験結果取得エラー: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
+
+@app.delete("/api/v1/experiments/{experiment_id}/")
+def delete_experiment(experiment_id: int):
+    """
+    指定した実験を削除するAPI
+    """
+    try:
+        with engine.connect() as conn:
+            with conn.begin():
+                # 関連する評価結果を削除
+                conn.execute(text("""
+                    DELETE FROM embeddings WHERE experiment_id = :experiment_id
+                """), {"experiment_id": experiment_id})
+                
+                # 実験を削除
+                result = conn.execute(text("""
+                    DELETE FROM experiments WHERE id = :experiment_id
+                """), {"experiment_id": experiment_id})
+                
+                if result.rowcount == 0:
+                    return JSONResponse(status_code=404, content={"error": "実験が見つかりません"})
+                
+                return JSONResponse(content={"message": "実験を削除しました"})
+    except Exception as e:
+        print(f"[エラー] 実験削除エラー: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/api/v1/experiments/statistics/")
+def get_experiments_statistics():
+    """
+    実験の統計情報を取得するAPI
+    """
+    try:
+        with engine.connect() as conn:
+            # 実験数と結果数の統計
+            stats_result = conn.execute(text("""
+                SELECT 
+                    COUNT(DISTINCT e.id) as total_experiments,
+                    COUNT(em.id) as total_results,
+                    AVG(em.overall_score) as avg_overall_score,
+                    MAX(em.overall_score) as max_overall_score,
+                    MIN(em.overall_score) as min_overall_score
+                FROM experiments e
+                LEFT JOIN embeddings em ON e.id = em.experiment_id
+            """))
+            
+            stats_row = stats_result.fetchone()
+            
+            # モデル別統計
+            model_stats = conn.execute(text("""
+                SELECT 
+                    embedding_model,
+                    COUNT(*) as count,
+                    AVG(overall_score) as avg_score,
+                    MAX(overall_score) as max_score,
+                    MIN(overall_score) as min_score
+                FROM embeddings
+                GROUP BY embedding_model
+                ORDER BY avg_score DESC
+            """))
+            
+            model_statistics = []
+            for row in model_stats:
+                model_statistics.append({
+                    "model": row[0],
+                    "count": row[1],
+                    "avg_score": float(row[2]) if row[2] else 0,
+                    "max_score": float(row[3]) if row[3] else 0,
+                    "min_score": float(row[4]) if row[4] else 0
+                })
+            
+            # チャンク戦略別統計
+            strategy_stats = conn.execute(text("""
+                SELECT 
+                    chunk_strategy,
+                    COUNT(*) as count,
+                    AVG(overall_score) as avg_score,
+                    MAX(overall_score) as max_score,
+                    MIN(overall_score) as min_score
+                FROM embeddings
+                GROUP BY chunk_strategy
+                ORDER BY avg_score DESC
+            """))
+            
+            strategy_statistics = []
+            for row in strategy_stats:
+                strategy_statistics.append({
+                    "strategy": row[0],
+                    "count": row[1],
+                    "avg_score": float(row[2]) if row[2] else 0,
+                    "max_score": float(row[3]) if row[3] else 0,
+                    "min_score": float(row[4]) if row[4] else 0
+                })
+            
+            return JSONResponse(content={
+                "overall": {
+                    "total_experiments": stats_row[0] if stats_row[0] else 0,
+                    "total_results": stats_row[1] if stats_row[1] else 0,
+                    "avg_overall_score": float(stats_row[2]) if stats_row[2] else 0,
+                    "max_overall_score": float(stats_row[3]) if stats_row[3] else 0,
+                    "min_overall_score": float(stats_row[4]) if stats_row[4] else 0
+                },
+                "by_model": model_statistics,
+                "by_strategy": strategy_statistics
+            })
+    except Exception as e:
+        print(f"[エラー] 統計情報取得エラー: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})

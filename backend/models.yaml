@@ -1,9 +1,19 @@
 models:
+  - name: llama3
+    type: ollama
+    category: "LLM"
+    display_name: "Llama3 (Ollama)"
+    description: "Ollamaで実行されるLlama3モデル。日本語対応が優秀な大規模言語モデルです。"
   - name: mistral
     type: ollama
     category: "LLM"
     display_name: "Mistral (Ollama)"
     description: "Ollamaで実行されるMistralモデル。大規模言語モデルとしての江能力を提供します。"
+  - name: gpt-4o
+    type: openai
+    category: "LLM"
+    display_name: "GPT-4o (OpenAI)"
+    description: "OpenAIの最新のGPT-4oモデル。非常に高品質な応答を提供します。"
   - name: gpt-4o-mini
     type: openai
     category: "LLM"

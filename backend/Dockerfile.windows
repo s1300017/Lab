@@ -1,0 +1,80 @@
+# ベースイメージの指定
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+# 環境変数の設定
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=off \
+    PIP_DISABLE_PIP_VERSION_CHECK=on \
+    PIP_DEFAULT_TIMEOUT=100 \
+    POETRY_VERSION=1.7.1 \
+    POETRY_HOME="/opt/poetry" \
+    POETRY_VIRTUALENVS_CREATE=false \
+    POETRY_NO_INTERACTION=1 \
+    POETRY_CACHE_DIR='/var/cache/pypoetry' \
+    PATH="$POETRY_HOME/bin:$PATH" \
+    TZ=Asia/Tokyo
+
+# システムパッケージのインストール
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    git \
+    libgl1-mesa-dev \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    python3.10 \
+    python3-pip \
+    python3.10-dev \
+    python3.10-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pythonのデフォルトを3.10に設定
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
+    update-alternatives --set python3 /usr/bin/python3.10 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
+    update-alternatives --set python /usr/bin/python3.10
+
+# Poetryのインストール
+RUN curl -sSL https://install.python-poetry.org | python3 - && \
+    cd /usr/local/bin && \
+    ln -s /root/.local/bin/poetry && \
+    poetry config virtualenvs.create false
+
+# 作業ディレクトリの設定
+WORKDIR /app
+
+# 依存関係のインストール（キャッシュを効かせるため別レイヤーで）
+COPY pyproject.toml poetry.lock* ./
+RUN poetry install --without dev --no-root && \
+    rm -rf ~/.cache/pip/*
+
+# アプリケーションコードのコピー
+COPY . .
+
+# モデルダウンロード用スクリプトをコピー
+COPY download_models.py .
+
+# 必要な権限を付与
+RUN chmod +x /app/download_models.py
+
+# ポートの公開
+EXPOSE 8000
+
+# ヘルスチェック用スクリプトをコピー
+COPY healthcheck.py .
+
+# ヘルスチェック用スクリプトに実行権限を付与
+RUN chmod +x /app/healthcheck.py
+
+# エントリーポイントスクリプトをコピー
+COPY docker-entrypoint.sh .
+RUN chmod +x /app/docker-entrypoint.sh
+
+# エントリーポイントの設定
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+
+# デフォルトコマンドの設定
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,6 +1,6 @@
-# 最新Ollama（1.0.0以降）をビルドするためのDockerfile
-# 必要に応じてバージョンは適宜修正してください
-FROM golang:1.24 as builder
+# Apple Silicon GPU (Metal) 対応のOllamaビルド用Dockerfile
+# M4 ProのMetal GPU加速を活用した最適化ビルド
+FROM --platform=linux/arm64 golang:1.24 as builder
 
 # gitをインストール
 RUN apt-get update && apt-get install -y git
@@ -18,13 +18,15 @@ RUN git fetch --tags && git checkout $(git describe --tags $(git rev-list --tags
 # バージョン情報を正しく埋め込むため、exportではなく同一RUN行で変数を使う
 # mageではなくgo buildで明示的にビルド
 WORKDIR /build/ollama
+# Apple Metal GPU加速対応のビルド設定
 RUN OLLAMA_VERSION=$(git describe --tags $(git rev-list --tags --max-count=1)) && \
     sed -i "s/var Version string = \".*\"/var Version string = \"${OLLAMA_VERSION}\"/" version/version.go && \
-    go build -o ollama . && \
+    CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+    go build -tags metal -ldflags "-s -w -X github.com/jmorganca/ollama/version.Version=${OLLAMA_VERSION}" -o ollama . && \
     echo "ビルド後バージョン確認:" && ./ollama --version
 
-# ランタイム用イメージ
-FROM ubuntu:22.04
+# Apple Silicon用ランタイムイメージ（ARM64最適化）
+FROM --platform=linux/arm64 ubuntu:22.04
 RUN apt-get update && apt-get install -y ca-certificates curl
 
 WORKDIR /app

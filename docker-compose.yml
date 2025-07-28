@@ -2,7 +2,6 @@ volumes:
   docker_lab_pgdata:
   models:
   data:
-  ollama_data:
 
 services:
   db:
@@ -27,34 +26,8 @@ services:
       - docker_lab_pgdata:/var/lib/postgresql/data
       - ./postgresql.conf:/etc/postgresql/postgresql.conf # JST用設定ファイルをマウント
 
-  ollama:
-    # 自作ビルドした最新版Ollamaイメージを使用
-    image: ollama-custom:latest
-    build: ./ollama-custom
-    container_name: rag_ollama
-    ports:
-      - "11435:11434"
-    environment:
-      - OLLAMA_NUM_THREADS=2
-      - OLLAMA_HOST=0.0.0.0
-      - TZ=Asia/Tokyo # JST化
-    entrypoint: ["/bin/sh", "/ollama-init-entry.sh"]
-    volumes:
-      - ollama_data:/root/.ollama
-      - ./ollama-init-entry.sh:/ollama-init-entry.sh
-    pull_policy: always
-    restart: always
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/version"]
-      interval: 60s  # ← ログ頻度を下げるため60秒に変更
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-
+  # ネイティブOllamaを使用するためDocker Ollamaサービスを削除
+  # ホストのOllamaサービスをhttp://host.docker.internal:11434で使用
   frontend:
     build: ./frontend
     container_name: rag_frontend
@@ -66,7 +39,6 @@ services:
       - TZ=Asia/Tokyo
     depends_on:
       - db
-      - ollama
       - backend
     restart: always
     volumes:
@@ -99,12 +71,12 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      ollama:
-        condition: service_healthy
     restart: always
     volumes:
       # モデルキャッシュを永続化
       - models:/app/.cache
+      # ローカルHuggingFaceモデルをマウント（GPU加速用）
+      - ./local_models:/app/local_models
       # アプリケーションコードのホットリロード用（開発時のみ）
       - ./backend/app:/app/app
       - ./backend/models.yaml:/app/models.yaml

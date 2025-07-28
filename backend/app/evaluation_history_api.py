@@ -93,7 +93,7 @@ def get_experiment_results(experiment_id: int):
                     "created_at": row[13].isoformat() if row[13] else None,
                     "experiment_name": row[14],
                     "file_name": row[15],
-                    "parameters": json.loads(row[16]) if row[16] else {}
+                    "parameters": row[16] if isinstance(row[16], dict) else (json.loads(row[16]) if row[16] and isinstance(row[16], str) else {})
                 })
             
             return {"results": results}

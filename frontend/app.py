@@ -1132,17 +1132,33 @@ def clear_database():
     try:
         response = requests.post(f"{BACKEND_URL}/clear_db/")
         if response.status_code == 200:
-            st.success("データベースを正常にクリアしました！")
-            # Clear session state related to old data
+            result = response.json()
+            st.success("🗑️ 全DBデータを正常に削除しました！")
+            
+            # 削除結果の詳細を表示
+            if "details" in result and result["details"]:
+                st.write("**削除結果詳細:**")
+                for detail in result["details"]:
+                    if "エラー" in detail or "失敗" in detail:
+                        st.warning(f"⚠️ {detail}")
+                    else:
+                        st.info(f"✅ {detail}")
+            
+            # セッション状態をクリア
             st.session_state.text = ""
             st.session_state.chunks = []
             st.session_state.evaluation_results = None
-            st.session_state.bulk_evaluation_results = None  # 一括評価結果もリセット
+            st.session_state.bulk_evaluation_results = None
             st.session_state.chat_history = []
+            
+            # リロードを促す
+            st.info("🔄 ページをリロードして変更を反映してください")
         else:
             st.error(f"データベースのクリアに失敗しました: {response.text}")
     except requests.exceptions.RequestException as e:
         st.error(f"バックエンドに接続できませんでした: {e}")
+    except Exception as e:
+        st.error(f"予期しないエラーが発生しました: {e}")
 
 # --- localStorageユーティリティ ---
 def save_state_to_localstorage():
@@ -1229,7 +1245,17 @@ with st.sidebar:
                 try:
                     response = requests.post(f"{BACKEND_URL}/clear_db/")
                     if response.status_code == 200:
-                        st.success("✅ すべてのデータを正常にクリアしました！")
+                        result = response.json()
+                        st.success("🗑️ すべてのデータを正常にクリアしました！")
+                        
+                        # 削除結果の詳細を表示
+                        if "details" in result and result["details"]:
+                            with st.expander("📊 削除結果詳細を表示"):
+                                for detail in result["details"]:
+                                    if "エラー" in detail or "失敗" in detail:
+                                        st.warning(f"⚠️ {detail}")
+                                    else:
+                                        st.info(f"✅ {detail}")
                         
                         # 状態確認
                         st.subheader("リセット状態の確認")
@@ -1283,13 +1309,24 @@ with st.sidebar:
                 # 1. バックエンドのデータベースをクリア
                 response = requests.post(f"{BACKEND_URL}/clear_db/")
                 if response.status_code == 200:
+                    result = response.json()
+                    
                     # 2. データベース関連の状態をリセット
                     st.session_state.chunks = []
                     st.session_state.evaluation_results = None
                     st.session_state.bulk_evaluation_results = None
                     st.session_state.chat_history = []
                     
-                    st.success("✅ データベースを正常に初期化しました！")
+                    st.success("🗑️ データベースを正常に初期化しました！")
+                    
+                    # 削除結果の詳細を表示
+                    if "details" in result and result["details"]:
+                        with st.expander("📊 初期化結果詳細を表示"):
+                            for detail in result["details"]:
+                                if "エラー" in detail or "失敗" in detail:
+                                    st.warning(f"⚠️ {detail}")
+                                else:
+                                    st.info(f"✅ {detail}")
                     
                     # 状態確認
                     st.subheader("データベース初期化の状態確認")
@@ -1464,6 +1501,26 @@ with st.sidebar:
 
     load_state_from_localstorage()
 
+    # --- LLMモデル選択（常に表示） ---
+    st.subheader("🤖 LLMモデル選択")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        question_llm_model = st.selectbox(
+            "質問生成用LLMモデル",
+            ["mistral", "llama3", "gpt-4o"],
+            index=0,
+            help="PDFから質問を自動生成するためのLLMモデルを選択。mistralが高速で推奨です。"
+        )
+    
+    with col2:
+        answer_llm_model = st.selectbox(
+            "回答生成用LLMモデル",
+            ["mistral", "llama3", "gpt-4o"],
+            index=0,
+            help="質問に対する回答を自動生成するためのLLMモデルを選択。mistralが高速で推奨です。"
+        )
+
     if "file_id" in st.session_state and not st.session_state.get("text"):
         try:
             resp = requests.get(f"{BACKEND_URL}/get_extracted/{st.session_state['file_id']}")
@@ -1506,7 +1563,11 @@ with st.sidebar:
             cleanse = st.checkbox("表・ノイズ除去クレンジング処理を行う", value=False, help="PDF内の表やノイズを自動で除去します")
             with st.spinner('PDFを処理中...'):
                 files = {'file': (uploaded_file.name, uploaded_file, 'application/pdf')}
-                data = {'cleanse': str(cleanse)}
+                data = {
+                    'cleanse': str(cleanse),
+                    'question_llm_model': question_llm_model,
+                    'answer_llm_model': answer_llm_model
+                }
                 try:
                     response = requests.post(f"{BACKEND_URL}/uploadfile/", files=files, data=data)
                     if response.status_code == 200:
@@ -1692,6 +1753,9 @@ qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
             st.session_state["uploaded_file_name"] = uploaded_file.name
             st.session_state["uploaded_file_size"] = uploaded_file.size
             st.session_state["cleanse_used"] = cleanse
+            # LLMモデル情報も保存
+            st.session_state["question_llm_model"] = question_llm_model
+            st.session_state["answer_llm_model"] = answer_llm_model
             save_state_to_localstorage()
             st.rerun()
 
@@ -1865,6 +1929,47 @@ with tab2:
         key="bulk_embeddings_tab2"
     )
 
+    # LLMモデルの選択を追加
+    st.subheader("LLMモデル設定")
+    
+    # LLMモデルリストを取得
+    llm_models = st.session_state.models.get("llm", [])
+    
+    # LLMモデル名と表示名のマッピングを作成
+    llm_options = {}
+    for model in llm_models:
+        model_id = model.get("name", "")
+        model_name = model.get("display_name", model_id)
+        provider = model.get("type", "").lower()
+        
+        # プロバイダーに応じた接頭辞を追加
+        if "openai" in provider:
+            display_name = f"OpenAI: {model_name}"
+        elif "ollama" in provider or model_id in ["mistral", "llama3", "ollama_llama2"]:
+            display_name = f"Ollama: {model_name}"
+        else:
+            display_name = f"{provider}: {model_name}"
+            
+        llm_options[display_name] = model_id
+    
+    # LLMモデルが1つもない場合はエラーメッセージを表示
+    if not llm_options:
+        st.error("利用可能なLLMモデルが見つかりません。バックエンドの設定を確認してください。")
+        st.stop()
+    
+    # デフォルトでMistralを選択（存在する場合）
+    default_llm = "mistral" if "mistral" in llm_options.values() else list(llm_options.values())[0]
+    
+    # LLMモデル選択
+    selected_llm_model = st.selectbox(
+        "一括評価で使用するLLMモデル",
+        options=list(llm_options.values()),
+        format_func=lambda x: [k for k, v in llm_options.items() if v == x][0],
+        index=list(llm_options.values()).index(default_llm) if default_llm in llm_options.values() else 0,
+        key="bulk_llm_model",
+        help="一括評価で質問・回答生成とRAGAS評価に使用するLLMモデルを選択してください。"
+    )
+
     # チャンク分割方法の選択
     chunk_methods = st.multiselect(
         "チャンク分割方法 (複数選択可)",
@@ -1992,6 +2097,7 @@ with tab2:
                         
                     payload = {
                         "embedding_model": emb,
+                        "llm_model": selected_llm_model,  # 一括評価用LLMモデルを追加
                         "chunk_methods": [method],
                         "chunk_sizes": [size] if size is not None else [1000],
                         "chunk_overlaps": [overlap] if overlap is not None else [200],
@@ -2029,6 +2135,7 @@ with tab2:
                         
                         # メタデータを追加
                         result['embedding_model'] = emb
+                        result['llm_model'] = selected_llm_model  # LLMモデル情報を追加
                         result['chunk_method'] = method
                         result['chunk_size'] = size
                         result['chunk_overlap'] = overlap
@@ -2061,16 +2168,16 @@ with tab2:
                 for emb in selected_embeddings:
                     for method, size, overlap in valid_combinations:
                         # 現在の評価ステータスを表示
-                        status_display.info(f"評価中: {emb}, {method}, size={size}, overlap={overlap}")
+                        status_display.info(f"評価中: LLM={selected_llm_model}, Emb={emb}, {method}, size={size}, overlap={overlap}")
                         
                         # 評価を実行
                         result = evaluate_single(emb, method, size, overlap)
                         
                         if result:
                             bulk_results.append(result)
-                            status_display.success(f"完了: {emb}, {method}, size={size}, overlap={overlap}")
+                            status_display.success(f"完了: LLM={selected_llm_model}, Emb={emb}, {method}, size={size}, overlap={overlap}")
                         else:
-                            status_display.warning(f"スキップ: {emb}, {method}, size={size}, overlap={overlap}")
+                            status_display.warning(f"スキップ: LLM={selected_llm_model}, Emb={emb}, {method}, size={size}, overlap={overlap}")
                         
                         # 少し待機（UIの更新のため）
                         import time
@@ -2144,7 +2251,7 @@ with tab2:
         
         # 必要カラム補完・ラベル列追加
         required_cols = {
-            'avg_chunk_len', 'num_chunks', 'overall_score', 'chunk_strategy', 'embedding_model',
+            'avg_chunk_len', 'num_chunks', 'overall_score', 'chunk_strategy', 'embedding_model', 'llm_model',
             'faithfulness', 'answer_relevancy', 'context_recall', 'context_precision', 'answer_correctness'
         }
         
@@ -2166,14 +2273,14 @@ with tab2:
         if missing_cols:
             st.info(f'不足しているカラムを補完します: {missing_cols}')
             for col in missing_cols:
-                if col in ['chunk_strategy', 'embedding_model']:
+                if col in ['chunk_strategy', 'embedding_model', 'llm_model']:
                     results_df[col] = 'unknown'
                 else:
                     results_df[col] = 0.0
         
-        # 重複を削除（同じchunk_strategyとembedding_modelの組み合わせで最初のエントリを保持）
+        # 重複を削除（同じchunk_strategy、embedding_model、llm_modelの組み合わせで最初のエントリを保持）
         results_df = results_df.drop_duplicates(
-            subset=['chunk_strategy', 'embedding_model'], 
+            subset=['chunk_strategy', 'embedding_model', 'llm_model'], 
             keep='first'
         )
         
@@ -2532,8 +2639,9 @@ with tab2:
                             plot_bgcolor='rgba(0,0,0,0)'
                         )
                         
-                        # レーダーチャートを表示
-                        st.plotly_chart(fig_radar, use_container_width=True)
+                        # レーダーチャートを表示（一意のkeyを追加）
+                        chart_key = f"radar_chart_{model_name}_{'_'.join(metrics_jp)}_{time.time()}"
+                        st.plotly_chart(fig_radar, use_container_width=True, key=chart_key)
                         st.markdown('<br>', unsafe_allow_html=True)
             
             # 結果をDataFrameに変換
