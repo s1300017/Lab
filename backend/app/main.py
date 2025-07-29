@@ -1896,7 +1896,8 @@ async def uploadfile(
         result = {
             "text": sample_text,
             "questions": questions,
-            "answers": answers
+            "answers": answers,
+            "qa_meta": qa_meta
         }
         print(f"[重要] 最終返却結果: qa_meta長={len(qa_meta)}, サンプル={qa_meta[:1] if qa_meta else 'None'}")
         return result
