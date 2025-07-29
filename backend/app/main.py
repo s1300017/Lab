@@ -1104,6 +1104,45 @@ async def bulk_evaluate(request: Request):
                 # ground_truthキーまたはanswersキーのどちらかを使用（互換性のため）
                 answers = data.get("ground_truth", data.get("answers"))
                 print(f"[DEBUG] qa_meta前: questions={questions}, answers={answers}, len_q={len(questions)}, len_a={len(answers)}")
+
+                # --- uploadfileと同等の日本語質問フィルタを適用 ---
+                def is_valid_japanese_question(q):
+                    import re
+                    if not re.search(r'[ぁ-んァ-ン一-龥]', q):
+                        return False
+                    exclude_patterns = [
+                        r'^Q\d*[:：]?\s*$', r'^A\d*[:：]?\s*$', r'以下の\d*つの質問', r'代表的な質問', r'Here are', r'英語', r'質問です', r'answers? to', r'^一意回答$', r'^A[:：]', r'^Q[:：]',
+                        r'^\d+[.．、)]?$', r'^\s*$', r'^\W+$'
+                    ]
+                    for pat in exclude_patterns:
+                        if re.search(pat, q):
+                            return False
+                    if re.match(r'^[\d\.\s]*$', q):
+                        return False
+                    if len(q.strip()) < 6:
+                        return False
+                    return True
+
+                # 質問・回答リストにフィルタ適用＆5件制限
+                if questions and answers and len(questions) == len(answers):
+                    filtered = [(q.strip(), a.strip()) for q, a in zip(questions, answers) if is_valid_japanese_question(q)]
+                    filtered = filtered[:5]  # 5件にtruncate
+                    questions = [q for q, a in filtered]
+                    answers = [a for q, a in filtered]
+                elif questions:
+                    filtered = [q.strip() for q in questions if is_valid_japanese_question(q)]
+                    filtered = filtered[:5]
+                    questions = filtered
+                    answers = [""] * len(questions)  # 回答がない場合は空欄
+                else:
+                    questions = []
+                    answers = []
+
+                print(f"[DEBUG] フィルタ後: questions={questions}, answers={answers}, len_q={len(questions)}, len_a={len(answers)}")
+
+                # --- フィルタ後に5件未満 or 空なら即エラー ---
+                if not questions or len(questions) < 5:
+                    raise ValueError("有効な日本語質問が5件未満です。英語や無効な質問が混入していないか確認してください。アップロード時のPDFやQAセットを見直してください。")
                 try:
                     import pandas as pd
                     if questions and answers and len(questions) == len(answers):
@@ -1857,8 +1896,7 @@ async def uploadfile(
         result = {
             "text": sample_text,
             "questions": questions,
-            "answers": answers,
-            "qa_meta": qa_meta
+            "answers": answers
         }
         print(f"[重要] 最終返却結果: qa_meta長={len(qa_meta)}, サンプル={qa_meta[:1] if qa_meta else 'None'}")
         return result

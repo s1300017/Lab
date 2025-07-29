@@ -19,6 +19,40 @@ import zipfile
 from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit_js_eval import streamlit_js_eval  # localStorage操作用
+
+# --- experiment_idによるQA・スコア復元関数 ---
+def restore_qa_from_backend():
+    """
+    experiment_idがsession_stateまたはlocalStorageにあれば、APIからQA・スコアを復元してsession_stateに格納
+    """
+    import requests
+    import os
+    experiment_id = st.session_state.get("experiment_id")
+    if not experiment_id:
+        # localStorageから取得（非同期→即時反映されないので注意）
+        experiment_id = streamlit_js_eval(
+            js_expressions="localStorage.getItem('rag_experiment_id')",
+            key="get_exp_id"
+        )
+        if experiment_id:
+            st.session_state["experiment_id"] = experiment_id
+            st.rerun()  # experiment_idセット後は即再読み込みしてAPI復元を確実に実行
+            return  # 2回目のロードで以降の処理が実行される
+    if experiment_id:
+        BACKEND_URL = os.environ.get('BACKEND_URL', st.secrets.get('BACKEND_URL', 'http://backend:8000'))
+        try:
+            response = requests.get(f"{BACKEND_URL}/api/v1/experiments/{experiment_id}/detailed_results/")
+            if response.status_code == 200:
+                data = response.json()
+                st.session_state["qa_questions"] = data.get("questions", [])
+                st.session_state["qa_answers"] = data.get("answers", [])
+                # --- スコア情報（qa_metaまたはscores）も復元 ---
+                scores = data.get("qa_meta") or data.get("scores") or []
+                st.session_state["qa_meta"] = scores  # どちらでもOKなように対応
+        except Exception as e:
+            st.warning(f"experiment_idからQA復元失敗: {e}")
+
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import matplotlib.font_manager as fm
@@ -1112,6 +1146,8 @@ def init_session_state():
     # --- chat_modelもllm_modelと同期して初期化 ---
     if 'chat_model' not in st.session_state:
         st.session_state.chat_model = st.session_state.llm_model
+    # --- experiment_idがあればQA・スコアをAPIから復元 ---
+    restore_qa_from_backend()  # 永続化されたQAデータを復元
 
 
 init_session_state()
@@ -1574,6 +1610,16 @@ with st.sidebar:
                         data = response.json()
                         if "file_id" in data:
                             st.session_state["file_id"] = data["file_id"]
+                        # --- experiment_idをセッションとlocalStorageに保存 ---
+                        if "experiment_id" in data:
+                            st.session_state["experiment_id"] = data["experiment_id"]
+                            # localStorageにも保存
+                            components.html(f"""
+                            <script>
+                            localStorage.setItem('rag_experiment_id', '{data['experiment_id']}');
+                            </script>
+                            """, height=0)
+                        # --- 既存のQAとスコアも保存 ---
                         if 'questions' in data and 'answers' in data:
                             st.session_state.text = data['text']
                             st.session_state.qa_questions = data['questions']
@@ -1583,10 +1629,7 @@ with st.sidebar:
                             # --- QA表示をスコア順で拡張表示 ---
                             qa_meta = data.get('qa_meta', [])
                             
-                            # デバッグ情報を表示
-                            st.write(f"**デバッグ情報**: questions={len(data['questions'])}, answers={len(data['answers'])}, qa_meta={len(qa_meta)}")
-                            if qa_meta:
-                                st.write(f"**qa_metaサンプル**: {qa_meta[0]}")
+                            # --- デバッグ情報・サンプル出力は削除 ---
                             
                             # qa_metaの長さをquestions/answersに合わせる
                             if len(qa_meta) < len(data['questions']):
@@ -1605,8 +1648,7 @@ with st.sidebar:
                             qa_tuples = list(zip(data['questions'], data['answers'], qa_meta))
                             # スコア降順でソート
                             qa_tuples_sorted = sorted(qa_tuples, key=lambda x: x[2].get('score', 0) if x[2] else 0, reverse=True)
-                            # --- 質問生成方法の説明を追加 ---
-                            with st.expander("🤖 自動質問生成の仕組み", expanded=False):
+                            with st.expander("🤖 自動質問・回答生成の仕組み（日本語対応）", expanded=False):
                                 st.markdown("""
                                 ### 質問生成プロセス
                                 
@@ -1639,28 +1681,25 @@ with st.sidebar:
                             st.write('### 自動生成QAセット（信頼性スコア順）')
                             with st.expander("信頼性スコアの計算式・説明", expanded=False):
                                 st.markdown('''
-- **信頼性スコア = 出現回数スコア + 回答長スコア**
-    - 出現回数スコア：同じ質問・同じ回答ペアが何回出現したか（多いほど信頼性が高い）
-    - 回答長スコア：回答の文字数を全体で正規化（最短=0, 最長=1）
-    
-**計算式（Python/pandasロジック）**
-```python
-qa_df["count_score"] = qa_df.groupby(["question", "answer"])['answer'].transform('count')
-qa_df["len_score"] = qa_df["answer"].apply(len)
-qa_df["len_score"] = (qa_df["len_score"] - qa_df["len_score"].min()) / (qa_df["len_score"].max() - qa_df["len_score"].min() + 1e-6)
-qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
-```
-- スコアが高いほど「多く出現し長い回答」＝信頼性が高いと判定されます。
-- 詳細なロジックはバックエンド`main.py`の該当箇所をご参照ください。
-''')
+                                - **信頼性スコア = 出現回数スコア + 回答長スコア**
+                                    - 出現回数スコア：同じ質問・同じ回答ペアが何回出現したか（多いほど信頼性が高い）
+                                    - 回答長スコア：回答の文字数を全体で正規化（最短=0, 最長=1）
+                                    
+                                **計算式（Python/pandasロジック）**
+                                ```python
+                                qa_df["count_score"] = qa_df.groupby(["question", "answer"])['answer'].transform('count')
+                                qa_df["len_score"] = qa_df["answer"].apply(len)
+                                qa_df["len_score"] = (qa_df["len_score"] - qa_df["len_score"].min()) / (qa_df["len_score"].max() - qa_df["len_score"].min() + 1e-6)
+                                qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
+                                ```
+                                - スコアが高いほど「多く出現し長い回答」＝信頼性が高いと判定されます。
+                                - 詳細なロジックはバックエンド`main.py`の該当箇所をご参照ください。
+                                ''')
                             for idx, (q, a, meta) in enumerate(qa_tuples_sorted):
                                 with st.expander(f"Q{idx+1}: {q}"):
                                     score = meta.get('score') if meta else None
                                     is_auto_fixed = meta.get('is_auto_fixed') if meta else False
                                     is_dummy_answer = meta.get('is_dummy_answer') if meta else False
-                                    
-                                    # デバッグ情報を表示
-                                    st.write(f"**デバッグ**: meta={meta}, is_dummy={is_dummy_answer}, is_auto_fixed={is_auto_fixed}")
                                     
                                     # バッジの設定（ダミー回答を優先表示）
                                     if is_dummy_answer:
