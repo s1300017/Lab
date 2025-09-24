@@ -34,14 +34,6 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # FastAPIアプリケーションの初期化
 app = FastAPI()
 
-# 評価履歴管理APIを統合
-try:
-    from .evaluation_history_api import router as history_router
-    app.include_router(history_router, prefix="/api/v1", tags=["evaluation_history"])
-    print(f"[{jst_now_str()}] [INFO] 評価履歴管理APIを統合しました")
-except ImportError as e:
-    print(f"[{jst_now_str()}] [WARNING] 評価履歴管理APIのインポートに失敗: {e}")
-
 # --- Dockerヘルスチェック用エンドポイント ---
 @app.get("/health")
 def health_check():
@@ -71,6 +63,38 @@ async def startup_event():
                 raise
             import time
             time.sleep(retry_delay)
+
+    # --- 起動時にOllamaモデルをバックグラウンドでウォームアップ（任意）---
+    try:
+        def _warmup():
+            try:
+                import urllib.request, urllib.error
+                import json as _json
+                base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+                targets = [
+                    {"model": "mistral:latest", "prompt": "ping", "stream": False},
+                    {"model": "llama3:latest", "prompt": "ping", "stream": False},
+                    {"model": "gpt-oss:20b", "prompt": "ping", "stream": False},
+                ]
+                for body in targets:
+                    try:
+                        req = urllib.request.Request(
+                            url=f"{base_url.rstrip('/')}/api/generate",
+                            data=_json.dumps(body).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            _ = resp.read()
+                        print(f"[ウォームアップ] {body['model']} 成功")
+                    except Exception as we:
+                        print(f"[ウォームアップ警告] {body.get('model')} 失敗: {we}")
+            except Exception as e:
+                print(f"[ウォームアップ初期化失敗] {e}")
+
+        threading.Thread(target=_warmup, daemon=True).start()
+    except Exception as e:
+        print(f"[ウォームアップ起動失敗] {e}")
 
 def init_db():
     print(f"[{jst_now_str()}] [DEBUG] init_db呼び出し")
@@ -105,73 +129,12 @@ def init_db():
                             context_recall FLOAT,
                             context_precision FLOAT,
                             answer_correctness FLOAT,
-                            experiment_id INTEGER,
-                            chunks_details JSONB,
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         );
                     """))
                     print(f"[{jst_now_str()}] [INFO] embeddingsテーブルを作成しました")
                 else:
                     print(f"[{jst_now_str()}] [INFO] embeddingsテーブルは既に存在します")
-                    
-                    # 既存のembeddingsテーブルにexperiment_idカラムが存在するかチェック
-                    column_check = conn.execute(text("""
-                        SELECT EXISTS (
-                            SELECT 1 FROM information_schema.columns 
-                            WHERE table_name = 'embeddings' AND column_name = 'experiment_id'
-                        )
-                    """))
-                    experiment_id_exists = column_check.scalar()
-                    
-                    if not experiment_id_exists:
-                        print(f"[{jst_now_str()}] [INFO] embeddingsテーブルにexperiment_idカラムを追加します")
-                        conn.execute(text("ALTER TABLE embeddings ADD COLUMN experiment_id INTEGER"))
-                        print(f"[{jst_now_str()}] [INFO] experiment_idカラムを追加しました")
-                    else:
-                        print(f"[{jst_now_str()}] [INFO] experiment_idカラムは既に存在します")
-                    
-                    # chunks_detailsカラムの存在チェック
-                    chunks_details_check = conn.execute(text("""
-                        SELECT EXISTS (
-                            SELECT 1 FROM information_schema.columns 
-                            WHERE table_name = 'embeddings' AND column_name = 'chunks_details'
-                        )
-                    """))
-                    chunks_details_exists = chunks_details_check.scalar()
-                    
-                    if not chunks_details_exists:
-                        print(f"[{jst_now_str()}] [INFO] embeddingsテーブルにchunks_detailsカラムを追加します")
-                        conn.execute(text("ALTER TABLE embeddings ADD COLUMN chunks_details JSONB"))
-                        print(f"[{jst_now_str()}] [INFO] chunks_detailsカラムを追加しました")
-                    else:
-                        print(f"[{jst_now_str()}] [INFO] chunks_detailsカラムは既に存在します")
-                
-                # experimentsテーブルの作成
-                result_exp = conn.execute(text(
-                    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'experiments');"
-                ))
-                exp_table_exists = result_exp.scalar()
-                
-                if not exp_table_exists:
-                    print(f"[{jst_now_str()}] [INFO] experimentsテーブルを作成します")
-                    conn.execute(text("""
-                        CREATE TABLE experiments (
-                            id SERIAL PRIMARY KEY,
-                            session_id TEXT NOT NULL,
-                            experiment_name TEXT,
-                            file_id TEXT,
-                            file_name TEXT,
-                            parameters JSONB,
-                            status TEXT DEFAULT 'running',
-                            total_combinations INTEGER DEFAULT 0,
-                            completed_combinations INTEGER DEFAULT 0,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        );
-                    """))
-                    print(f"[{jst_now_str()}] [INFO] experimentsテーブルを作成しました")
-                else:
-                    print(f"[{jst_now_str()}] [INFO] experimentsテーブルは既に存在します")
                     
                 # コミットは自動的に行われる
                 
@@ -199,39 +162,158 @@ threading.Thread(target=print_routes, daemon=True).start()
 from fastapi import UploadFile, File
 from PyPDF2 import PdfReader
 
+@app.post("/uploadfile/")
+async def uploadfile(file: UploadFile = File(...), cleanse: bool = Form(False), question_llm_model: str = Form("mistral"), answer_llm_model: str = Form("mistral")):
+    """
+    PDFアップロード時にテキスト抽出→LLMで質問自動生成→LLMで回答自動生成まで行い、
+    質問・回答セットを返すAPI。
+    """
+    print(f"[{jst_now_str()}][重要] uploadfile関数実行開始: ファイル名={file.filename}, サイズ={getattr(file, 'size', '不明')}")
+    print(f"[{jst_now_str()}][重要] ファイル情報: {file=}, タイプ={type(file)}")
+    import io
+    try:
+        file_id = str(uuid.uuid4())  # ← ここで必ずfile_idを発行
+        # 1. PDFからテキスト抽出
+        contents = await file.read()
+        print(f"[{jst_now_str()}][重要] ファイル読み込み完了: {len(contents)}バイト")
+        pdf_stream = io.BytesIO(contents)
+        print(f"[重要] BytesIOストリーム作成完了: {pdf_stream.getbuffer().nbytes}バイト")
+        try:
+            reader = PdfReader(pdf_stream)
+            print(f"[重要] PdfReader初期化成功: {len(reader.pages)}ページ")
+            text = ""
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                text += page_text
+                print(f"[重要] ページ抽出: {len(page_text)}文字")
+            # クレンジング処理（オプション）
+            if cleanse:
+                print("[重要] クレンジング処理を実施します")
+                text = cleanse_pdf_text(text)
+            sample_text = text[:3000] if len(text) > 3000 else text
+            print(f"[重要] PDF抽出完了: 合計{len(text)}文字, サンプル={sample_text[:100]}...")
+        except Exception as pdf_error:
+            print(f"[重要] PDF処理エラー: {pdf_error}")
+            return {"error": f"PDF処理エラー: {str(pdf_error)}"}
+        print("[重要] LLM質問生成開始 (GPT-OSS固定)")
+        # モデル指定は無視し、内部で常にGPT-OSSを使用
+        llm_q_instance = get_llm("gpt-oss")
+        prompt_q = f"""以下の内容に関する代表的な質問を日本語で5つ作成してください。\n---\n{text[:1500]}\n---\n質問："""
+        try:
+            questions_resp = llm_q_instance.invoke(prompt_q)
+            print(f"[重要] LLM質問生成レスポンス取得: {len(questions_resp.content)}文字")
+            questions = [q.strip() for q in questions_resp.content.split('\n') if q.strip()]
+            print(f"[重要] 質問リスト生成完了: {len(questions)}件")
+        except Exception as e:
+            print(f"[重要] LLM質問生成例外: {e}")
+            questions = []
+        if not questions:
+            import re
+            print("[重要] 正規表現によるQA/箇条書き抽出開始")
+            bullets = re.findall(r'^[\*\-\d\.]+\s*(.+)', text, re.MULTILINE)
+            qas = re.findall(r'Q[\d：: ]*(.+?)\nA[\d：: ]*(.+?)(?=\nQ|\n\Z)', text, re.DOTALL)
+            if qas:
+                questions = [q.strip() for q, a in qas]
+                answers = [a.strip() for q, a in qas]
+            elif bullets:
+                questions = bullets[:5]
+                answers = ["該当内容を本文から要約してください。"] * len(questions)
+            else:
+                paras = [p.strip() for p in text.split('\n') if p.strip()]
+                questions = [f"{p[:20]}について説明してください。" for p in paras[:5]]
+                answers = ["該当内容を本文から要約してください。"] * len(questions)
+        else:
+            answers = []
+            # モデル指定は無視し、内部で常にGPT-OSSを使用
+            llm_a_instance = get_llm("gpt-oss")
+            for i, q in enumerate(questions):
+                try:
+                    prompt_a = f"""
+以下の内容に基づいて、次の質問に日本語で簡潔に答えてください。\n---\n{sample_text}\n---\n質問: {q}\n回答：
+"""
+                    answer_resp = llm_a_instance.invoke(prompt_a)
+                    print(f"[DEBUG] answer_resp={{answer_resp}}, type={{type(answer_resp)}}")
+                    # 型ガード: content属性・str型対応
+                    if hasattr(answer_resp, "content"):
+                        answer = answer_resp.content.strip().split('\n')[0]
+                    elif isinstance(answer_resp, str):
+                        answer = answer_resp.strip().split('\n')[0]
+                    else:
+                        answer = str(answer_resp)
+                    print(f"[重要] LLM回答{{i+1}}生成完了: {{len(answer)}}文字")
+                    answers.append(answer)
+                except Exception as e:
+                    import traceback
+                    print(f"[重要] LLM回答{{i+1}}生成例外: {{e}}")
+                    traceback.print_exc()
+                    answers.append("該当内容を本文から要約してください。")
+        if not questions or not answers:
+            print("[重要] ダミーQAセットを返却（questions/answersが空）")
+            questions = ["この文書の主題は何ですか？"]
+            answers = ["本文を要約してください。"]
+        # --- qa_meta を生成（回答長の正規化スコア + ダミー回答フラグ）---
+        try:
+            max_len = max((len(a) for a in answers), default=1)
+            dummy_patterns = ["該当内容を本文から要約", "本文を要約して"]
+            qa_meta = []
+            for a in answers:
+                norm_len = (len(a) / max_len) if max_len else 0.0
+                is_dummy = any(pat in a for pat in dummy_patterns)
+                qa_meta.append({
+                    "score": float(round(norm_len, 3)),
+                    "is_auto_fixed": False,
+                    "is_dummy_answer": bool(is_dummy),
+                    "candidates": [a],
+                    "candidate_scores": [float(round(norm_len, 3))]
+                })
+        except Exception as e:
+            print(f"[警告] qa_meta生成時に例外: {e}。全件デフォルト値を設定します")
+            qa_meta = [{
+                "score": 1.0,
+                "is_auto_fixed": False,
+                "is_dummy_answer": False,
+                "candidates": [a],
+                "candidate_scores": [1.0]
+            } for a in answers]
 
+        print(f"[重要] API返却直前: questions={questions}, answers={answers}")
+        # 4. 抽出データ保存
+        extracted_path = EXTRACTED_DIR / f"{file_id}.json"
+        with open(extracted_path, "w", encoding="utf-8") as f_json:
+            json.dump({
+                "text": sample_text,
+                "questions": questions,
+                "answers": answers,
+                "qa_meta": qa_meta,
+                "file_name": file.filename,  # ←file_nameで統一
+            }, f_json, ensure_ascii=False)
+        # PDFファイル保存
+        pdf_path = PDF_DIR / f"{file_id}.pdf"
+        with open(pdf_path, "wb") as f_pdf:
+            f_pdf.write(contents)
+        # 5. file_id付きで返却
+        return {
+            "file_id": file_id,
+            "text": sample_text,
+            "questions": questions,
+            "answers": answers,
+            "qa_meta": qa_meta,
+            "file_name": file.filename,  # ←file_nameで統一
+        }
+    except Exception as e:
+        print(f"[重要] uploadfile全体例外: {e}")
+        return {"error": str(e)}
 
 # --- PDFクレンジング関数 ---
 def cleanse_pdf_text(text: str) -> str:
-    """
-    PDFテキストから表記号を日本語に変換し、ノイズ行や連続空白行を除去します。
-    表記号変換はAIが扱いやすいように日本語へ置換します。
-    Qiita記事（https://qiita.com/UKI_datascience/items/ba610c83c8f942f4b538）準拠。
-    """
     import re
-    # 1. 表記号→日本語変換
-    table_symbol_map = {
-        "│": "たて", "┃": "ふとたて", "─": "よこ", "━": "ふとよこ", "┏": "ひだりうえ", "┓": "みぎうえ",
-        "┗": "ひだりした", "┛": "みぎした", "├": "ひだり", "┤": "みぎ", "┬": "うえ", "┴": "した", "┼": "てん",
-        "|": "たて", "-": "よこ", "+": "てん", "＝": "よこ", "＝": "ふとよこ"
-    }
-    def replace_table_symbols(s):
-        for k, v in table_symbol_map.items():
-            s = s.replace(k, v)
-        return s
-    text = replace_table_symbols(text)
-    # 2. ノイズ行除去（Qiita記事例: 表形式や記号が多い行・短い行など）
     lines = text.split('\n')
-    cleansed = []
-    for line in lines:
-        # 罫線や記号が多い行の除去
-        if re.match(r'^[\sたてよこふとてんうえしたひだりみぎ]+$', line):
-            continue
-        # 3文字以下の短い行も除去（必要なら）
-        if len(line.strip()) <= 2:
-            continue
-        cleansed.append(line)
-    # 3. 連続空白行の削除
+    # 表形式やノイズ行の除去例
+    cleansed = [
+        line for line in lines
+        if not re.match(r'^\s*[\|\-]{2,}', line) and len(re.findall(r'\|', line)) < 3
+    ]
+    # 連続空白行の削除
     result = []
     prev_blank = False
     for line in cleansed:
@@ -243,7 +325,6 @@ def cleanse_pdf_text(text: str) -> str:
             result.append(line)
             prev_blank = False
     return '\n'.join(result)
-
 
 # --- 新規: file_idで抽出済みデータ取得API ---
 from fastapi import HTTPException
@@ -418,7 +499,6 @@ def semantic_chunk_text(text, chunk_size=None, chunk_overlap=None, embedding_mod
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_ollama import OllamaLLM
-from langchain_community.chat_models import ChatOllama
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores.pgvector import PGVector
@@ -431,14 +511,15 @@ from sqlalchemy.orm import sessionmaker
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-from ragas import evaluate
+from langchain_core.runnables import RunnableLambda
+from ragas import evaluate, RunConfig
 from ragas.metrics import (
     faithfulness,
     answer_relevancy,
     context_recall,
     context_precision,
     answer_correctness,  # 追加: 回答の正確性指標
-
+    answer_similarity,
 )
 from datasets import Dataset
 
@@ -450,6 +531,474 @@ LOCAL_MODEL_PATH = Path("/app/models/BAAI_bge-small-en-v1.5")
 import logging
 logging.basicConfig(level=logging.INFO)
 logging.info(f"[起動時] OPENAI_API_KEY: {os.getenv('OPENAI_API_KEY')}")
+
+# --- RAGAS互換ラッパー（set_run_config を要求する環境向け）---
+class RAGASCompatibleOllamaLLM:
+    """
+    RAGASが set_run_config を呼んでもエラーにしないための薄いラッパー。
+    それ以外の属性・メソッドは元のOllamaLLMに委譲する。
+    """
+    def __init__(self, model: str, base_url: str, **kwargs):
+        self._llm = OllamaLLM(model=model, base_url=base_url, **kwargs)
+
+    # RAGASが存在チェックすることがある
+    def set_run_config(self, config):
+        pass
+
+    # --- ここからRAGAS互換のためのプロンプト正規化ロジックを追加 ---
+    def _normalize_prompt_value(self, p):
+        """
+        LangChainのStringPromptValue/ChatPromptValue等が来ても
+        .to_string() で文字列化する。リスト/タプルは要素を再帰的に処理。
+        それ以外はstr()にフォールバック。
+        """
+        if p is None:
+            return ""
+        # StringPromptValue / ChatPromptValue を想定（duck-typing）
+        try:
+            to_str = getattr(p, "to_string", None)
+            if callable(to_str):
+                return to_str()
+        except Exception:
+            pass
+        # リスト/タプルは各要素を文字列化して結合（単一プロンプト扱い時）
+        if isinstance(p, (list, tuple)):
+            return " ".join(self._normalize_prompt_value(pi) for pi in p)
+        # すでに文字列ならそのまま、その他はstrにフォールバック
+        return p if isinstance(p, str) else str(p)
+
+    def _normalize_prompts(self, prompts):
+        """
+        RAGAS/LLMのgenerate系が期待する list[str] を必ず返す。
+        - StringPromptValue/ChatPromptValue → [str]
+        - str → [str]
+        - list/tuple → 各要素を文字列化
+        - それ以外 → [str(obj)]
+        """
+        # 文字列化可能なPromptValue（to_string持ち）を単一として扱う
+        try:
+            to_str = getattr(prompts, "to_string", None)
+            if callable(to_str):
+                return [to_str()]
+        except Exception:
+            pass
+        if isinstance(prompts, str):
+            return [prompts]
+        if isinstance(prompts, (list, tuple)):
+            return [self._normalize_prompt_value(p) for p in prompts]
+        return [self._normalize_prompt_value(prompts)]
+
+    def _sanitize_kwargs(self, kwargs: dict) -> dict:
+        """OllamaLLMが受け付けないkwargを除去する。
+        代表的にはOpenAI系の `n`, `best_of`, `logprobs`, `echo` に加え、
+        Ollamaの低レベルclient.generateがトップレベルでは受け付けない
+        生成制御系（temperature, max_tokens, top_p, top_k, num_predict, stop, seed）を除去。
+        """
+        if not kwargs:
+            return {}
+        drop_keys = {
+            "n",
+            "best_of",
+            "logprobs",
+            "top_logprobs",
+            "echo",
+            "presence_penalty",
+            "frequency_penalty",
+            # 低レベルclient.generateにトップレベルで渡すとTypeErrorになる代表例
+            "temperature",
+            "max_tokens",   # OpenAI系 → Ollamaはoptions.num_predict
+            "top_p",
+            "top_k",
+            "num_predict",
+            "stop",
+            "seed",
+        }
+        return {k: v for k, v in kwargs.items() if k not in drop_keys}
+
+    # RAGASが直接呼び出すことがあるAPIをラップ
+    def generate(self, prompts, **kwargs):
+        """promptsをlist[str]へ正規化してから委譲"""
+        norm = self._normalize_prompts(prompts)
+        safe_kwargs = self._sanitize_kwargs(kwargs)
+        return self._llm.generate(norm, **safe_kwargs)
+
+    async def agenerate(self, prompts, **kwargs):
+        """promptsをlist[str]へ正規化してから委譲（async）"""
+        norm = self._normalize_prompts(prompts)
+        safe_kwargs = self._sanitize_kwargs(kwargs)
+        # 一部の実装でagenerateが存在しても同期返却の場合があるため awaitable 判定を行う
+        if hasattr(self._llm, "agenerate"):
+            try:
+                res = self._llm.agenerate(norm, **safe_kwargs)
+                import inspect
+                if inspect.isawaitable(res):
+                    return await res
+                # 同期返却（list/LLMResultなど）の場合はそのまま返す
+                return res
+            except TypeError:
+                # 同期実装に対してawaitしてしまった等の互換性問題に備えフォールバック
+                pass
+        # フォールバック：スレッドでgenerateを呼ぶ
+        import asyncio
+        return await asyncio.to_thread(self._llm.generate, norm, **safe_kwargs)
+
+    def invoke(self, prompt, **kwargs):
+        """単一プロンプト入力のラッパー。Runnable互換向け"""
+        text = self._normalize_prompt_value(prompt)
+        safe_kwargs = self._sanitize_kwargs(kwargs)
+        if hasattr(self._llm, "invoke"):
+            return self._llm.invoke(text, **safe_kwargs)
+        # フォールバック：generateの最初のテキストを返す
+        res = self._llm.generate([text], **safe_kwargs)
+        try:
+            # LangChain LLMResult 互換の取り出し
+            return res.generations[0][0].text
+        except Exception:
+            return res
+
+    async def ainvoke(self, prompt, **kwargs):
+        """単一プロンプト入力の非同期ラッパー。Runnable互換向け"""
+        text = self._normalize_prompt_value(prompt)
+        safe_kwargs = self._sanitize_kwargs(kwargs)
+        if hasattr(self._llm, "ainvoke"):
+            try:
+                res = self._llm.ainvoke(text, **safe_kwargs)
+                import inspect
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+            except TypeError:
+                pass
+        # フォールバック：agenerate→最初のテキストを返す
+        if hasattr(self._llm, "agenerate"):
+            try:
+                res0 = self._llm.agenerate([text], **safe_kwargs)
+                import inspect
+                if inspect.isawaitable(res0):
+                    res = await res0
+                else:
+                    res = res0
+            except TypeError:
+                # フォールバック：スレッドでgenerate
+                import asyncio
+                res = await asyncio.to_thread(self._llm.generate, [text], **safe_kwargs)
+        else:
+            import asyncio
+            res = await asyncio.to_thread(self._llm.generate, [text], **safe_kwargs)
+        try:
+            return res.generations[0][0].text
+        except Exception:
+            return res
+    # --- ここまで追加 ---
+
+    @property
+    def client(self):
+        """RAGASや内部実装が直接 .client.generate(**kwargs) を呼んでも
+        受け付けないkwarg（例: n）を除去できるようにプロキシを返す。
+        """
+        try:
+            base_client = getattr(self._llm, "client")
+        except Exception:
+            return None
+        return _RAGASSafeClientProxy(base_client, self._sanitize_kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._llm, name)
+
+    def set_run_config(self, config):
+        """RAGAS互換のためのno-op。"""
+        pass
+
+
+class _RAGASSafeClientProxy:
+    """Ollamaの低レベルclientへの呼び出しをラップし、
+    OpenAI互換kwarg（n等）を除去してから委譲する簡易プロキシ。
+    """
+    def __init__(self, client, sanitize_fn):
+        self._client = client
+        self._sanitize_fn = sanitize_fn
+
+    async def generate(self, *args, **kwargs):
+        """非同期で低レベルclient.generateを実行。
+        ragas側がawaitしてもTypeErrorにならないようにするため、to_threadで包む。
+        """
+        safe_kwargs = self._sanitize_fn(kwargs)
+        import asyncio
+        return await asyncio.to_thread(self._client.generate, *args, **safe_kwargs)
+
+    async def agenerate(self, *args, **kwargs):
+        """generateのエイリアス（async）。"""
+        return await self.generate(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
+class RAGASLLMAsyncAdapter:
+    """
+    RAGASが llm.generate(...) を await する経路に入っても例外にならないよう、
+    generate/invoke を非同期対応で提供するアダプタ。
+    既存の `RAGASCompatibleOllamaLLM` を内包して使うことを想定。
+    """
+    def __init__(self, llm):
+        self._llm = llm
+
+    def _sanitize_kwargs(self, kwargs: dict) -> dict:
+        try:
+            # 既存ラッパのサニタイズを流用
+            return self._llm._sanitize_kwargs(kwargs)
+        except Exception:
+            # 最低限の防御（OpenAI系の代表キーを除去）
+            drop_keys = {
+                "n", "best_of", "logprobs", "top_logprobs", "echo",
+                "presence_penalty", "frequency_penalty",
+                "temperature", "max_tokens", "top_p", "top_k",
+                "num_predict", "stop", "seed",
+            }
+            return {k: v for k, v in (kwargs or {}).items() if k not in drop_keys}
+
+    async def generate(self, prompts, **kwargs):
+        """await 可能な generate を提供。内部で agenerate か to_thread を使用"""
+        safe_kwargs = self._sanitize_kwargs(kwargs)
+        # agenerate が存在しても同期返却の場合があるため awaitable 判定を行う
+        if hasattr(self._llm, "agenerate"):
+            try:
+                res = self._llm.agenerate(prompts, **safe_kwargs)
+                import inspect
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+            except Exception:
+                pass
+        # フォールバック：スレッドでgenerate
+        import asyncio
+        return await asyncio.to_thread(self._llm.generate, prompts, **safe_kwargs)
+
+    async def agenerate(self, prompts, **kwargs):
+        return await self.generate(prompts, **kwargs)
+
+    async def invoke(self, prompt, **kwargs):
+        safe_kwargs = self._sanitize_kwargs(kwargs)
+        if hasattr(self._llm, "ainvoke"):
+            try:
+                res = self._llm.ainvoke(prompt, **safe_kwargs)
+                import inspect
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+            except Exception:
+                pass
+        # フォールバック：スレッドでinvoke
+        import asyncio
+        return await asyncio.to_thread(self._llm.invoke, prompt, **safe_kwargs)
+
+    async def ainvoke(self, prompt, **kwargs):
+        return await self.invoke(prompt, **kwargs)
+
+    @property
+    def client(self):
+        try:
+            base_client = getattr(self._llm, "client")
+        except Exception:
+            return None
+        return _RAGASSafeClientProxy(base_client, getattr(self._llm, "_sanitize_kwargs", lambda x: x))
+
+    def __getattr__(self, name):
+        return getattr(self._llm, name)
+
+
+class RAGASCompatibleOllamaEmbeddings:
+    """
+    RAGASが set_run_config を呼んでもエラーにしないための薄いラッパー。
+    それ以外の属性・メソッドは元のOllamaEmbeddingsに委譲する。
+    """
+    def __init__(self, model: str, base_url: str):
+        self._emb = OllamaEmbeddings(model=model, base_url=base_url)
+
+    def set_run_config(self, config):
+        pass
+
+    async def embed_text(self, text: str):
+        """RAGASがawaitしても安全な単一テキスト埋め込みAPI（async）。"""
+        import asyncio
+        if hasattr(self._emb, "embed_query"):
+            return await asyncio.to_thread(self._emb.embed_query, text)
+        # フォールバック: embed_documents に単一要素リストで委譲
+        vecs = await asyncio.to_thread(self._emb.embed_documents, [text])
+        return vecs[0] if vecs else []
+
+    async def aembed_text(self, text: str):
+        """非同期版。ragas 側が await しても安全。"""
+        # embed_text 自体が async なのでそのまま await する
+        return await self.embed_text(text)
+
+    def embed_documents(self, texts):
+        # ベクトルストア（PGVector）が同期メソッドを期待するため同期で提供
+        return self._emb.embed_documents(texts)
+
+    def embed_query(self, text: str):
+        # ベクトルストア（PGVector）が同期メソッドを期待するため同期で提供
+        try:
+            if isinstance(self._model_name, str) and "jina-embeddings-v4" in self._model_name:
+                client = getattr(self._emb, "client", None)
+                if client is not None and hasattr(client, "encode"):
+                    vec = client.encode(
+                        sentences=[text],
+                        task="retrieval",
+                        prompt_name="query",
+                        normalize_embeddings=True,
+                    )[0]
+                    # SentenceTransformerはnumpyを返すことがあるためlist化
+                    return vec.tolist() if hasattr(vec, "tolist") else vec
+        except Exception:
+            # 失敗時はフォールバック
+            pass
+        return self._emb.embed_query(text)
+
+    async def aembed_documents(self, texts):
+        import asyncio
+        # 同期版 embed_documents に委譲（上のv4専用分岐を再利用）
+        return await asyncio.to_thread(self.embed_documents, texts)
+
+    def __getattr__(self, name):
+        return getattr(self._emb, name)
+
+
+class RAGASCompatibleHuggingFaceEmbeddings:
+    """
+    RAGASが embeddings.set_run_config を呼んでもエラーにしないための薄いラッパー。
+    それ以外の属性・メソッドは元のHuggingFaceEmbeddingsに委譲する。
+    """
+    def __init__(self, model_name: str, **kwargs):
+        # 元のHuggingFaceEmbeddingsを内部に保持
+        # kwargsにはdeviceやencode_kwargsなどが含まれる
+        self._model_name = model_name
+        self._emb = HuggingFaceEmbeddings(model_name=model_name, **kwargs)
+        # 一度だけログを出すためのフラグ（スパム防止）
+        self._log_once = {"doc": False, "qry": False, "doc_fallback": False, "qry_fallback": False}
+
+    def set_run_config(self, config):
+        # RAGAS互換のためのno-op
+        pass
+
+    async def embed_text(self, text: str):
+        """RAGASがawaitしても安全な単一テキスト埋め込みAPI（async）。"""
+        import asyncio
+        if hasattr(self._emb, "embed_query"):
+            return await asyncio.to_thread(self._emb.embed_query, text)
+        vecs = await asyncio.to_thread(self._emb.embed_documents, [text])
+        return vecs[0] if vecs else []
+
+    async def aembed_text(self, text: str):
+        # embed_text 自体が async なのでそのまま await する
+        return await self.embed_text(text)
+
+    def embed_documents(self, texts):
+        # jina-embeddings-v4 は Retrieval タスクで passage/query のプロンプトを切替える必要がある
+        try:
+            if isinstance(self._model_name, str) and "jina-embeddings-v4" in self._model_name:
+                client = getattr(self._emb, "_client", None) or getattr(self._emb, "client", None)
+                if client is not None and hasattr(client, "encode"):
+                    # Passage 用のプロンプトを指定（正規化も実施）
+                    vecs = client.encode(
+                        sentences=texts,
+                        task="retrieval",
+                        prompt_name="passage",
+                        normalize_embeddings=True,
+                    )
+                    if not self._log_once["doc"]:
+                        print("[emb] Jina v4 encode(passages) path used: task=retrieval, prompt_name=passage, normalize_embeddings=True")
+                        self._log_once["doc"] = True
+                    return vecs.tolist() if hasattr(vecs, "tolist") else vecs
+        except Exception:
+            # 失敗時はフォールバック
+            pass
+        if not self._log_once["doc_fallback"]:
+            print("[emb] embed_documents fallback path used (HuggingFaceEmbeddings)")
+            self._log_once["doc_fallback"] = True
+        return self._emb.embed_documents(texts)
+
+    async def aembed_documents(self, texts):
+        import asyncio
+        return await asyncio.to_thread(self._emb.embed_documents, texts)
+
+    def embed_query(self, text: str):
+        # ベクトルストア（PGVector）が同期メソッドを期待するため同期で提供
+        # Jina v4 ではクエリ用プロンプトとタスクを明示する
+        try:
+            if isinstance(self._model_name, str) and "jina-embeddings-v4" in self._model_name:
+                client = getattr(self._emb, "_client", None) or getattr(self._emb, "client", None)
+                if client is not None and hasattr(client, "encode"):
+                    vec = client.encode(
+                        sentences=[text],
+                        task="retrieval",
+                        prompt_name="query",
+                        normalize_embeddings=True,
+                    )[0]
+                    if not self._log_once["qry"]:
+                        print("[emb] Jina v4 encode(query) path used: task=retrieval, prompt_name=query, normalize_embeddings=True")
+                        self._log_once["qry"] = True
+                    return vec.tolist() if hasattr(vec, "tolist") else vec
+        except Exception:
+            # 失敗時はフォールバック
+            pass
+        if not self._log_once["qry_fallback"]:
+            print("[emb] embed_query fallback path used (HuggingFaceEmbeddings)")
+            self._log_once["qry_fallback"] = True
+        return self._emb.embed_query(text)
+
+    async def aembed_query(self, text: str):
+        import asyncio
+        # 同期版 embed_query に委譲（上のv4専用分岐を再利用）
+        return await asyncio.to_thread(self.embed_query, text)
+
+    def __getattr__(self, name):
+        # それ以外の属性アクセスは内部の実体に委譲
+        return getattr(self._emb, name)
+
+
+class RAGASCompatibleOpenAIEmbeddings:
+    """
+    RAGASが set_run_config を呼んでもエラーにしないための薄いラッパー。
+    OpenAIEmbeddings のインスタンスを内包し、必要メソッドを委譲する。
+    """
+    def __init__(self, **kwargs):
+        # OpenAIEmbeddings は model / api_key などを kwargs で受け取る
+        self._emb = OpenAIEmbeddings(**kwargs)
+
+    def set_run_config(self, config):
+        # RAGAS互換のためのno-op
+        pass
+
+    async def embed_text(self, text: str):
+        # 非同期で単一テキストの埋め込み（RAGAS側がawaitしても安全）
+        import asyncio
+        if hasattr(self._emb, "embed_query"):
+            return await asyncio.to_thread(self._emb.embed_query, text)
+        vecs = await asyncio.to_thread(self._emb.embed_documents, [text])
+        return vecs[0] if vecs else []
+
+    async def aembed_text(self, text: str):
+        return await self.embed_text(text)
+
+    def embed_documents(self, texts):
+        # PGVector 等が同期メソッドを期待するため同期で提供
+        return self._emb.embed_documents(texts)
+
+    def embed_query(self, text: str):
+        # PGVector 等が同期メソッドを期待するため同期で提供
+        return self._emb.embed_query(text)
+
+    async def aembed_documents(self, texts):
+        import asyncio
+        return await asyncio.to_thread(self._emb.embed_documents, texts)
+
+    async def aembed_query(self, text: str):
+        import asyncio
+        return await asyncio.to_thread(self._emb.embed_query, text)
+
+    def __getattr__(self, name):
+        return getattr(self._emb, name)
 
 
 # データベース接続設定
@@ -467,30 +1016,19 @@ def get_collection_name(model_name: str) -> str:
 # --- Model Selection ---
 def get_llm(model_name: str):
     """
-    モデル名に応じてLLMインスタンスを返す。
-    models.yamlのname（例: 'mistral', 'gpt-4o-mini'）にも対応。
-    未対応モデルは詳細付きで例外。
+    内部LLMは常に GPT-OSS に固定します（gpt-oss:20b on Ollama）。
+    引数 model_name は互換性維持のため受け取りますが、無視されます。
     """
-    # OpenAI系モデル名はすべてこの分岐で返す
-    openai_models = ["gpt-4o", "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"]
-    if model_name in openai_models:
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if openai_api_key is None:
-            raise ValueError("OPENAI_API_KEY environment variable is not set")
-        # モデル名に応じてChatOpenAIインスタンスを返す
-        return ChatOpenAI(model=model_name, temperature=0, openai_api_key=openai_api_key)
-    elif model_name == "ollama_llama2":
-        # llama2:7bモデルをOllamaで呼び出す
-        return ChatOllama(model="llama2:7b", base_url="http://host.docker.internal:11434", temperature=0)
-    elif model_name == "llama3":
-        # llama3:latestモデルをOllamaで呼び出す
-        return ChatOllama(model="llama3:latest", base_url="http://host.docker.internal:11434", temperature=0)
-    elif model_name == "mistral":
-        # mistral:latestモデルをOllamaで呼び出す
-        return ChatOllama(model="mistral:latest", base_url="http://host.docker.internal:11434", temperature=0)
-    else:
-        # 日本語で詳細も返す
-        raise ValueError(f"未対応のLLMモデルが指定されました: {model_name}")
+    # Ollamaの接続先は環境変数から取得（未指定時はDocker内サービス名を既定値とする）
+    # 例: ホスト上のOllamaを使う場合は OLLAMA_BASE_URL=http://host.docker.internal:11434
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+    try:
+        if model_name not in (None, "gpt-oss", "gpt-oss:20b"):
+            print(f"[INFO] get_llm: 要求モデル '{model_name}' を無視し、GPT-OSS(gpt-oss:20b)を使用します")
+    except Exception:
+        # 念のため例外は握りつぶす（ログ用途のみのため）
+        pass
+    return RAGASCompatibleOllamaLLM(model="gpt-oss:20b", base_url=ollama_base_url)
 
 
 # 利用可能なデバイスを自動判定（Apple Siliconならmps, NVIDIAならcuda, どちらもなければcpu）
@@ -511,7 +1049,34 @@ def get_torch_device():
 
 def get_embeddings(model_name: str):
     device = get_torch_device()  # デバイス自動判定
+    common_kwargs = {
+        'model_kwargs': {
+            'device': device,
+            'trust_remote_code': True
+        },
+        'encode_kwargs': {
+            'normalize_embeddings': True
+        }
+    }
     
+    # Ollama埋め込みモデル（優先使用）
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+    ollama_embedding_models = {
+        "nomic-embed-text": "nomic-embed-text",
+        "mxbai-embed-large": "mxbai-embed-large",
+        "all-minilm": "all-minilm",
+        # 日本語/多言語対応のモデル（Ollama）
+        # 事前に `ollama pull bge-m3` / `ollama pull jina-embeddings-v3` を実行しておくこと
+        "bge-m3": "bge-m3",
+        "jina-embeddings-v3": "jina-embeddings-v3",
+    }
+    if model_name in ollama_embedding_models:
+        # RAGAS互換の薄いラッパーで包む（set_run_config 要求に対応）
+        return RAGASCompatibleOllamaEmbeddings(
+            model=ollama_embedding_models[model_name],
+            base_url=ollama_base_url,
+        )
+
     # OpenAIモデルのマッピング
     openai_models = {
         "gpt-4o": "text-embedding-ada-002",  # 旧モデル名との互換性のため
@@ -521,42 +1086,46 @@ def get_embeddings(model_name: str):
     }
     
     if model_name in openai_models:
-        return OpenAIEmbeddings(
+        return RAGASCompatibleOpenAIEmbeddings(
             model=openai_models[model_name],
             openai_api_key=os.getenv("OPENAI_API_KEY")
         )
     
-    # ローカルHuggingFaceモデルのマッピング（GPU加速対応）
-    local_hf_models = {
-        "huggingface_bge_small": "/app/local_models/models/bge-small-en-v1.5",
-        "huggingface_bge_large": "/app/local_models/models/bge-large-en-v1.5",
-        "huggingface_miniLM": "/app/local_models/models/all-MiniLM-L6-v2",
-        "huggingface_mpnet_base": "/app/local_models/models/all-mpnet-base-v2",
-        "huggingface_multi_qa_minilm": "/app/local_models/models/multi-qa-MiniLM-L6-cos-v1",
-        "huggingface_multi_qa_mpnet": "/app/local_models/models/multi-qa-mpnet-base-dot-v1",
-        "huggingface_paraphrase_multilingual": "/app/local_models/models/paraphrase-multilingual-MiniLM-L12-v2",
-        "huggingface_distiluse_multilingual": "/app/local_models/models/distiluse-base-multilingual-cased-v2",
-        "huggingface_xlm_r": "/app/local_models/models/xlm-r-100langs-bert-base-nli-stsb-mean-tokens"
+    # HuggingFaceモデルのマッピング
+    hf_models = {
+        "huggingface_bge_small": "BAAI/bge-small-en-v1.5",
+        "huggingface_bge_large": "BAAI/bge-large-en-v1.5",
+        "huggingface_miniLM": "sentence-transformers/all-MiniLM-L6-v2",
+        "huggingface_mpnet_base": "sentence-transformers/all-mpnet-base-v2",
+        "huggingface_multi_qa_minilm": "sentence-transformers/multi-qa-MiniLM-L6-cos-v1",
+        "huggingface_multi_qa_mpnet": "sentence-transformers/multi-qa-mpnet-base-dot-v1",
+        "huggingface_paraphrase_multilingual": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "huggingface_distiluse_multilingual": "sentence-transformers/distiluse-base-multilingual-cased-v2",
+        "huggingface_xlm_r": "sentence-transformers/xlm-r-100langs-bert-base-nli-stsb-mean-tokens",
+        # --- Jina Embeddings v4 (HuggingFace) ---
+        # 多言語・マルチモーダル埋め込み。text-only用途ではRetrieval(task)を使用。
+        "jina-embeddings-v4": "jinaai/jina-embeddings-v4",
     }
     
-    if model_name in local_hf_models:
-        local_path = local_hf_models[model_name]
-        print(f"[INFO] ローカル埋め込みモデルを使用: {local_path} (device: {device})")
-        
-        # GPU加速対応のHuggingFaceEmbeddingsを作成
-        common_kwargs = {
-            'model_kwargs': {
-                'device': device,  # Metal GPU (mps) または CUDA
-                'trust_remote_code': True
-            },
-            'encode_kwargs': {
-                'normalize_embeddings': True,
-                'device': device  # エンコード時もGPUを使用
-            }
-        }
-        
-        return HuggingFaceEmbeddings(
-            model_name=local_path,
+    if model_name in hf_models:
+        # Jina Embeddings v4 はエンコード前にタスク指定が必須
+        # 参考: エラーメッセージ "Task must be specified before encoding data..."
+        if model_name == "jina-embeddings-v4":
+            # 初期化時に default_task は渡さず、エンコード時に task を指定する
+            return RAGASCompatibleHuggingFaceEmbeddings(
+                model_name=hf_models[model_name],
+                model_kwargs={
+                    'device': device,
+                    'trust_remote_code': True,
+                },
+                encode_kwargs={
+                    'normalize_embeddings': True,
+                    'task': 'retrieval',
+                }
+            )
+        # それ以外は共通設定を適用
+        return RAGASCompatibleHuggingFaceEmbeddings(
+            model_name=hf_models[model_name],
             **common_kwargs
         )
     
@@ -567,19 +1136,13 @@ def get_embeddings(model_name: str):
 current_llm = None
 current_embeddings = None
 
-# デフォルトでHuggingFaceのモデルを使用
+# 内部LLMはGPT-OSS固定
 try:
-    # まずは軽量モデルを試す
-    current_llm = get_llm("ollama_llama2")
+    current_llm = get_llm("gpt-oss")
 except Exception as e:
     import logging
-    logging.warning(f"LLM初期化失敗 (ollama_llama2): {e}")
-    try:
-        # 代替モデルを試す
-        current_llm = get_llm("mistral")
-    except Exception as e2:
-        logging.warning(f"LLM初期化失敗 (mistral): {e2}")
-        current_llm = None
+    logging.warning(f"LLM初期化失敗 (gpt-oss): {e}")
+    current_llm = None
 
 try:
     # デフォルトでHuggingFaceの軽量モデルを使用
@@ -897,89 +1460,51 @@ def calculate_overlap_metrics(contexts: list[list[str]], embedder=None) -> dict:
 @app.post("/clear_db/")
 def clear_db():
     """
-    すべてのDBデータを完全削除するAPI。
-    - ベクターストアコレクションの削除
-    - embeddingsテーブルの全データ削除
-    - experimentsテーブルの全データ削除
+    すべてのembeddingモデルのコレクション（DBデータ）を完全削除するAPI。
+    主要embeddingモデル（huggingface_bge_small, openai等）すべてをループで削除。
     """
     try:
-        print(f"[{jst_now_str()}] [INFO] DB全体リセット開始")
+        if not LOCAL_MODEL_PATH.exists():
+            return {
+                "status": "error",
+                "message": f"モデルが見つかりません: {LOCAL_MODEL_PATH}。DBリセット不可。",
+                "model_exists": False
+            }
+        # 削除対象embeddingモデルリスト
+        embedding_models = ["huggingface_bge_small", "gpt-4o"]
         results = []
-        
-        # 1. PostgreSQLテーブルのデータ削除
-        try:
-            with engine.connect() as conn:
-                with conn.begin():
-                    # embeddingsテーブルの全データ削除
-                    embeddings_result = conn.execute(text("DELETE FROM embeddings"))
-                    embeddings_count = embeddings_result.rowcount
-                    results.append(f"embeddingsテーブル: {embeddings_count}件削除")
-                    print(f"[{jst_now_str()}] [INFO] embeddingsテーブル: {embeddings_count}件削除")
-                    
-                    # experimentsテーブルの全データ削除
-                    experiments_result = conn.execute(text("DELETE FROM experiments"))
-                    experiments_count = experiments_result.rowcount
-                    results.append(f"experimentsテーブル: {experiments_count}件削除")
-                    print(f"[{jst_now_str()}] [INFO] experimentsテーブル: {experiments_count}件削除")
-                    
-                    # シーケンスのリセット
-                    conn.execute(text("ALTER SEQUENCE embeddings_id_seq RESTART WITH 1"))
-                    conn.execute(text("ALTER SEQUENCE experiments_id_seq RESTART WITH 1"))
-                    results.append("シーケンスリセット完了")
-                    print(f"[{jst_now_str()}] [INFO] シーケンスリセット完了")
-        except Exception as db_error:
-            error_msg = f"PostgreSQLテーブル削除エラー: {str(db_error)}"
-            results.append(error_msg)
-            print(f"[{jst_now_str()}] [ERROR] {error_msg}")
-        
-        # 2. ベクターストアコレクションの削除
-        if LOCAL_MODEL_PATH.exists():
-            # 削除対象embeddingモデルリスト
-            embedding_models = ["huggingface_bge_small", "huggingface_bge_large", "gpt-4o", "text-embedding-3-large"]
-            for emb_model in embedding_models:
-                try:
-                    if emb_model in ["huggingface_bge_small", "huggingface_bge_large"]:
-                        dummy_embeddings = HuggingFaceEmbeddings(
-                            model_name=str(LOCAL_MODEL_PATH),
-                            model_kwargs={'device': 'cpu', 'trust_remote_code': True},
-                            encode_kwargs={'normalize_embeddings': True}
-                        )
-                    elif emb_model in ["gpt-4o", "text-embedding-3-large"]:
-                        from langchain_openai import OpenAIEmbeddings
-                        dummy_embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
-                    else:
-                        continue
-                    
-                    vectorstore = PGVector.from_documents(
-                        documents=[],
-                        embedding=dummy_embeddings,
-                        collection_name=get_collection_name(emb_model)
+        for emb_model in embedding_models:
+            try:
+                if emb_model == "huggingface_bge_small":
+                    dummy_embeddings = HuggingFaceEmbeddings(
+                        model_name=str(LOCAL_MODEL_PATH),
+                        model_kwargs={'device': 'cpu', 'trust_remote_code': True},
+                        encode_kwargs={'normalize_embeddings': True}
                     )
-                    vectorstore.delete_collection()
-                    results.append(f"{emb_model}コレクション: 削除成功")
-                    print(f"[{jst_now_str()}] [INFO] {emb_model}コレクション削除成功")
-                except Exception as e:
-                    error_msg = f"{emb_model}コレクション: 削除失敗 ({str(e)})"
-                    results.append(error_msg)
-                    print(f"[{jst_now_str()}] [ERROR] {error_msg}")
-        else:
-            results.append(f"モデルが見つかりません: {LOCAL_MODEL_PATH}. ベクターストアコレクションの削除をスキップ")
-        
-        print(f"[{jst_now_str()}] [INFO] DB全体リセット完了")
+                elif emb_model == "gpt-4o":
+                    from langchain_openai import OpenAIEmbeddings
+                    dummy_embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
+                else:
+                    continue
+                vectorstore = PGVector.from_documents(
+                    documents=[],  # 空のドキュメントで初期化
+                    embedding=dummy_embeddings,
+                    collection_name=get_collection_name(emb_model)
+                )
+                vectorstore.delete_collection()
+                results.append(f"{emb_model}: 削除成功")
+            except Exception as e:
+                results.append(f"{emb_model}: 削除失敗 ({str(e)})")
         return {
             "status": "success",
-            "message": "全DBデータを削除しました。",
+            "message": "全embeddingモデルのコレクションを削除しました。",
             "details": results,
-            "model_exists": LOCAL_MODEL_PATH.exists()
+            "model_exists": True
         }
     except Exception as e:
-        error_msg = f"DB全体削除時エラー: {str(e)}"
-        print(f"[{jst_now_str()}] [ERROR] {error_msg}")
-        import traceback
-        traceback.print_exc()
         return {
             "status": "error",
-            "message": error_msg,
+            "message": f"DB全体削除時エラー: {str(e)}",
             "model_exists": LOCAL_MODEL_PATH.exists()
         }
 
@@ -988,26 +1513,18 @@ def get_available_models():
     """
     利用可能なモデルと現在のモデル状態を返します。
     """
-    # HuggingFaceキャッシュディレクトリでの存在チェック
-    hf_cache_path = Path("/app/.cache/huggingface/hub/models--BAAI--bge-small-en-v1.5")
-    model_exists = hf_cache_path.exists() or LOCAL_MODEL_PATH.exists()
-    
-    # 実際に存在するパスを使用
-    actual_path = hf_cache_path if hf_cache_path.exists() else LOCAL_MODEL_PATH
-    
+    model_exists = LOCAL_MODEL_PATH.exists()
     model_info = {
         "model_name": str(MODEL_NAME),
         "local_path": str(LOCAL_MODEL_PATH),
-        "hf_cache_path": str(hf_cache_path),
-        "actual_path": str(actual_path),
         "exists": model_exists,
         "size_mb": (
-            sum(f.stat().st_size for f in actual_path.glob('**/*') if f.is_file()) / (1024 * 1024)
+            sum(f.stat().st_size for f in LOCAL_MODEL_PATH.glob('**/*') if f.is_file()) / (1024 * 1024)
         ) if model_exists else 0
     }
     
     return {
-        "llm_models": ["llama3", "mistral", "ollama_llama2", "gpt-4o"],
+        "llm_models": ["ollama_llama2", "gpt-4o"],
         "embedding_models": ["huggingface_bge_small", "gpt-4o"],
         "current_embedding_model": {
             "name": "huggingface_bge_small",
@@ -1055,17 +1572,55 @@ async def bulk_evaluate(request: Request):
                 return {}
 
         # 並列処理の最大数を制限するセマフォを作成
-        MAX_PARALLEL_TASKS = 5  # APIリクエスト制限に基づいて調整
+        MAX_PARALLEL_TASKS = int(os.getenv("EVAL_MAX_PARALLEL_TASKS", "2"))  # 既定を2に調整（安定性優先）
         semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
+        # 計測ログの有効化（環境変数でON/OFF）
+        TIMING_LOG = os.getenv("EVAL_TIMING_LOG", "0").lower() in {"1", "true", "yes"}
+        import time
+        def _tnow():
+            return time.monotonic()
+        def _tlog(label: str, start: float = None):
+            # EVAL_TIMING_LOG が有効なときのみ出力
+            if not TIMING_LOG:
+                return
+            try:
+                if start is None:
+                    print(f"[timing] {label} at {jst_now_str()}")
+                else:
+                    dur = _tnow() - start
+                    print(f"[timing] {label} took {dur:.3f}s")
+            except Exception:
+                pass
 
         async def evaluate_one_bulk(data):
             try:
                 print("[進捗] 評価データを処理中...")
+                # タイムアウト設定（環境変数で調整可能）
+                # 既定値を延長: LLM呼び出し=60秒, 評価全体=600秒
+                def _parse_timeout_env(key: str, default_seconds: int):
+                    val = os.getenv(key, str(default_seconds))
+                    if val is None:
+                        return default_seconds
+                    v = str(val).strip().lower()
+                    if v in ("none", "no", "off", "false", "0", "-1"):
+                        return None  # 無制限
+                    try:
+                        return int(v)
+                    except Exception:
+                        return default_seconds
+                LLM_TIMEOUT = _parse_timeout_env("EVAL_LLM_TIMEOUT_SECONDS", 60)
+                EVAL_TIMEOUT = _parse_timeout_env("RAGAS_EVAL_TIMEOUT_SECONDS", 600)
+                def _fmt(t):
+                    return "no-timeout" if t is None else f"{t}s"
+                print(f"[設定] TIMEOUT: LLM_TIMEOUT={_fmt(LLM_TIMEOUT)}, EVAL_TIMEOUT={_fmt(EVAL_TIMEOUT)}, MAX_PARALLEL_TASKS={MAX_PARALLEL_TASKS}")
                 embedding_model = data.get("embedding_model")
-                llm_model = data.get("llm_model", "mistral")  # デフォルトでmistralを使用
                 chunk_methods = data.get("chunk_methods", [data.get("chunk_method", "recursive")])
                 chunk_sizes = data.get("chunk_sizes", [data.get("chunk_size", 1000)])
                 chunk_overlaps = data.get("chunk_overlaps", [data.get("chunk_overlap", 0)])
+                # ユーザー指定のLLMモデルは無視し、内部では常にGPT-OSSを使用
+                _requested_llm_model = data.get("llm_model", None)
+                llm_model = "gpt-oss"
+                print(f"[設定] LLMモデルはGPT-OSS固定です（リクエスト指定: {_requested_llm_model} → 使用: {llm_model}）")
                 
                 # セマンティックチャンキングが選択されている場合の情報メッセージ
                 if "semantic" in chunk_methods:
@@ -1089,95 +1644,21 @@ async def bulk_evaluate(request: Request):
                     'huggingface_bge_small', 'huggingface_bge_large', 'huggingface_miniLM', 'huggingface_mpnet_base',
                     'huggingface_multi_qa_minilm', 'huggingface_multi_qa_mpnet',
                     'huggingface_paraphrase_multilingual', 'huggingface_distiluse_multilingual',
-                    'huggingface_xlm_r'
+                    'huggingface_xlm_r', 'jina-embeddings-v4',
+                    # Ollama埋め込みモデル
+                    'nomic-embed-text', 'mxbai-embed-large', 'all-minilm', 'bge-m3', 'jina-embeddings-v3',
                 }
                 
                 if embedding_model not in supported_models:
                     raise ValueError(f"未サポートの埋め込みモデルが指定されました: {embedding_model}")
-                    
-                # モデル名がopenaiの場合は、最新モデルを使用するように警告
-                if embedding_model == "gpt-4o":
-                    print("警告: 'openai' モデルは非推奨です。代わりに 'text-embedding-3-small' または 'text-embedding-3-large' の使用を検討してください。")
+                
+                # OpenAI埋め込みの旧指定に対する注意喚起
+                if embedding_model == "openai":
+                    print("警告: 'openai' は包括的な指定です。具体的な 'text-embedding-3-small' または 'text-embedding-3-large' を選択してください。")
 
-                qa_meta = []  # ←必ず初期化（関数のtryより前に移動）
                 questions = data.get("questions")
                 # ground_truthキーまたはanswersキーのどちらかを使用（互換性のため）
                 answers = data.get("ground_truth", data.get("answers"))
-                print(f"[DEBUG] qa_meta前: questions={questions}, answers={answers}, len_q={len(questions)}, len_a={len(answers)}")
-
-                # --- uploadfileと同等の日本語質問フィルタを適用 ---
-                def is_valid_japanese_question(q):
-                    import re
-                    if not re.search(r'[ぁ-んァ-ン一-龥]', q):
-                        return False
-                    exclude_patterns = [
-                        r'^Q\d*[:：]?\s*$', r'^A\d*[:：]?\s*$', r'以下の\d*つの質問', r'代表的な質問', r'Here are', r'英語', r'質問です', r'answers? to', r'^一意回答$', r'^A[:：]', r'^Q[:：]',
-                        r'^\d+[.．、)]?$', r'^\s*$', r'^\W+$'
-                    ]
-                    for pat in exclude_patterns:
-                        if re.search(pat, q):
-                            return False
-                    if re.match(r'^[\d\.\s]*$', q):
-                        return False
-                    if len(q.strip()) < 6:
-                        return False
-                    return True
-
-                # 質問・回答リストにフィルタ適用＆5件制限
-                if questions and answers and len(questions) == len(answers):
-                    filtered = [(q.strip(), a.strip()) for q, a in zip(questions, answers) if is_valid_japanese_question(q)]
-                    filtered = filtered[:5]  # 5件にtruncate
-                    questions = [q for q, a in filtered]
-                    answers = [a for q, a in filtered]
-                elif questions:
-                    filtered = [q.strip() for q in questions if is_valid_japanese_question(q)]
-                    filtered = filtered[:5]
-                    questions = filtered
-                    answers = [""] * len(questions)  # 回答がない場合は空欄
-                else:
-                    questions = []
-                    answers = []
-
-                print(f"[DEBUG] フィルタ後: questions={questions}, answers={answers}, len_q={len(questions)}, len_a={len(answers)}")
-
-                # --- フィルタ後に5件未満 or 空なら即エラー ---
-                if not questions or len(questions) < 5:
-                    raise ValueError("有効な日本語質問が5件未満です。英語や無効な質問が混入していないか確認してください。アップロード時のPDFやQAセットを見直してください。")
-                try:
-                    import pandas as pd
-                    if questions and answers and len(questions) == len(answers):
-                        print("[DEBUG] qa_metaスコア計算ロジックに入る")
-                    else:
-                        print("[DEBUG] qa_metaスコア計算条件を満たさずスキップ")
-                    if questions and answers and len(questions) == len(answers):
-                        qa_df = pd.DataFrame({"question": questions, "answer": answers})
-                        print(f"[DEBUG] qa_df内容: {qa_df}")
-                        # 出現回数スコア
-                        qa_df["count_score"] = qa_df.groupby(["question", "answer"])['answer'].transform('count')
-                        qa_df["len_score"] = qa_df["answer"].apply(len)
-                        qa_df["len_score"] = (qa_df["len_score"] - qa_df["len_score"].min()) / (qa_df["len_score"].max() - qa_df["len_score"].min() + 1e-6)
-                        qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
-                        for q, group in qa_df.groupby("question"):
-                            print(f"[DEBUG] groupbyループ: q={q}, group={group}")
-                            candidates = group[["answer", "total_score"]].to_dict("records")
-                            # スコア最大の回答を選択
-                            best_idx = group["total_score"].idxmax()
-                            best_answer = group.loc[best_idx, "answer"]
-                            best_score = group.loc[best_idx, "total_score"]
-                            is_auto_fixed = len(group) > 1
-                            qa_meta.append({
-                                "score": float(best_score),
-                                "is_auto_fixed": bool(is_auto_fixed),
-                                "candidates": [c["answer"] for c in candidates],
-                                "candidate_scores": [float(c["total_score"]) for c in candidates]
-                            })
-                    else:
-                        # 質問・回答が空や不一致の場合はqa_metaも空リスト
-                        qa_meta = []
-                except Exception as e:
-                    print(f"[警告] QA矛盾自動修正処理で例外: {e}")
-                    qa_meta = []
-                
                 if not questions or not answers:
                     raise ValueError("questions/answersが指定されていません。PDFアップロード時の自動生成結果をそのまま送信してください。")
                 if not (sample_text and questions and answers):
@@ -1186,7 +1667,9 @@ async def bulk_evaluate(request: Request):
                 results = []
                 # embedding_modelのインスタンスを一度だけロードし再利用
                 print(f"[進捗] 埋め込みモデル '{embedding_model}' をロード中...")
+                _t0_embed = _tnow()
                 embedder = get_embeddings(embedding_model)
+                _tlog("embedder.load", _t0_embed)
                 
                 # chunk_method/chunk_size/chunk_overlapごとに完全に独立してチャンク分割→ベクトルストア→retriever→RAG回答生成→評価→スコア集計を実行
                 for i in range(len(chunk_methods)):
@@ -1204,6 +1687,7 @@ async def bulk_evaluate(request: Request):
                                 continue
                                 
                             print(f"[進捗] セマンティックチャンキングを開始します（chunk_sizeとchunk_overlapは無視されます）...")
+                            _t0_chunk = _tnow()
                             
                             # セマンティックチャンキングのパラメータを取得
                             semantic_params = data.get("semantic_params", {})
@@ -1219,6 +1703,7 @@ async def bulk_evaluate(request: Request):
                                 embedding_model=embedder,
                                 similarity_threshold=similarity_threshold
                             )
+                            _tlog(f"chunking.semantic", _t0_chunk)
                             
                             # セマンティックチャンキングの場合はchunk_sizeとchunk_overlapをNoneに設定
                             chunk_size_val = None
@@ -1230,6 +1715,7 @@ async def bulk_evaluate(request: Request):
                             chunk_overlap = chunk_overlaps[i] if i < len(chunk_overlaps) else 200
                             # チャンク分割
                             print(f"[進捗] チャンク分割を実行: 方式={chunk_method}, サイズ={chunk_size}, オーバーラップ={chunk_overlap}")
+                            _t0_chunk = _tnow()
                             
                             # 非同期でチャンク分割を実行
                             if chunk_method == "recursive":
@@ -1253,6 +1739,7 @@ async def bulk_evaluate(request: Request):
                             # semanticチャンキングは上記のif文で既に処理済み
                             else:
                                 raise ValueError(f"未対応のchunk_method: {chunk_method}")
+                            _tlog(f"chunking.{chunk_method}", _t0_chunk)
                             
                             # チャンク戦略を設定
                             chunk_size_val = chunk_sizes[i] if i < len(chunk_sizes) else chunk_sizes[0]
@@ -1265,6 +1752,7 @@ async def bulk_evaluate(request: Request):
 
                         print(f"[進捗] {len(chunks)}個のチャンクを作成しました。平均長さ: {sum(len(c) for c in chunks) / max(len(chunks), 1):.1f}文字")
                         print(f"[進捗] ベクトルストアを構築中...")
+                        _t0_vs = _tnow()
                         
                         # ベクトルストア構築
                         vectorstore = PGVector.from_documents(
@@ -1274,27 +1762,47 @@ async def bulk_evaluate(request: Request):
                         )
                         # チャンクをベクトルストアに追加（大量の場合はバッチ処理）
                         await asyncio.to_thread(vectorstore.add_texts, texts=chunks)
-                        retriever = vectorstore.as_retriever()
+                        _tlog("vectorstore.build+add", _t0_vs)
+                        # 検索パラメータの受け口（既定は従来と互換）
+                        top_k = int(data.get("top_k", 5))
+                        use_mmr = bool(data.get("use_mmr", False))
+                        fetch_k = int(data.get("fetch_k", max(top_k * 2, 20)))
+                        try:
+                            lambda_mult = float(data.get("lambda_mult", 0.5))
+                        except Exception:
+                            lambda_mult = 0.5
+                        if use_mmr:
+                            print(f"[設定] retriever=MMR k={top_k}, fetch_k={fetch_k}, lambda_mult={lambda_mult}")
+                            retriever = vectorstore.as_retriever(
+                                search_type="mmr",
+                                search_kwargs={"k": top_k, "fetch_k": fetch_k, "lambda_mult": lambda_mult},
+                            )
+                        else:
+                            print(f"[設定] retriever=similarity k={top_k}")
+                            retriever = vectorstore.as_retriever(
+                                search_kwargs={"k": top_k},
+                            )
 
                         # RAG回答生成＆コンテキスト取得
                         contexts = []
+                        pred_answers = []
                         
-                        # PDFアップロード時の回答がある場合はそれを使用、ない場合は新しく生成
+                        # PDFアップロード時の回答が揃っていれば使い回し（高速化）
                         if answers and len(answers) == len(questions):
                             print(f"[進捗] PDFアップロード時の回答を使用（{len(answers)}個の回答）")
-                            pred_answers = answers  # PDFアップロード時の回答を使い回し
+                            pred_answers = answers  # 回答は使い回し
                             
-                            # コンテキスト取得のみ実行
                             async def get_context_only(q):
                                 async with semaphore:
                                     retrieved_docs = await asyncio.to_thread(retriever.get_relevant_documents, q)
                                     return [doc.page_content for doc in retrieved_docs]
-                            
-                            print(f"[進捗] コンテキスト取得のみ実行（{len(questions)}個の質問）...")
+                            # 全質問のコンテキストのみ取得
+                            _t0_ctx = _tnow()
                             contexts = await asyncio.gather(*[get_context_only(q) for q in questions])
+                            _tlog("retrieval.contexts_only", _t0_ctx)
+                            print(f"[進捗] コンテキスト取得完了。評価処理を開始...")
                         else:
                             print(f"[進捗] 新しいRAG回答を生成（{len(questions)}個の質問）...")
-                            pred_answers = []
                             
                             # 各質問に対して非同期でコンテキスト取得と回答生成を行う
                             async def get_context_and_answer(q):
@@ -1302,25 +1810,46 @@ async def bulk_evaluate(request: Request):
                                     # 各質問ごとにリトリーバーで文脈取得（非同期化）
                                     retrieved_docs = await asyncio.to_thread(retriever.get_relevant_documents, q)
                                     context_texts = [doc.page_content for doc in retrieved_docs]
-                                    # LLMインスタンス・プロンプト生成
-                                    llm_instance = get_llm(llm_model)  # リクエストで指定されたLLMモデルを使用
+                                    # LLMインスタンス・プロンプト生成（GPT-OSS固定）
+                                    llm_instance = get_llm("gpt-oss")
                                     prompt = ChatPromptTemplate.from_template("""Answer the question based only on the following context:\n{context}\n\nQuestion: {question}""")
+                                    # Ollama ラッパーはLCELのRunnableではないため、RunnableLambdaで委譲して対応
+                                    def _to_text(x):
+                                        try:
+                                            return x.to_string()
+                                        except Exception:
+                                            return x
+                                    # ラッパーのinvokeを確実に通す（型正規化のため）
+                                    llm_runnable = RunnableLambda(lambda x: llm_instance.invoke(_to_text(x)))
                                     chain = (
                                         {"context": lambda _: context_texts, "question": lambda _: q}
                                         | prompt
-                                        | llm_instance
+                                        | llm_runnable
                                         | StrOutputParser()
                                     )
-                                    # 非同期で回答生成
-                                    answer = await chain.ainvoke(q)
+                                    # 非同期で回答生成（タイムアウト付与）
+                                    try:
+                                        # 最初のマッピングでcontext/questionを供給するため空dictで十分
+                                        if LLM_TIMEOUT is None:
+                                            answer = await chain.ainvoke({})
+                                        else:
+                                            answer = await asyncio.wait_for(chain.ainvoke({}), timeout=LLM_TIMEOUT)
+                                    except asyncio.TimeoutError:
+                                        print(f"[警告] LLM回答生成がタイムアウト: model={llm_model}, timeout={LLM_TIMEOUT}s, question={q[:30]}...")
+                                        answer = "[LLMタイムアウト]"
+                                    except Exception as e:
+                                        print(f"[警告] LLM回答生成失敗: {e}")
+                                        answer = "[LLMエラー]"
                                     return context_texts, answer
                             
                             # 非同期で全質問の回答を生成
+                            _t0_rag = _tnow()
                             results_list = await asyncio.gather(*[get_context_and_answer(q) for q in questions])
+                            _tlog("retrieval+llm_answers", _t0_rag)
                             for context_texts, answer in results_list:
                                 contexts.append(context_texts)
                                 pred_answers.append(answer)
-                        print(f"[進捗] RAG回答生成完了。評価処理を開始...")
+                            print(f"[進捗] RAG回答生成完了。評価処理を開始...")
                         # --- ここまで並列化 ---
 
                         # RAGAS等で自動評価
@@ -1332,81 +1861,159 @@ async def bulk_evaluate(request: Request):
                             "contexts": contexts,
                             "ground_truth": answers
                         }
-                        dataset = Dataset.from_dict(dataset_dict)
-                        llm_instance_eval = get_llm(llm_model)  # リクエストで指定されたLLMモデルを使用
+                        # 必須カラム 'reference' を追加（answer_correctness 用）
+                        dataset_dict_with_ref = dict(dataset_dict)
+                        dataset_dict_with_ref["reference"] = answers
+                        dataset = Dataset.from_dict(dataset_dict_with_ref)
+                        # 評価用LLMもGPT-OSS固定
+                        llm_instance_eval = get_llm("gpt-oss")
+                        # RAGAS が await するケースに対応する非同期アダプタ
+                        ragas_llm = RAGASLLMAsyncAdapter(llm_instance_eval)
                         
-                        # RAGASメトリクスを埋め込みモデルで初期化（OpenAI Embeddingsを回避）
-                        from ragas.metrics import faithfulness, answer_relevancy, context_recall, context_precision, answer_correctness
-                        
-                        # メトリクスを埋め込みモデルで初期化
-                        metrics_with_embeddings = []
-                        for metric in [faithfulness, answer_relevancy, context_recall, context_precision, answer_correctness]:
-                            # メトリクスに埋め込みモデルを設定
-                            if hasattr(metric, 'embeddings'):
-                                metric.embeddings = embedder
-                            metrics_with_embeddings.append(metric)
-                        
-                        # 評価関数を非同期化
-                        async def eval_one(idx):
-                            async with semaphore:  # セマフォで並列処理数を制限
-                                print(f"[進捗] 評価 {idx+1}/{len(questions)} 件目を処理中...") 
-                                single_dataset = Dataset.from_dict({
-                                    "question": [questions[idx]],
-                                    "answer": [pred_answers[idx]],
-                                    "contexts": [contexts[idx]],
-                                    "ground_truth": [answers[idx]],
-                                })
-                                return idx, evaluate(
-                                    dataset=single_dataset,
-                                    metrics=metrics_with_embeddings,
-                                    llm=llm_instance_eval,
+                        # --- 全質問を1つのDatasetにまとめて一括評価（ragas側でmax_workers並列化） ---
+                        import copy as _copy
+                        base_metrics = [faithfulness, answer_relevancy, context_recall, context_precision, answer_correctness, answer_similarity]
+                        metrics_local = [_copy.deepcopy(m) for m in base_metrics]
+                        for m in metrics_local:
+                            if hasattr(m, "llm"):
+                                m.llm = ragas_llm
+                            if hasattr(m, "embeddings"):
+                                m.embeddings = embedder
+                        # ragas.evaluate は同期関数のため、スレッド実行＋必要に応じてタイムアウトを適用
+                        eval_df = None
+                        try:
+                            _t0_eval = _tnow()
+                            if EVAL_TIMEOUT is None:
+                                eval_res_all = await asyncio.to_thread(
+                                    evaluate,
+                                    dataset=dataset,
+                                    metrics=metrics_local,
+                                    llm=ragas_llm,
+                                    embeddings=embedder,
+                                    run_config=RunConfig(timeout=EVAL_TIMEOUT, max_workers=MAX_PARALLEL_TASKS),
                                 )
-                        
-                        # 非同期で評価を実行
-                        eval_results_with_idx = await asyncio.gather(*[eval_one(i) for i in range(len(questions))])
-                        # 結果を元の順番に整理
-                        eval_results = [None] * len(questions)
-                        for idx, result in eval_results_with_idx:
-                            eval_results[idx] = result
-
-                        # 評価メトリクスの定義
-                        metrics_keys = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
-                        metrics_sum = {k: 0.0 for k in metrics_keys}
-                        metrics_count = {k: 0 for k in metrics_keys}
-                        metrics_per_qa = []
-                        
-                        # 各質問のメトリクスを収集
-                        for idx, res in enumerate(eval_results):
-                            scores = res.scores if hasattr(res, "scores") else {}
-                            # scoresがlist型ならdictに変換（防御的処理）
-                            if isinstance(scores, list):
-                                if len(scores) > 0 and isinstance(scores[0], dict):
-                                    scores = scores[0]
+                            else:
+                                eval_res_all = await asyncio.wait_for(
+                                    asyncio.to_thread(
+                                        evaluate,
+                                        dataset=dataset,
+                                        metrics=metrics_local,
+                                        llm=ragas_llm,
+                                        embeddings=embedder,
+                                        run_config=RunConfig(timeout=EVAL_TIMEOUT, max_workers=MAX_PARALLEL_TASKS),
+                                    ),
+                                    timeout=EVAL_TIMEOUT,
+                                )
+                            _tlog("ragas.evaluate", _t0_eval)
+                            # 代表的な戻り: Resultオブジェクト。to_pandas() があればDataFrame化
+                            try:
+                                if hasattr(eval_res_all, "to_pandas"):
+                                    eval_df = eval_res_all.to_pandas()
+                                elif hasattr(eval_res_all, "to_dict") and hasattr(eval_res_all, "columns"):
+                                    eval_df = eval_res_all  # 既にDataFrame互換
                                 else:
-                                    scores = {}
-                                    
-                            # 各質問ごとのメトリクスを格納
-                            qa_metric = {
-                                "question": questions[idx],
-                                "answer": pred_answers[idx],
-                                "faithfulness": safe_val(scores.get("faithfulness", 0.0)),
-                                "answer_relevancy": safe_val(scores.get("answer_relevancy", 0.0)),
-                                "context_recall": safe_val(scores.get("context_recall", 0.0)),
-                                "context_precision": safe_val(scores.get("context_precision", 0.0)),
-                                "answer_correctness": safe_val(scores.get("answer_correctness", 0.0)),
-                            }
-                            metrics_per_qa.append(qa_metric)
-                            
-                            # 合計を計算
-                            for k in metrics_keys:
-                                if k in scores and isinstance(scores[k], (float, int)):
-                                    metrics_sum[k] += float(scores[k])
-                                    metrics_count[k] += 1
-                        
-                        # 平均値を計算
-                        metrics_avg = {k: safe_val(metrics_sum[k] / metrics_count[k] if metrics_count[k] > 0 else 0.0) for k in metrics_keys}
-                        
-                        # 総合スコアの計算
+                                    eval_df = None
+                            except Exception:
+                                eval_df = None
+                        except asyncio.TimeoutError:
+                            print(f"[警告] ragas.evaluate 一括評価がタイムアウト: timeout={EVAL_TIMEOUT}s")
+                            eval_df = None
+                        except TypeError:
+                            # 互換性問題フォールバック: embeddings を外して実行
+                            try:
+                                if EVAL_TIMEOUT is None:
+                                    eval_res_all = await asyncio.to_thread(
+                                        evaluate,
+                                        dataset=dataset,
+                                        metrics=metrics_local,
+                                        llm=ragas_llm,
+                                        run_config=RunConfig(timeout=EVAL_TIMEOUT, max_workers=MAX_PARALLEL_TASKS),
+                                    )
+                                else:
+                                    eval_res_all = await asyncio.wait_for(
+                                        asyncio.to_thread(
+                                            evaluate,
+                                            dataset=dataset,
+                                            metrics=metrics_local,
+                                            llm=ragas_llm,
+                                            run_config=RunConfig(timeout=EVAL_TIMEOUT, max_workers=MAX_PARALLEL_TASKS),
+                                        ),
+                                        timeout=EVAL_TIMEOUT,
+                                    )
+                                if hasattr(eval_res_all, "to_pandas"):
+                                    eval_df = eval_res_all.to_pandas()
+                                elif hasattr(eval_res_all, "to_dict") and hasattr(eval_res_all, "columns"):
+                                    eval_df = eval_res_all
+                                else:
+                                    eval_df = None
+                            except TypeError:
+                                # 最終フォールバック: run_config も外す
+                                try:
+                                    if EVAL_TIMEOUT is None:
+                                        eval_res_all = await asyncio.to_thread(
+                                            evaluate,
+                                            dataset=dataset,
+                                            metrics=metrics_local,
+                                            llm=ragas_llm,
+                                        )
+                                    else:
+                                        eval_res_all = await asyncio.wait_for(
+                                            asyncio.to_thread(
+                                                evaluate,
+                                                dataset=dataset,
+                                                metrics=metrics_local,
+                                                llm=ragas_llm,
+                                            ),
+                                            timeout=EVAL_TIMEOUT,
+                                        )
+                                    if hasattr(eval_res_all, "to_pandas"):
+                                        eval_df = eval_res_all.to_pandas()
+                                    elif hasattr(eval_res_all, "to_dict") and hasattr(eval_res_all, "columns"):
+                                        eval_df = eval_res_all
+                                    else:
+                                        eval_df = None
+                                except Exception:
+                                    print("[警告] ragas.evaluate 一括評価フォールバック失敗")
+                                    eval_df = None
+
+                        # 評価メトリクスの定義と結果整形（answer_similarity を含む）
+                        metrics_keys = [
+                            "faithfulness",
+                            "answer_relevancy",
+                            "context_precision",
+                            "context_recall",
+                            "answer_correctness",
+                            "answer_similarity",
+                        ]
+                        metrics_per_qa = []
+                        metrics_avg = {k: 0.0 for k in metrics_keys}
+                        try:
+                            if eval_df is not None:
+                                try:
+                                    rows = eval_df.to_dict(orient="records")
+                                except Exception:
+                                    rows = []
+                                for r in rows:
+                                    item = {k: safe_val(r.get(k, 0.0)) for k in metrics_keys}
+                                    metrics_per_qa.append(item)
+                                # 平均値を計算（列が無い場合は0）
+                                for k in metrics_keys:
+                                    try:
+                                        if hasattr(eval_df, "columns") and k in list(eval_df.columns):
+                                            metrics_avg[k] = safe_val(float(eval_df[k].mean()))
+                                        else:
+                                            metrics_avg[k] = 0.0
+                                    except Exception:
+                                        metrics_avg[k] = 0.0
+                            else:
+                                # タイムアウトや失敗時のフォールバック（質問数ぶんの0レコード）
+                                metrics_per_qa = [{k: 0.0 for k in metrics_keys} for _ in range(len(questions))]
+                                metrics_avg = {k: 0.0 for k in metrics_keys}
+                        except Exception:
+                            # 万一の整形失敗時も0で埋める
+                            metrics_per_qa = [{k: 0.0 for k in metrics_keys} for _ in range(len(questions))]
+                            metrics_avg = {k: 0.0 for k in metrics_keys}
+                        # 総合スコアの計算（重み付けは従来比率を踏襲）
                         overall_score = (
                             metrics_avg["answer_relevancy"] * 0.25 +
                             metrics_avg["faithfulness"] * 0.25 +
@@ -1422,7 +2029,15 @@ async def bulk_evaluate(request: Request):
                         
                         # 必須キーのリスト
                         required_keys = [
-                            "overall_score", "faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness", "avg_chunk_len", "num_chunks"
+                            "overall_score",
+                            "faithfulness",
+                            "answer_relevancy",
+                            "answer_similarity",
+                            "context_recall",
+                            "context_precision",
+                            "answer_correctness",
+                            "avg_chunk_len",
+                            "num_chunks",
                         ]
                         
                         print(f"[進捗] 評価メトリクスの計算が完了しました。総合スコア: {overall_score:.4f}")
@@ -1435,6 +2050,7 @@ async def bulk_evaluate(request: Request):
                             "overall_score": overall_score,
                             "faithfulness": metrics_avg["faithfulness"],
                             "answer_relevancy": metrics_avg["answer_relevancy"],
+                            "answer_similarity": metrics_avg.get("answer_similarity", 0.0),
                             "context_recall": metrics_avg["context_recall"],
                             "context_precision": metrics_avg["context_precision"],
                             "answer_correctness": metrics_avg["answer_correctness"],
@@ -1454,101 +2070,6 @@ async def bulk_evaluate(request: Request):
                                 response_dict[k] = 0.0
                                 
                         print(f"[進捗] チャンク方法 '{chunk_method}' の処理が完了しました。スコア: {overall_score:.4f}")
-                        
-                        # 評価結果をデータベースに永続化
-                        try:
-                            # 実験セッションIDを生成（ユニークな実験を識別）
-                            import uuid
-                            session_id = data.get('session_id', str(uuid.uuid4()))
-                            experiment_name = f"{embedding_model}_{chunk_method}_{chunk_size_val}_{chunk_overlap_val}"
-                            
-                            with engine.connect() as db_conn:
-                                with db_conn.begin():
-                                    # 1. 実験セッションをexperimentsテーブルに記録
-                                    exp_result = db_conn.execute(text("""
-                                        INSERT INTO experiments (
-                                            session_id, experiment_name, file_id, file_name, parameters, 
-                                            status, total_combinations, completed_combinations
-                                        ) VALUES (
-                                            :session_id, :experiment_name, :file_id, :file_name, :parameters,
-                                            'completed', 1, 1
-                                        ) RETURNING id
-                                    """), {
-                                        'session_id': session_id,
-                                        'experiment_name': experiment_name,
-                                        'file_id': data.get('file_id', 'unknown'),
-                                        'file_name': data.get('file_name', 'unknown'),
-                                        'parameters': json.dumps({
-                                            'embedding_model': embedding_model,
-                                            'chunk_method': chunk_method,
-                                            'chunk_size': chunk_size_val,
-                                            'chunk_overlap': chunk_overlap_val,
-                                            'similarity_threshold': similarity_threshold if chunk_method == 'semantic' else None
-                                        })
-                                    })
-                                    experiment_id = exp_result.fetchone()[0]
-                                    
-                                    # チャンク詳細情報を準備
-                                    chunks_details = {
-                                        'chunk_method': chunk_method,
-                                        'chunk_strategy': chunk_strategy,
-                                        'total_chunks': len(chunks),
-                                        'chunks': [
-                                            {
-                                                'index': i,
-                                                'content': chunk[:200] + '...' if len(chunk) > 200 else chunk,  # 最初の200文字のみ保存
-                                                'length': len(chunk)
-                                            }
-                                            for i, chunk in enumerate(chunks[:10])  # 最初の10チャンクのみ保存
-                                        ],
-                                        'parameters': {
-                                            'chunk_size': chunk_size_val if chunk_method != 'semantic' else None,
-                                            'chunk_overlap': chunk_overlap_val if chunk_method != 'semantic' else None,
-                                            'similarity_threshold': similarity_threshold if chunk_method == 'semantic' else None
-                                        }
-                                    }
-                                    
-                                    # 2. 評価結果をembeddingsテーブルに保存
-                                    db_conn.execute(text("""
-                                        INSERT INTO embeddings (
-                                            text, embedding_model, chunk_strategy, chunk_size, chunk_overlap,
-                                            avg_chunk_len, num_chunks, overall_score, faithfulness, answer_relevancy,
-                                            context_recall, context_precision, answer_correctness, experiment_id, chunks_details
-                                        ) VALUES (
-                                            :text, :embedding_model, :chunk_strategy, :chunk_size, :chunk_overlap,
-                                            :avg_chunk_len, :num_chunks, :overall_score, :faithfulness, :answer_relevancy,
-                                            :context_recall, :context_precision, :answer_correctness, :experiment_id, :chunks_details
-                                        )
-                                    """), {
-                                        'text': sample_text[:1000],  # テキストは最初の1000文字のみ保存
-                                        'embedding_model': embedding_model,
-                                        'chunk_strategy': chunk_strategy,
-                                        'chunk_size': chunk_size_val if chunk_method != 'semantic' else None,
-                                        'chunk_overlap': chunk_overlap_val if chunk_method != 'semantic' else None,
-                                        'avg_chunk_len': avg_chunk_len,
-                                        'num_chunks': num_chunks,
-                                        'overall_score': overall_score,
-                                        'faithfulness': metrics_avg['faithfulness'],
-                                        'answer_relevancy': metrics_avg['answer_relevancy'],
-                                        'context_recall': metrics_avg['context_recall'],
-                                        'context_precision': metrics_avg['context_precision'],
-                                        'answer_correctness': metrics_avg['answer_correctness'],
-                                        'experiment_id': experiment_id,
-                                        'chunks_details': json.dumps(chunks_details, ensure_ascii=False)
-                                    })
-                                    
-                                    print(f"[進捗] 評価結果をデータベースに保存しました。experiment_id: {experiment_id}")
-                                    
-                                    # response_dictに実験IDを追加
-                                    response_dict['experiment_id'] = experiment_id
-                                    response_dict['session_id'] = session_id
-                                    
-                        except Exception as db_error:
-                            print(f"[警告] データベース保存エラー: {str(db_error)}")
-                            # データベースエラーがあっても評価結果は返却する
-                            import traceback
-                            traceback.print_exc()
-                        
                         results.append(response_dict)
                     except Exception as e:
                         # エラー時も必ずエラー内容を返す
@@ -1620,14 +2141,10 @@ async def bulk_evaluate(request: Request):
         }
 
 # --- PDFアップロード＆QA自動生成API ---
-from fastapi import UploadFile, File, Form
+from fastapi import UploadFile, File
 
 @app.post("/uploadfile/")
-async def uploadfile(
-    file: UploadFile = File(...),
-    question_llm_model: str = Form("llama3"),
-    answer_llm_model: str = Form("llama3")
-):
+async def uploadfile(file: UploadFile = File(...), question_llm_model: str = Form("mistral"), answer_llm_model: str = Form("mistral")):
     """
     PDFアップロード時にテキスト抽出→LLMで質問自動生成→LLMで回答自動生成まで行い、
     質問・回答セットを返すAPI。
@@ -1635,7 +2152,6 @@ async def uploadfile(
     # ■■ 最重要デバッグ情報 ■■
     print(f"[重要] uploadfile関数実行開始: ファイル名={file.filename}, サイズ={file.size if hasattr(file, 'size') else '不明'}")
     print(f"[重要] ファイル情報: {file=}, タイプ={type(file)}")
-    print(f"[重要] LLMモデル選択: 質問生成={question_llm_model}, 回答生成={answer_llm_model}")
     import io
     try:
         try:
@@ -1671,46 +2187,18 @@ async def uploadfile(
             print(f"[重要] PDF処理エラー: {e}")
             return {"error": f"PDF処理エラー: {str(e)}"}
 
-        # 2. LLMで質問セット自動生成
-        print(f"[重要] LLM質問生成開始: モデル={question_llm_model}")
-        llm_instance = get_llm(question_llm_model)
+        # 2. LLMで質問セット自動生成（GPT-OSS固定）
+        print("[重要] LLM質問生成開始 (GPT-OSS固定)")
+        llm_q_instance = get_llm("gpt-oss")
         prompt_q = f"""
-以下の内容に関する代表的な質問を日本語で5つ作成してください。各質問は改行で区切ってください。
-
----
-{text[:1500]}
----
-
-質問：
+以下の内容に関する代表的な質問を日本語で5つ作成してください。\n---\n{text[:1500]}\n---\n質問：
 """
         try:
-            # タイムアウトを設定してLLM呼び出し
-            import signal
-            import time
-            
-            def timeout_handler(signum, frame):
-                raise TimeoutError("LLM質問生成がタイムアウトしました")
-            
-            # 20秒のタイムアウトを設定（GPU加速で高速化）
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(20)
-            
-            start_time = time.time()
-            questions_resp = llm_instance.invoke(prompt_q)
-            signal.alarm(0)  # タイムアウトをクリア
-            
-            elapsed_time = time.time() - start_time
-            print(f"[重要] LLM質問生成レスポンス取得: {len(questions_resp.content)}文字 (実行時間: {elapsed_time:.2f}秒)")
+            questions_resp = llm_q_instance.invoke(prompt_q)
+            print(f"[重要] LLM質問生成レスポンス取得: {len(questions_resp.content)}文字")
             questions = [q.strip() for q in questions_resp.content.split('\n') if q.strip()]
-            answers = []  # LLM回答生成で後で埋める
             print(f"[重要] 質問リスト生成完了: {len(questions)}件")
-        except TimeoutError as e:
-            signal.alarm(0)  # タイムアウトをクリア
-            print(f"[重要] LLM質問生成タイムアウト: {e}")
-            # フォールバック処理に進む
-            questions = []
         except Exception as e:
-            signal.alarm(0)  # タイムアウトをクリア
             print(f"[重要] LLM質問生成例外: {e}")
             questions = []
 
@@ -1728,68 +2216,31 @@ async def uploadfile(
                 print(f"[重要] QA形式から抽出: {len(questions)}件")
             elif bullets:
                 questions = bullets[:5]
+                answers = ["該当内容を本文から要約してください。"] * len(questions)
                 print(f"[重要] 箇条書きから抽出: {len(questions)}件")
-                # 箇条書きから抽出した質問に対してもLLM回答生成を実行
-                answers = []  # 後でLLM回答生成で埋める
             else:
                 # 各段落の先頭文を質問化
                 paras = [p.strip() for p in text.split('\n') if p.strip()]
                 questions = [f"{p[:20]}について説明してください。" for p in paras[:5]]
+                answers = ["該当内容を本文から要約してください。"] * len(questions)
                 print(f"[重要] 段落先頭文から生成: {len(questions)}件")
-                # 段落から生成した質問に対してもLLM回答生成を実行
-                answers = []  # 後でLLM回答生成で埋める
-        
-        # 質問が生成された場合は、LLMで回答セットを自動生成
-        if questions and not answers:
-            # 3. LLMで回答セット自動生成
-            print(f"[重要] LLM回答生成開始: モデル={answer_llm_model}")
-            # 回答生成用のLLMインスタンスを取得
-            try:
-                answer_llm_instance = get_llm(answer_llm_model)
-            except Exception as e:
-                print(f"[重要] LLMインスタンス取得失敗: {e}")
-                # LLMが使用できない場合は簡易回答でフォールバック
-                answers = [f"{q}についての詳細は本文を参照してください。" for q in questions]
-                print(f"[重要] 簡易回答でフォールバック: {len(answers)}件")
-            else:
-                answers = []
-                for i, q in enumerate(questions):
-                    try:
-                        prompt_a = f"""
-以下の内容に基づいて、次の質問に日本語で簡潔に答えてください。
-
----
-{sample_text}
----
-
-質問: {q}
-回答："""
-                        # タイムアウトを設定してLLM呼び出し
-                        def timeout_handler(signum, frame):
-                            raise TimeoutError(f"LLM回答{i+1}生成がタイムアウトしました")
-                        
-                        # 20秒のタイムアウトを設定（GPU加速で高速化）
-                        signal.signal(signal.SIGALRM, timeout_handler)
-                        signal.alarm(20)
-                        
-                        start_time = time.time()
-                        answer_resp = answer_llm_instance.invoke(prompt_a)
-                        signal.alarm(0)  # タイムアウトをクリア
-                        
-                        elapsed_time = time.time() - start_time
-                        print(f"[重要] LLM回答{i+1}生成完了: {len(answer_resp.content)}文字 (実行時間: {elapsed_time:.2f}秒)")
-                        answer = answer_resp.content.strip().split('\n')[0]
-                        answers.append(answer)
-                    except TimeoutError as e:
-                        signal.alarm(0)  # タイムアウトをクリア
-                        print(f"[重要] LLM回答{i+1}生成タイムアウト: {e}")
-                        # タイムアウト時は簡易的な回答を生成
-                        simple_answer = f"{q}に関する内容を本文から要約してください。"
-                        answers.append(simple_answer)
-                    except Exception as e:
-                        signal.alarm(0)  # タイムアウトをクリア
-                        print(f"[重要] LLM回答{i+1}生成例外: {e}")
-                        answers.append("該当内容を本文から要約してください。")
+        else:
+            # 3. LLMで回答セット自動生成（GPT-OSS固定）
+            print("[重要] LLM回答生成開始 (GPT-OSS固定)")
+            answers = []
+            llm_a_instance = get_llm("gpt-oss")
+            for i, q in enumerate(questions):
+                try:
+                    prompt_a = f"""
+以下の内容に基づいて、次の質問に日本語で簡潔に答えてください。\n---\n{sample_text}\n---\n質問: {q}\n回答：
+"""
+                    answer_resp = llm_a_instance.invoke(prompt_a)
+                    print(f"[重要] LLM回答{i+1}生成完了: {len(answer_resp.content)}文字")
+                    answer = answer_resp.content.strip().split('\n')[0]
+                    answers.append(answer)
+                except Exception as e:
+                    print(f"[重要] LLM回答{i+1}生成例外: {e}")
+                    answers.append("該当内容を本文から要約してください。")
 
         # --- 最終ガード: questions/answersが空なら必ずダミー値を返す ---
         if not questions or not answers:
@@ -1797,110 +2248,44 @@ async def uploadfile(
             questions = ["この文書の主題は何ですか？"]
             answers = ["本文を要約してください。"]
 
-        # 4. qa_metaを生成（信頼性スコア計算とダミー回答フラグ付き）
-        print(f"[重要] qa_meta生成開始: {len(questions)}質問, {len(answers)}回答")
-        
+        # --- qa_meta を生成（回答長の正規化スコア + ダミー回答フラグ）---
         try:
-            import pandas as pd
-            if questions and answers and len(questions) == len(answers):
-                # pandasで信頼性スコアを計算
-                qa_df = pd.DataFrame({"question": questions, "answer": answers})
-                print(f"[重要] qa_df内容:\n{qa_df}")
-                
-                # 出現回数スコア計算
-                qa_df["count_score"] = qa_df.groupby(["question", "answer"])['answer'].transform('count')
-                
-                # 回答長スコア計算
-                qa_df["len_score"] = qa_df["answer"].apply(len)
-                if qa_df["len_score"].max() > qa_df["len_score"].min():
-                    qa_df["len_score"] = (qa_df["len_score"] - qa_df["len_score"].min()) / (qa_df["len_score"].max() - qa_df["len_score"].min())
-                else:
-                    qa_df["len_score"] = 0.5  # 全て同じ長さの場合
-                
-                # 総合スコア計算
-                qa_df["total_score"] = qa_df["count_score"] + qa_df["len_score"]
-                
-                print(f"[重要] スコア計算結果:\n{qa_df[['question', 'answer', 'count_score', 'len_score', 'total_score']]}")
-                
-                # qa_metaを質問ごとに生成
-                qa_meta = []
-                for q, group in qa_df.groupby("question"):
-                    print(f"[重要] groupbyループ: q={q}, group=\n{group}")
-                    candidates = group[["answer", "total_score"]].to_dict("records")
-                    best_idx = group["total_score"].idxmax()
-                    best_answer = group.loc[best_idx, "answer"]
-                    best_score = group.loc[best_idx, "total_score"]
-                    is_auto_fixed = len(group) > 1
-                    
-                    # ダミー回答判定パターンを拡張
-                    dummy_patterns = [
-                        "該当内容を本文から要約してください。",
-                        "本文を要約してください。",
-                        "以下の条件が必要です：",
-                        "条件が必要です",
-                        "条件は以下の通りです",
-                        "条件について説明してください"
-                    ]
-                    is_dummy_answer = any(pattern in best_answer for pattern in dummy_patterns) or best_answer.endswith("です：") or len(best_answer.strip()) < 10
-                    
-                    qa_meta.append({
-                        "score": float(best_score),
-                        "is_auto_fixed": bool(is_auto_fixed),
-                        "is_dummy_answer": bool(is_dummy_answer),
-                        "candidates": [c["answer"] for c in candidates],
-                        "candidate_scores": [float(c["total_score"]) for c in candidates]
-                    })
-                    
-                print(f"[重要] qa_meta生成結果: {qa_meta}")
-            else:
-                print(f"[警告] qa_meta生成スキップ: questions={len(questions)}, answers={len(answers)}")
-                qa_meta = []
-        except Exception as e:
-            print(f"[警告] qa_meta生成例外: {e}")
-            import traceback
-            traceback.print_exc()
+            max_len = max((len(a) for a in answers), default=1)
+            dummy_patterns = ["該当内容を本文から要約", "本文を要約して"]
             qa_meta = []
-        
-        # qa_metaが空の場合のフォールバック
-        if not qa_meta and questions and answers and len(questions) == len(answers):
-            print("[重要] qa_metaが空なのでフォールバック処理を実行")
-            dummy_patterns = [
-                "該当内容を本文から要約してください。",
-                "本文を要約してください。",
-                "以下の条件が必要です：",
-                "条件が必要です",
-                "条件は以下の通りです",
-                "条件について説明してください"
-            ]
-            qa_meta = [
-                {
-                    "score": 1.0 + (len(a) / 100.0),  # 回答長に応じてスコアを変化
+            for a in answers:
+                norm_len = (len(a) / max_len) if max_len else 0.0
+                is_dummy = any(pat in a for pat in dummy_patterns)
+                qa_meta.append({
+                    "score": float(round(norm_len, 3)),
                     "is_auto_fixed": False,
-                    "is_dummy_answer": any(pattern in a for pattern in dummy_patterns) or a.endswith("です：") or len(a.strip()) < 10,
+                    "is_dummy_answer": bool(is_dummy),
                     "candidates": [a],
-                    "candidate_scores": [1.0 + (len(a) / 100.0)]
-                }
-                for a in answers
-            ]
-        
-        # 5. 結果を辞書形式で返却（正常時は全キー、JSONResponseは使わない）
-        print(f"[重要] API返却直前: {len(questions)}質問, {len(answers)}回答, {len(qa_meta)}meta")
+                    "candidate_scores": [float(round(norm_len, 3))]
+                })
+        except Exception as e:
+            print(f"[警告] qa_meta生成時に例外: {e}。全件デフォルト値を設定します")
+            qa_meta = [{
+                "score": 1.0,
+                "is_auto_fixed": False,
+                "is_dummy_answer": False,
+                "candidates": [a],
+                "candidate_scores": [1.0]
+            } for a in answers]
+
+        # 4. 結果を辞書形式で返却（正常時は全キー、JSONResponseは使わない）
+        print(f"[重要] API返却直前: {len(questions)}質問, {len(answers)}回答")
         for i, (q, a) in enumerate(zip(questions, answers)):
             print(f"[重要] Q{i+1}: {q}")
             print(f"[重要] A{i+1}: {a}")
-            if i < len(qa_meta):
-                meta = qa_meta[i]
-                print(f"[重要] Meta{i+1}: score={meta.get('score', 'N/A')}, is_dummy={meta.get('is_dummy_answer', 'N/A')}, is_auto_fixed={meta.get('is_auto_fixed', 'N/A')}")
         
         # dictを直接返す（JSONResponse不使用）
-        result = {
+        return {
             "text": sample_text,
             "questions": questions,
             "answers": answers,
             "qa_meta": qa_meta
         }
-        print(f"[重要] 最終返却結果: qa_meta長={len(qa_meta)}, サンプル={qa_meta[:1] if qa_meta else 'None'}")
-        return result
     except Exception as e:
         # 異常時も辞書を直接返す（JSONResponse不使用）
         print(f"[重要] uploadfile全体例外: {e}")
@@ -1952,255 +2337,4 @@ def list_strategies():
         strategies = load_strategies_yaml()
         return JSONResponse(content=strategies)
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# --- 実験管理API ---
-
-@app.get("/api/v1/experiments/")
-def get_experiments():
-    """
-    実験一覧を取得するAPI
-    """
-    try:
-        with engine.connect() as conn:
-            result = conn.execute(text("""
-                SELECT 
-                    id, session_id, experiment_name, file_name, 
-                    parameters, status, total_combinations, completed_combinations,
-                    created_at, updated_at
-                FROM experiments 
-                ORDER BY created_at DESC
-            """))
-            
-            experiments = []
-            for row in result:
-                exp = {
-                    "id": row[0],
-                    "session_id": row[1],
-                    "experiment_name": row[2],
-                    "file_name": row[3],
-                    "parameters": row[4] if isinstance(row[4], dict) else (json.loads(row[4]) if row[4] and isinstance(row[4], str) else {}),
-                    "status": row[5],
-                    "total_combinations": row[6],
-                    "completed_combinations": row[7],
-                    "created_at": row[8].isoformat() if row[8] else None,
-                    "updated_at": row[9].isoformat() if row[9] else None
-                }
-                experiments.append(exp)
-            
-            return JSONResponse(content={"experiments": experiments})
-    except Exception as e:
-        print(f"[エラー] 実験一覧取得エラー: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-@app.get("/api/v1/experiments/{experiment_id}/detailed_results/")
-def get_experiment_results(experiment_id: int):
-    """
-    指定した実験の詳細結果を取得するAPI（チャンク詳細情報含む）
-    """
-    try:
-        with engine.connect() as conn:
-            # 実験情報を取得
-            exp_result = conn.execute(text("""
-                SELECT session_id, experiment_name, file_name, parameters, status, 
-                       total_combinations, completed_combinations, created_at
-                FROM experiments 
-                WHERE id = :experiment_id
-            """), {"experiment_id": experiment_id})
-            
-            exp_row = exp_result.fetchone()
-            
-            if not exp_row:
-                return {"error": "実験が見つかりません"}
-            
-            # parametersの安全なパース
-            parameters = {}
-            if exp_row[3] is not None:
-                if isinstance(exp_row[3], dict):
-                    parameters = exp_row[3]
-                elif isinstance(exp_row[3], str):
-                    try:
-                        parameters = json.loads(exp_row[3])
-                    except (json.JSONDecodeError, TypeError):
-                        parameters = {}
-            
-            experiment_info = {
-                "session_id": exp_row[0],
-                "experiment_name": exp_row[1],
-                "file_name": exp_row[2],
-                "parameters": parameters,
-                "status": exp_row[4],
-                "total_combinations": exp_row[5],
-                "completed_combinations": exp_row[6],
-                "created_at": exp_row[7].isoformat() if exp_row[7] else None
-            }
-            
-            # 評価結果を取得（チャンク詳細情報含む）
-            results_query = conn.execute(text("""
-                SELECT 
-                    id, text, embedding_model, chunk_strategy, chunk_size, chunk_overlap,
-                    avg_chunk_len, num_chunks, overall_score, faithfulness, answer_relevancy,
-                    context_recall, context_precision, answer_correctness, chunks_details,
-                    created_at
-                FROM embeddings 
-                WHERE experiment_id = :experiment_id
-                ORDER BY created_at ASC
-            """), {"experiment_id": experiment_id})
-            
-            results = []
-            for row in results_query:
-                # chunks_detailsの安全なパース
-                chunks_details = None
-                if row[14] is not None:
-                    if isinstance(row[14], dict):
-                        chunks_details = row[14]
-                    elif isinstance(row[14], str):
-                        try:
-                            chunks_details = json.loads(row[14])
-                        except (json.JSONDecodeError, TypeError):
-                            chunks_details = None
-                
-                result_data = {
-                    "id": row[0],
-                    "text": row[1],
-                    "embedding_model": row[2],
-                    "chunk_strategy": row[3],
-                    "chunk_size": row[4],
-                    "chunk_overlap": row[5],
-                    "avg_chunk_len": row[6],
-                    "num_chunks": row[7],
-                    "overall_score": row[8],
-                    "faithfulness": row[9],
-                    "answer_relevancy": row[10],
-                    "context_recall": row[11],
-                    "context_precision": row[12],
-                    "answer_correctness": row[13],
-                    "chunks_details": chunks_details,
-                    "created_at": row[15].isoformat() if row[15] else None
-                }
-                results.append(result_data)
-            
-            return {
-                "experiment": experiment_info,
-                "results": results,
-                "total_results": len(results)
-            }
-    except Exception as e:
-        print(f"[エラー] 実験結果取得エラー: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
-
-@app.delete("/api/v1/experiments/{experiment_id}/")
-def delete_experiment(experiment_id: int):
-    """
-    指定した実験を削除するAPI
-    """
-    try:
-        with engine.connect() as conn:
-            with conn.begin():
-                # 関連する評価結果を削除
-                conn.execute(text("""
-                    DELETE FROM embeddings WHERE experiment_id = :experiment_id
-                """), {"experiment_id": experiment_id})
-                
-                # 実験を削除
-                result = conn.execute(text("""
-                    DELETE FROM experiments WHERE id = :experiment_id
-                """), {"experiment_id": experiment_id})
-                
-                if result.rowcount == 0:
-                    return JSONResponse(status_code=404, content={"error": "実験が見つかりません"})
-                
-                return JSONResponse(content={"message": "実験を削除しました"})
-    except Exception as e:
-        print(f"[エラー] 実験削除エラー: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-@app.get("/api/v1/experiments/statistics/")
-def get_experiments_statistics():
-    """
-    実験の統計情報を取得するAPI
-    """
-    try:
-        with engine.connect() as conn:
-            # 実験数と結果数の統計
-            stats_result = conn.execute(text("""
-                SELECT 
-                    COUNT(DISTINCT e.id) as total_experiments,
-                    COUNT(em.id) as total_results,
-                    AVG(em.overall_score) as avg_overall_score,
-                    MAX(em.overall_score) as max_overall_score,
-                    MIN(em.overall_score) as min_overall_score
-                FROM experiments e
-                LEFT JOIN embeddings em ON e.id = em.experiment_id
-            """))
-            
-            stats_row = stats_result.fetchone()
-            
-            # モデル別統計
-            model_stats = conn.execute(text("""
-                SELECT 
-                    embedding_model,
-                    COUNT(*) as count,
-                    AVG(overall_score) as avg_score,
-                    MAX(overall_score) as max_score,
-                    MIN(overall_score) as min_score
-                FROM embeddings
-                GROUP BY embedding_model
-                ORDER BY avg_score DESC
-            """))
-            
-            model_statistics = []
-            for row in model_stats:
-                model_statistics.append({
-                    "model": row[0],
-                    "count": row[1],
-                    "avg_score": float(row[2]) if row[2] else 0,
-                    "max_score": float(row[3]) if row[3] else 0,
-                    "min_score": float(row[4]) if row[4] else 0
-                })
-            
-            # チャンク戦略別統計
-            strategy_stats = conn.execute(text("""
-                SELECT 
-                    chunk_strategy,
-                    COUNT(*) as count,
-                    AVG(overall_score) as avg_score,
-                    MAX(overall_score) as max_score,
-                    MIN(overall_score) as min_score
-                FROM embeddings
-                GROUP BY chunk_strategy
-                ORDER BY avg_score DESC
-            """))
-            
-            strategy_statistics = []
-            for row in strategy_stats:
-                strategy_statistics.append({
-                    "strategy": row[0],
-                    "count": row[1],
-                    "avg_score": float(row[2]) if row[2] else 0,
-                    "max_score": float(row[3]) if row[3] else 0,
-                    "min_score": float(row[4]) if row[4] else 0
-                })
-            
-            return JSONResponse(content={
-                "overall": {
-                    "total_experiments": stats_row[0] if stats_row[0] else 0,
-                    "total_results": stats_row[1] if stats_row[1] else 0,
-                    "avg_overall_score": float(stats_row[2]) if stats_row[2] else 0,
-                    "max_overall_score": float(stats_row[3]) if stats_row[3] else 0,
-                    "min_overall_score": float(stats_row[4]) if stats_row[4] else 0
-                },
-                "by_model": model_statistics,
-                "by_strategy": strategy_statistics
-            })
-    except Exception as e:
-        print(f"[エラー] 統計情報取得エラー: {str(e)}")
-        import traceback
-        traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})

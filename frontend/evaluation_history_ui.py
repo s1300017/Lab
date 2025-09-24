@@ -1,6 +1,6 @@
 # 評価履歴表示UI（Streamlit）
 import streamlit as st
-import requests
+from http_client import http_get, http_delete
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -21,7 +21,7 @@ def show_evaluation_history(backend_url: str):
         
         # 実験一覧を取得
         try:
-            response = requests.get(f"{backend_url}/api/v1/experiments/")
+            response = http_get(f"{backend_url}/api/v1/experiments/")
             if response.status_code == 200:
                 data = response.json()
                 experiments = data.get("experiments", [])
@@ -70,7 +70,7 @@ def show_evaluation_history(backend_url: str):
                         with col1:
                             if st.button("削除実行", type="primary", key="delete_confirm_button"):
                                 try:
-                                    delete_response = requests.delete(f"{backend_url}/api/v1/experiments/{delete_exp_id}/")
+                                    delete_response = http_delete(f"{backend_url}/api/v1/experiments/{delete_exp_id}/")
                                     if delete_response.status_code == 200:
                                         st.success("実験を削除しました")
                                         st.rerun()  # ページをリロード
@@ -94,7 +94,7 @@ def show_evaluation_history(backend_url: str):
                     if selected_exp_id:
                         # 実験結果を取得
                         try:
-                            result_response = requests.get(f"{backend_url}/api/v1/experiments/{selected_exp_id}/detailed_results/")
+                            result_response = http_get(f"{backend_url}/api/v1/experiments/{selected_exp_id}/detailed_results/")
                             if result_response.status_code == 200:
                                 result_data = result_response.json()
                                 results = result_data.get("results", [])
@@ -249,7 +249,7 @@ def show_evaluation_history(backend_url: str):
                         
                         if delete_exp_id and st.button("実験を削除", type="secondary"):
                             try:
-                                delete_response = requests.delete(f"{backend_url}/api/v1/experiments/{delete_exp_id}/")
+                                delete_response = http_delete(f"{backend_url}/api/v1/experiments/{delete_exp_id}/")
                                 if delete_response.status_code == 200:
                                     st.success("実験を削除しました。")
                                     st.rerun()
@@ -269,7 +269,7 @@ def show_evaluation_history(backend_url: str):
         
         # 全実験の結果を統合分析
         try:
-            response = requests.get(f"{backend_url}/api/v1/experiments/")
+            response = http_get(f"{backend_url}/api/v1/experiments/")
             if response.status_code == 200:
                 data = response.json()
                 experiments = data.get("experiments", [])
@@ -279,7 +279,7 @@ def show_evaluation_history(backend_url: str):
                     all_results = []
                     for exp in experiments:
                         try:
-                            result_response = requests.get(f"{backend_url}/api/v1/experiments/{exp['id']}/detailed_results/")
+                            result_response = http_get(f"{backend_url}/api/v1/experiments/{exp['id']}/detailed_results/")
                             if result_response.status_code == 200:
                                 result_data = result_response.json()
                                 results = result_data.get("results", [])
@@ -352,7 +352,7 @@ def show_evaluation_history(backend_url: str):
         
         # 統計情報を取得
         try:
-            response = requests.get(f"{backend_url}/api/v1/experiments/statistics/")
+            response = http_get(f"{backend_url}/api/v1/experiments/statistics/")
             if response.status_code == 200:
                 stats = response.json()
                 

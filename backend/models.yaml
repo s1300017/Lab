@@ -1,4 +1,9 @@
 models:
+  - name: gpt-oss
+    type: ollama
+    category: "LLM"
+    display_name: "GPT-OSS 20B (Ollama)"
+    description: "Ollamaで実行されるGPT-OSS 20Bモデル。オープンソースの大規模言語モデルで、高性能な推論が可能です。"
   - name: llama3
     type: ollama
     category: "LLM"
@@ -8,7 +13,7 @@ models:
     type: ollama
     category: "LLM"
     display_name: "Mistral (Ollama)"
-    description: "Ollamaで実行されるMistralモデル。大規模言語モデルとしての江能力を提供します。"
+    description: "Ollamaで実行されるMistralモデル。大規模言語モデルとしての能力を提供します。"
   - name: gpt-4o
     type: openai
     category: "LLM"
@@ -79,3 +84,21 @@ models:
     category: "Embedding"
     display_name: "XLM-R (HuggingFace)"
     description: "100言語に対応した多言語モデル。"
+
+  # --- Ollama Embeddings (Japanese/Multilingual capable) ---
+  - name: bge-m3
+    type: ollama
+    category: "Embedding"
+    display_name: "bge-m3 (Ollama)"
+    description: "多言語対応のBGE埋め込み。日本語で高品質な類似度が得られます。Ollamaで `ollama pull bge-m3` が必要です。"
+  - name: jina-embeddings-v3
+    type: ollama
+    category: "Embedding"
+    display_name: "Jina Embeddings v3 (Ollama)"
+    description: "多言語対応の高性能埋め込み。日本語に強い特性があります。Ollamaで `ollama pull jina-embeddings-v3` が必要です。"
+  # --- HuggingFace: Jina Embeddings v4 ---
+  - name: jina-embeddings-v4
+    type: huggingface
+    category: "Embedding"
+    display_name: "Jina Embeddings v4 (HuggingFace)"
+    description: "多言語・マルチモーダル対応の次世代埋め込み。text用途では Retrieval(task) を使用し、query/passages でプロンプトを切替えます。初回にモデルのダウンロードが行われます。"

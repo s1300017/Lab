@@ -20,13 +20,16 @@ from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_js_eval import streamlit_js_eval  # localStorage操作用
+from http_client import http_get, http_post
+
+# http_get/http_post は共通モジュール http_client から使用する
 
 # --- experiment_idによるQA・スコア復元関数 ---
 def restore_qa_from_backend():
     """
     experiment_idがsession_stateまたはlocalStorageにあれば、APIからQA・スコアを復元してsession_stateに格納
     """
-    import requests
+    # 共通セッション使用のため、ローカルrequestsインポートは不要
     import os
     experiment_id = st.session_state.get("experiment_id")
     if not experiment_id:
@@ -42,7 +45,7 @@ def restore_qa_from_backend():
     if experiment_id:
         BACKEND_URL = os.environ.get('BACKEND_URL', st.secrets.get('BACKEND_URL', 'http://backend:8000'))
         try:
-            response = requests.get(f"{BACKEND_URL}/api/v1/experiments/{experiment_id}/detailed_results/")
+            response = http_get(f"{BACKEND_URL}/api/v1/experiments/{experiment_id}/detailed_results/")
             if response.status_code == 200:
                 data = response.json()
                 st.session_state["qa_questions"] = data.get("questions", [])
@@ -1166,7 +1169,7 @@ except Exception as e:
 
 def clear_database():
     try:
-        response = requests.post(f"{BACKEND_URL}/clear_db/")
+        response = http_post(f"{BACKEND_URL}/clear_db/")
         if response.status_code == 200:
             result = response.json()
             st.success("🗑️ 全DBデータを正常に削除しました！")
@@ -1279,7 +1282,7 @@ with st.sidebar:
                 
                 # 3. バックエンドのデータベースをクリア
                 try:
-                    response = requests.post(f"{BACKEND_URL}/clear_db/")
+                    response = http_post(f"{BACKEND_URL}/clear_db/")
                     if response.status_code == 200:
                         result = response.json()
                         st.success("🗑️ すべてのデータを正常にクリアしました！")
@@ -1343,7 +1346,7 @@ with st.sidebar:
         with st.spinner("データベースを初期化中..."):
             try:
                 # 1. バックエンドのデータベースをクリア
-                response = requests.post(f"{BACKEND_URL}/clear_db/")
+                response = http_post(f"{BACKEND_URL}/clear_db/")
                 if response.status_code == 200:
                     result = response.json()
                     
@@ -1402,10 +1405,9 @@ with st.sidebar:
     st.header("設定")
     
     # モデル・エンベディングモデルリストをAPI経由で取得
-    import requests
     def fetch_models():
         try:
-            resp = requests.get(f"{BACKEND_URL}/list_models")
+            resp = http_get(f"{BACKEND_URL}/list_models")
             resp.raise_for_status()
             data = resp.json()
             # カテゴライズされたモデルを別々のリストで返す
@@ -1541,25 +1543,29 @@ with st.sidebar:
     st.subheader("🤖 LLMモデル選択")
     col1, col2 = st.columns(2)
     
+    # バックエンドからモデル一覧を取得
+    models = fetch_models()
+    llm_models = [model['name'] for model in models.get('llm', [])]
+    
     with col1:
         question_llm_model = st.selectbox(
             "質問生成用LLMモデル",
-            ["mistral", "llama3", "gpt-4o"],
-            index=0,
-            help="PDFから質問を自動生成するためのLLMモデルを選択。mistralが高速で推奨です。"
+            llm_models,
+            index=llm_models.index('mistral') if 'mistral' in llm_models else 0,
+            help="PDFから質問を自動生成するためのLLMモデルを選択。"
         )
     
     with col2:
         answer_llm_model = st.selectbox(
             "回答生成用LLMモデル",
-            ["mistral", "llama3", "gpt-4o"],
-            index=0,
-            help="質問に対する回答を自動生成するためのLLMモデルを選択。mistralが高速で推奨です。"
+            llm_models,
+            index=llm_models.index('mistral') if 'mistral' in llm_models else 0,
+            help="質問に対する回答を自動生成するためのLLMモデルを選択。"
         )
 
     if "file_id" in st.session_state and not st.session_state.get("text"):
         try:
-            resp = requests.get(f"{BACKEND_URL}/get_extracted/{st.session_state['file_id']}")
+            resp = http_get(f"{BACKEND_URL}/get_extracted/{st.session_state['file_id']}")
             if resp.status_code == 200:
                 data = resp.json()
                 st.session_state["text"] = data.get("text", "")
@@ -1605,7 +1611,7 @@ with st.sidebar:
                     'answer_llm_model': answer_llm_model
                 }
                 try:
-                    response = requests.post(f"{BACKEND_URL}/uploadfile/", files=files, data=data)
+                    response = http_post(f"{BACKEND_URL}/uploadfile/", files=files, data=data)
                     if response.status_code == 200:
                         data = response.json()
                         if "file_id" in data:
@@ -1628,9 +1634,7 @@ with st.sidebar:
                             st.success("PDFからテキスト・質問・回答セットを自動生成しました。以降の評価処理でこのセットが使われます。")
                             # --- QA表示をスコア順で拡張表示 ---
                             qa_meta = data.get('qa_meta', [])
-                            
-                            # --- デバッグ情報・サンプル出力は削除 ---
-                            
+                             
                             # qa_metaの長さをquestions/answersに合わせる
                             if len(qa_meta) < len(data['questions']):
                                 # qa_metaが不足している場合はダミーで補完
@@ -1643,19 +1647,19 @@ with st.sidebar:
                                         'candidates': [data['answers'][len(qa_meta) + i] if len(qa_meta) + i < len(data['answers']) else 'データ不足'],
                                         'candidate_scores': [1.0]
                                     })
-                                st.warning(f"qa_metaが{missing_count}件不足していたため、ダミーデータで補完しました")
-                            
+                             
                             qa_tuples = list(zip(data['questions'], data['answers'], qa_meta))
                             # スコア降順でソート
                             qa_tuples_sorted = sorted(qa_tuples, key=lambda x: x[2].get('score', 0) if x[2] else 0, reverse=True)
-                            with st.expander("🤖 自動質問・回答生成の仕組み（日本語対応）", expanded=False):
-                                st.markdown("""
+                            # --- 質問生成方法の説明を追加 ---
+                            with st.expander("🤖 自動質問生成の仕組み", expanded=False):
+                                st.markdown(f"""
                                 ### 質問生成プロセス
                                 
-                                **1. 主要手法: LLM（GPT-4o）による生成**
+                                **1. 主要手法: LLM（{question_llm_model}）による生成**
                                 - PDFテキストの最初の1,500文字を抽出
                                 - プロンプト: "以下の内容に関する代表的な質問を日本語で5つ作成してください"
-                                - GPT-4oが文書内容を理解して適切な質問を自動生成
+                                - {question_llm_model} が文書内容を理解して適切な質問を自動生成
                                 
                                 **2. フォールバック手法（LLM失敗時）**
                                 - **QA形式抽出**: 既存のQ&A形式テキストから質問を抽出
@@ -1663,7 +1667,7 @@ with st.sidebar:
                                 - **段落要約**: 各段落の先頭文から「〜について説明してください」形式で生成
                                 
                                 **3. 回答生成**
-                                - 各質問に対してGPT-4oが文書内容に基づいて回答を生成
+                                - 各質問に対して{answer_llm_model}が文書内容に基づいて回答を生成
                                 - プロンプト: "以下の内容に基づいて、次の質問に日本語で簡潔に答えてください"
                                 - 文書の最初の3,000文字をコンテキストとして使用
                                 
@@ -1855,7 +1859,12 @@ with tab1:
             "sentence_transformers_distiluse-base-multilingual-cased-v1": "軽量な多言語対応モデル。\n- サイズ: 約170MB\n- 用途: 軽量な多言語対応が必要な場合",
             "sentence_transformers_xlm-r-100langs-bert-base-nli-stsb-mean-tokens": "100言語対応モデル。\n- サイズ: 約1.2GB\n- 用途: 100以上の言語を処理する場合",
             "microsoft_layoutlm-base-uncased": "ドキュメントレイアウトを考慮したモデル。PDFなどのドキュメント処理に適しています。\n- サイズ: 約420MB\n- 用途: PDFなどのドキュメントレイアウトを考慮した処理",
-            "microsoft_layoutlmv3-base": "レイアウト情報も考慮した高性能モデル。\n- サイズ: 約1.2GB\n- 用途: ドキュメントのレイアウト情報も考慮した高精度な処理"
+            "microsoft_layoutlmv3-base": "レイアウト情報も考慮した高性能モデル。\n- サイズ: 約1.2GB\n- 用途: ドキュメントのレイアウト情報も考慮した高精度な処理",
+            # --- Ollama（日本語/多言語対応の埋め込み） ---
+            "bge-m3": "Ollamaの多言語BGE埋め込み。日本語の類似度が高品質。\n- 取得: `ollama pull bge-m3`",
+            "jina-embeddings-v3": "Ollamaの多言語Jina埋め込み。日本語に強い。\n- 取得: `ollama pull jina-embeddings-v3`",
+            # --- HuggingFace: Jina Embeddings v4 ---
+            "jina-embeddings-v4": "HuggingFaceのJina Embeddings v4。多言語・マルチモーダル対応で日本語に強い。\n- 取得: 初回自動ダウンロード（Hugging Face）。\n- 注意: 検索用途では Retrieval(task) と query/passages プロンプトを内部で使用します。",
         }
         
         # モデル選択UI
@@ -1882,7 +1891,7 @@ with tab1:
                     payload["embedding_model"] = embedding_model
                     payload["similarity_threshold"] = similarity_threshold
 
-                chunk_response = requests.post(f"{BACKEND_URL}/chunk/", json=payload)
+                chunk_response = http_post(f"{BACKEND_URL}/chunk/", json=payload)
                 if chunk_response.status_code == 200:
                     st.session_state.chunks = chunk_response.json()['chunks']
                     # 2. Embed
@@ -1891,7 +1900,7 @@ with tab1:
                         "embedding_model": st.session_state.embedding_model,
                         "chunk_method": chunk_method  # チャンク方式を追加
                     }
-                    embed_response = requests.post(f"{BACKEND_URL}/embed_and_store/", json=embed_payload)
+                    embed_response = http_post(f"{BACKEND_URL}/embed_and_store/", json=embed_payload)
                     if embed_response.status_code == 200:
                         st.success(f"{len(st.session_state.chunks)}個のチャンクを生成し、ベクトル化しました。")
                     else:
@@ -1967,47 +1976,9 @@ with tab2:
         default=default_selection,
         key="bulk_embeddings_tab2"
     )
-
-    # LLMモデルの選択を追加
+    # LLMモデルはRAGAS一括評価では固定（GPT-OSS）とする
     st.subheader("LLMモデル設定")
-    
-    # LLMモデルリストを取得
-    llm_models = st.session_state.models.get("llm", [])
-    
-    # LLMモデル名と表示名のマッピングを作成
-    llm_options = {}
-    for model in llm_models:
-        model_id = model.get("name", "")
-        model_name = model.get("display_name", model_id)
-        provider = model.get("type", "").lower()
-        
-        # プロバイダーに応じた接頭辞を追加
-        if "openai" in provider:
-            display_name = f"OpenAI: {model_name}"
-        elif "ollama" in provider or model_id in ["mistral", "llama3", "ollama_llama2"]:
-            display_name = f"Ollama: {model_name}"
-        else:
-            display_name = f"{provider}: {model_name}"
-            
-        llm_options[display_name] = model_id
-    
-    # LLMモデルが1つもない場合はエラーメッセージを表示
-    if not llm_options:
-        st.error("利用可能なLLMモデルが見つかりません。バックエンドの設定を確認してください。")
-        st.stop()
-    
-    # デフォルトでMistralを選択（存在する場合）
-    default_llm = "mistral" if "mistral" in llm_options.values() else list(llm_options.values())[0]
-    
-    # LLMモデル選択
-    selected_llm_model = st.selectbox(
-        "一括評価で使用するLLMモデル",
-        options=list(llm_options.values()),
-        format_func=lambda x: [k for k, v in llm_options.items() if v == x][0],
-        index=list(llm_options.values()).index(default_llm) if default_llm in llm_options.values() else 0,
-        key="bulk_llm_model",
-        help="一括評価で質問・回答生成とRAGAS評価に使用するLLMモデルを選択してください。"
-    )
+    st.info("RAGAS一括評価ではLLMモデルはGPT-OSSに固定されています。フロントエンドからの選択は不要です。")
 
     # チャンク分割方法の選択
     chunk_methods = st.multiselect(
@@ -2052,6 +2023,33 @@ with tab2:
         help="recursive/fixedチャンキングの場合に使用されます。"
     )
     
+    # 検索（リトリーバ）パラメータ
+    st.subheader("検索パラメータ（Retriever）")
+    col_a, col_b, col_c = st.columns([1, 1, 1])
+    with col_a:
+        bulk_top_k = st.number_input(
+            "top_k (取得件数)",
+            min_value=1, max_value=50, value=8, step=1,
+            help="検索で取得する上位件数。recall向上のため8〜10を推奨"
+        )
+    with col_b:
+        bulk_use_mmr = st.checkbox(
+            "MMRを有効化",
+            value=False,
+            help="Maximal Marginal Relevance により文脈の多様性を確保"
+        )
+    with col_c:
+        bulk_lambda_mult = st.slider(
+            "lambda_mult (MMR重み)",
+            min_value=0.0, max_value=1.0, value=0.5, step=0.05,
+            help="0に近いほど多様性重視、1に近いほど類似度重視"
+        )
+    bulk_fetch_k = st.number_input(
+        "fetch_k (MMR候補件数)",
+        min_value=bulk_top_k, max_value=200, value=max(20, int(bulk_top_k) * 2), step=1,
+        help="MMRで候補として取得する件数"
+    )
+
     # 情報表示
     # サイズ/オーバーラップを必要としないチャンク方法
     non_size_methods = ["semantic", "sentence", "paragraph"]
@@ -2136,7 +2134,7 @@ with tab2:
                         
                     payload = {
                         "embedding_model": emb,
-                        "llm_model": selected_llm_model,  # 一括評価用LLMモデルを追加
+                        # LLMモデルはバックエンドでGPT-OSSに固定（フロントから送信しない）
                         "chunk_methods": [method],
                         "chunk_sizes": [size] if size is not None else [1000],
                         "chunk_overlaps": [overlap] if overlap is not None else [200],
@@ -2144,14 +2142,21 @@ with tab2:
                         "questions": qa_questions,
                         "answers": qa_answers,
                     }
+                    # 検索パラメータを追加
+                    payload["top_k"] = int(bulk_top_k)
+                    payload["use_mmr"] = bool(bulk_use_mmr)
+                    payload["fetch_k"] = int(max(bulk_fetch_k, bulk_top_k))
+                    payload["lambda_mult"] = float(bulk_lambda_mult)
                     
                     if method == "semantic":
-                        payload["similarity_threshold"] = bulk_similarity_threshold
+                        # 後方互換のため両方送る（バックエンドは semantic_params を優先）
+                        payload["semantic_params"] = {"similarity_threshold": float(bulk_similarity_threshold)}
+                        payload["similarity_threshold"] = float(bulk_similarity_threshold)
                     
-                    response = requests.post(
+                    # タイムアウトを無効化（timeout指定なし）
+                    response = http_post(
                         f"{BACKEND_URL}/bulk_evaluate/", 
-                        json=payload, 
-                        timeout=300
+                        json=payload
                     )
                     
                     completed_tasks[0] += 1
@@ -2174,7 +2179,6 @@ with tab2:
                         
                         # メタデータを追加
                         result['embedding_model'] = emb
-                        result['llm_model'] = selected_llm_model  # LLMモデル情報を追加
                         result['chunk_method'] = method
                         result['chunk_size'] = size
                         result['chunk_overlap'] = overlap
@@ -2207,16 +2211,16 @@ with tab2:
                 for emb in selected_embeddings:
                     for method, size, overlap in valid_combinations:
                         # 現在の評価ステータスを表示
-                        status_display.info(f"評価中: LLM={selected_llm_model}, Emb={emb}, {method}, size={size}, overlap={overlap}")
+                        status_display.info(f"評価中: Emb={emb}, {method}, size={size}, overlap={overlap}")
                         
                         # 評価を実行
                         result = evaluate_single(emb, method, size, overlap)
                         
                         if result:
                             bulk_results.append(result)
-                            status_display.success(f"完了: LLM={selected_llm_model}, Emb={emb}, {method}, size={size}, overlap={overlap}")
+                            status_display.success(f"完了: Emb={emb}, {method}, size={size}, overlap={overlap}")
                         else:
-                            status_display.warning(f"スキップ: LLM={selected_llm_model}, Emb={emb}, {method}, size={size}, overlap={overlap}")
+                            status_display.warning(f"スキップ: Emb={emb}, {method}, size={size}, overlap={overlap}")
                         
                         # 少し待機（UIの更新のため）
                         import time
@@ -2290,7 +2294,7 @@ with tab2:
         
         # 必要カラム補完・ラベル列追加
         required_cols = {
-            'avg_chunk_len', 'num_chunks', 'overall_score', 'chunk_strategy', 'embedding_model', 'llm_model',
+            'avg_chunk_len', 'num_chunks', 'overall_score', 'chunk_strategy', 'embedding_model',
             'faithfulness', 'answer_relevancy', 'context_recall', 'context_precision', 'answer_correctness'
         }
         
@@ -2312,14 +2316,14 @@ with tab2:
         if missing_cols:
             st.info(f'不足しているカラムを補完します: {missing_cols}')
             for col in missing_cols:
-                if col in ['chunk_strategy', 'embedding_model', 'llm_model']:
+                if col in ['chunk_strategy', 'embedding_model']:
                     results_df[col] = 'unknown'
                 else:
                     results_df[col] = 0.0
         
-        # 重複を削除（同じchunk_strategy、embedding_model、llm_modelの組み合わせで最初のエントリを保持）
+        # 重複を削除（同じchunk_strategy、embedding_modelの組み合わせで最初のエントリを保持）
         results_df = results_df.drop_duplicates(
-            subset=['chunk_strategy', 'embedding_model', 'llm_model'], 
+            subset=['chunk_strategy', 'embedding_model'], 
             keep='first'
         )
         
@@ -2357,9 +2361,10 @@ with tab2:
             print("\n=== 処理後のデータフレーム ===")
             print(results_df[['chunk_strategy', 'chunk_size', 'chunk_overlap', 'label']].to_string())
         
-        # オーバーラップ比較を表示
-        if 'overlap' in results_df.columns and len(results_df['overlap'].unique()) > 1:
-            plot_overlap_comparison(results_df)
+        # オーバーラップ比較を表示 + それ以外のグラフは常に描画
+        if True:
+            if 'overlap' in results_df.columns and len(results_df['overlap'].unique()) > 1:
+                plot_overlap_comparison(results_df)
             
             # メトリクスとその日本語ラベルを定義
             metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness"]
@@ -2757,14 +2762,13 @@ with tab_chatbot:
         else:
             # --- RAGバックエンドAPIを呼び出して実際の応答を取得 ---
             try:
-                import requests
-                BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
                 query_payload = {
                     "query": prompt,
                     "llm_model": chat_model,
                     "embedding_model": st.session_state.get("embedding_model", "huggingface_bge_small")
                 }
-                response = requests.post(f"{BACKEND_URL}/query/", json=query_payload, timeout=120)
+                # タイムアウトを無効化（timeout指定なし）
+                response = http_post(f"{BACKEND_URL}/query/", json=query_payload)
                 if response.status_code == 200:
                     data = response.json()
                     response_text = data.get("answer", "（応答がありません）")
@@ -2870,29 +2874,37 @@ with tab_thesis:
             # 評価指標の統計値を表示
             st.subheader("評価指標の統計値")
             metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision", "answer_correctness", "overall_score"]
-            stats_df = pd.DataFrame({
-                "指標": metrics,
-                "平均値": results_df[metrics].mean(),
-                "標準偏差": results_df[metrics].std(),
-                "最小値": results_df[metrics].min(),
-                "最大値": results_df[metrics].max(),
-                "中央値": results_df[metrics].median()
-            })
-            st.dataframe(stats_df, use_container_width=True)
-            
-            # 相関分析
-            st.subheader("指標間の相関係数")
-            corr_matrix = results_df[metrics].corr()
-            st.dataframe(corr_matrix, use_container_width=True)
-            
-            # 信頼区間の計算
-            st.subheader("信頼区間")
-            confidence_intervals = {
-                "指標": metrics,
-                "95%信頼区間 (下限)": [results_df[metric].quantile(0.025) for metric in metrics],
-                "95%信頼区間 (上限)": [results_df[metric].quantile(0.975) for metric in metrics]
-            }
-            st.dataframe(pd.DataFrame(confidence_intervals), use_container_width=True)
+            # 存在する列のみで集計（KeyError防止）
+            metrics_in_df = [m for m in metrics if m in results_df.columns]
+            if not metrics_in_df:
+                st.info("評価メトリクス列が存在しないため、統計・相関・信頼区間は表示できません。バックエンドの実行状況をご確認ください。")
+            else:
+                stats_df = pd.DataFrame({
+                    "指標": metrics_in_df,
+                    "平均値": results_df[metrics_in_df].mean(),
+                    "標準偏差": results_df[metrics_in_df].std(),
+                    "最小値": results_df[metrics_in_df].min(),
+                    "最大値": results_df[metrics_in_df].max(),
+                    "中央値": results_df[metrics_in_df].median()
+                })
+                st.dataframe(stats_df, use_container_width=True)
+                
+                # 相関分析（2列以上のときのみ）
+                st.subheader("指標間の相関係数")
+                if len(metrics_in_df) >= 2:
+                    corr_matrix = results_df[metrics_in_df].corr()
+                    st.dataframe(corr_matrix, use_container_width=True)
+                else:
+                    st.info("相関係数は2つ以上のメトリクス列が必要です。")
+                
+                # 信頼区間の計算
+                st.subheader("信頼区間")
+                confidence_intervals = {
+                    "指標": metrics_in_df,
+                    "95%信頼区間 (下限)": [results_df[m].quantile(0.025) for m in metrics_in_df],
+                    "95%信頼区間 (上限)": [results_df[m].quantile(0.975) for m in metrics_in_df]
+                }
+                st.dataframe(pd.DataFrame(confidence_intervals), use_container_width=True)
         else:
             st.info("統計的分析結果は一括評価実行後のみ表示されます。")
             

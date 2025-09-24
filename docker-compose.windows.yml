@@ -1,4 +1,4 @@
-version: '3.8'
+version: "3.8"
 
 volumes:
   docker_lab_pgdata:
@@ -19,7 +19,11 @@ services:
       TZ: Asia/Tokyo
     restart: always
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ragdb}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ragdb}",
+        ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -83,9 +87,11 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
       - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ragdb}
-      - OLLAMA_API_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
       - NVIDIA_DRIVER_CAPABILITIES=all
       - NVIDIA_VISIBLE_DEVICES=all
+      - EVAL_MAX_PARALLEL_TASKS=6
+      - EVAL_TIMING_LOG=1
     depends_on:
       db:
         condition: service_healthy

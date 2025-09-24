@@ -1,0 +1,12 @@
+Docker コンテナ→ホストに切替（.env に反映＋疎通確認）
+bash
+./scripts/switch_ollama_endpoint.sh docker --apply-env .env --container rag_backend
+ホスト直に切替（.env に反映＋疎通確認）
+bash
+./scripts/switch_ollama_endpoint.sh host --apply-env .env
+Ollama(brew) を 0.0.0.0:11434 で恒久化（必要なときだけ）
+bash
+./scripts/switch_ollama_endpoint.sh docker --restart-ollama
+疎通確認のみ（ホストとコンテナ両方を試行）
+bash
+./scripts/switch_ollama_endpoint.sh
