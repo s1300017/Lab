@@ -14,3 +14,5 @@ __pycache__/
 backend/data/pdf/
 backend/data/images/
 backend/data/extracted/
+lab_backup_20251127_103726.zip
+.gitignore
