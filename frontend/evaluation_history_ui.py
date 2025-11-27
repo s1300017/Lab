@@ -6,6 +6,317 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
 import json
+import time
+from typing import Any, Mapping
+
+
+def _create_label(row: pd.Series) -> str:
+    """チャンク戦略とサイズからラベルを生成する."""
+    chunk_strategy = str(row.get("chunk_strategy") or row.get("chunk_method") or "unknown").strip()
+    chunk_size = row.get("chunk_size")
+    if chunk_strategy.lower() in {"semantic", "sentence", "paragraph"}:
+        return chunk_strategy.lower()
+    if chunk_size is not None and chunk_size != "" and not pd.isna(chunk_size):
+        return f"{chunk_strategy}-{chunk_size}"
+    return chunk_strategy or "unknown"
+
+
+def _plot_overlap_comparison_for_history(results_df: pd.DataFrame, key_prefix: str = "") -> None:
+    """一括評価タブと同様のオーバーラップ比較グラフを描画する."""
+    required_columns = [
+        "faithfulness",
+        "answer_relevancy",
+        "context_recall",
+        "context_precision",
+        "answer_correctness",
+        "overall_score",
+    ]
+    available_metrics = [col for col in required_columns if col in results_df.columns]
+    if not available_metrics:
+        st.info("比較可能な評価指標が不足しているため、オーバーラップ比較グラフは表示できません。")
+        return
+
+    if "overlap" not in results_df.columns:
+        if "chunk_overlap" in results_df.columns:
+            results_df = results_df.assign(overlap=results_df["chunk_overlap"])
+        else:
+            st.info("overlap または chunk_overlap 列が存在しないため、オーバーラップ比較グラフは表示できません。")
+            return
+    else:
+        results_df = results_df.copy()
+
+    group_cols = ["overlap"]
+    if "embedding_model" in results_df.columns:
+        group_cols.append("embedding_model")
+    if "chunk_strategy" in results_df.columns:
+        group_cols.append("chunk_strategy")
+    if "chunk_size" in results_df.columns:
+        group_cols.append("chunk_size")
+
+    overlap_scores = results_df.groupby(group_cols)[available_metrics].mean().reset_index()
+    if len(overlap_scores) <= 1:
+        st.info("オーバーラップ値が一種類のみのため、比較グラフは省略します。")
+        return
+
+    prefix = key_prefix or ""
+
+    tab1, tab2, tab3 = st.tabs(["折れ線グラフ", "ヒートマップ", "最適値サマリー"])
+
+    with tab1:
+        for metric in available_metrics:
+            st.subheader(f"{metric} の比較")
+            if "embedding_model" in overlap_scores.columns and "chunk_size" in overlap_scores.columns:
+                models = overlap_scores["embedding_model"].unique()
+                chunk_sizes = sorted(overlap_scores["chunk_size"].dropna().unique())
+                if len(models) == 0:
+                    st.info("モデル情報が不足しているため、グラフは表示できません。")
+                    continue
+                model_tabs = st.tabs([str(model) for model in models])
+                for idx, model in enumerate(models):
+                    with model_tabs[idx]:
+                        model_data = overlap_scores[overlap_scores["embedding_model"] == model]
+                        fig = go.Figure()
+                        colors = px.colors.qualitative.Plotly
+                        for i, chunk_size in enumerate(chunk_sizes):
+                            size_rows = model_data[model_data["chunk_size"] == chunk_size]
+                            if size_rows.empty:
+                                continue
+                            mean_rows = size_rows.groupby("overlap", as_index=False)[metric].mean()
+                            display_label = _create_label(size_rows.iloc[0]) if len(size_rows) > 0 else str(chunk_size)
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=mean_rows["overlap"],
+                                    y=mean_rows[metric],
+                                    mode="lines+markers",
+                                    name=display_label,
+                                    line=dict(color=colors[i % len(colors)], width=3),
+                                    marker=dict(size=9, color=colors[i % len(colors)]),
+                                    hovertemplate=
+                                        f"<b>{display_label}</b><br>オーバーラップ: %{{x}}<br>スコア: %{{y:.3f}}<extra></extra>",
+                                )
+                            )
+                        fig.update_layout(
+                            title=f"{model} - チャンクサイズ別比較",
+                            xaxis_title="オーバーラップサイズ (トークン数)",
+                            yaxis_title=f"{metric} スコア (0-1)",
+                            template="plotly_white",
+                            height=400,
+                            margin=dict(l=50, r=50, t=60, b=40),
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                        )
+                        chart_key = f"{prefix}overlap_line_{metric}_{str(model)}"
+                        st.plotly_chart(fig, use_container_width=True, key=chart_key)
+            else:
+                fig = px.line(
+                    overlap_scores,
+                    x="overlap",
+                    y=metric,
+                    color="embedding_model" if "embedding_model" in overlap_scores.columns else None,
+                    title=f"{metric} の比較",
+                    markers=True,
+                )
+                fig.update_layout(
+                    xaxis_title="オーバーラップサイズ (トークン数)",
+                    yaxis_title=f"{metric} スコア (0-1)",
+                    template="plotly_white",
+                    height=400,
+                )
+                st.plotly_chart(fig, use_container_width=True, key=f"{prefix}overlap_line_simple_{metric}")
+
+    with tab2:
+        if "chunk_size" in overlap_scores.columns and "embedding_model" in overlap_scores.columns:
+            for model in overlap_scores["embedding_model"].unique():
+                model_data = overlap_scores[overlap_scores["embedding_model"] == model]
+                pivot = model_data.pivot_table(
+                    index="chunk_size",
+                    columns="overlap",
+                    values="overall_score",
+                    aggfunc="mean",
+                )
+                if pivot.empty:
+                    continue
+                fig = px.imshow(
+                    pivot,
+                    labels=dict(x="オーバーラップ", y="チャンクサイズ", color="総合スコア"),
+                    title=f"{model} - チャンク×オーバーラップ ヒートマップ",
+                    aspect="auto",
+                )
+                st.plotly_chart(fig, use_container_width=True, key=f"{prefix}overlap_heatmap_{str(model)}")
+        else:
+            st.info("ヒートマップを描画するためのチャンクサイズ/モデル情報が不足しています。")
+
+    with tab3:
+        if "chunk_strategy" in overlap_scores.columns:
+            summary_df = (
+                overlap_scores
+                .groupby("chunk_strategy")[available_metrics]
+                .mean()
+                .sort_values("overall_score", ascending=False)
+            )
+            st.dataframe(summary_df, use_container_width=True)
+        else:
+            st.info("chunk_strategy 列が存在しないため、サマリー表示を省略します。")
+
+
+def _render_bulk_style_charts(results_df: pd.DataFrame, key_prefix: str = "") -> None:
+    """一括評価タブと同じ構成のグラフ群を描画する."""
+    if results_df.empty:
+        st.info("評価結果が空のため、グラフは表示できません。")
+        return
+
+    df = results_df.copy()
+
+    if "chunk_strategy" not in df.columns and "chunk_method" in df.columns:
+        df["chunk_strategy"] = df["chunk_method"]
+    if "overlap" not in df.columns and "chunk_overlap" in df.columns:
+        df["overlap"] = df["chunk_overlap"]
+    for col in [
+        "overall_score",
+        "faithfulness",
+        "answer_relevancy",
+        "context_recall",
+        "context_precision",
+        "answer_correctness",
+    ]:
+        if col not in df.columns:
+            df[col] = pd.NA
+    if "chunk_size" not in df.columns:
+        df["chunk_size"] = pd.NA
+    if "num_chunks" not in df.columns:
+        df["num_chunks"] = 0
+    if "avg_chunk_len" not in df.columns:
+        df["avg_chunk_len"] = 0
+
+    df["label"] = df.apply(_create_label, axis=1)
+
+    st.write("### オーバーラップ比較")
+    _plot_overlap_comparison_for_history(df, key_prefix)
+
+    metrics = [
+        "faithfulness",
+        "answer_relevancy",
+        "context_recall",
+        "context_precision",
+        "answer_correctness",
+    ]
+    metrics_jp = ["信頼性", "回答の関連性", "コンテキスト再現", "コンテキスト精度", "回答正確性"]
+    available_metrics = [m for m in metrics if m in df.columns]
+
+    if available_metrics:
+        st.write("### レーダーチャート")
+        for label in df["label"].dropna().unique():
+            subset = df[df["label"] == label]
+            if subset.empty:
+                continue
+            fig = go.Figure()
+            for model in subset["embedding_model"].dropna().unique():
+                model_df = subset[subset["embedding_model"] == model]
+                if model_df.empty:
+                    continue
+                r_values = [
+                    float(model_df[m].mean()) if m in model_df.columns and pd.notna(model_df[m]).any() else 0
+                    for m in metrics
+                ]
+                fig.add_trace(
+                    go.Scatterpolar(
+                        r=r_values,
+                        theta=metrics_jp,
+                        fill="toself",
+                        name=str(model),
+                        hovertemplate="%{theta}: %{r:.3f}<extra></extra>",
+                    )
+                )
+            fig.update_layout(
+                title=f"{label} - モデル別メトリクス比較",
+                polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+                showlegend=True,
+                height=450,
+            )
+            st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}radar_{label}_{time.time_ns()}")
+
+    if {"num_chunks", "avg_chunk_len", "overall_score"}.issubset(df.columns):
+        st.write("### バブルチャート (チャンク分布)")
+        for model, model_data in df.groupby("embedding_model"):
+            if model_data.empty:
+                continue
+            plot_data = model_data.copy()
+            plot_data["bubble_size"] = plot_data["overall_score"].apply(
+                lambda v: min(float(v) * 20, 50) if pd.notna(v) else 5
+            )
+            model_str = str(model).replace(" ", "_")
+            fig = px.scatter(
+                plot_data,
+                x="num_chunks",
+                y="avg_chunk_len",
+                size="bubble_size",
+                color="overall_score",
+                hover_data={
+                    "chunk_size": True,
+                    "chunk_strategy": True,
+                    "num_chunks": True,
+                    "avg_chunk_len": ":.1f",
+                    "overall_score": ".3f",
+                },
+                labels={
+                    "num_chunks": "チャンク数",
+                    "avg_chunk_len": "平均チャンク長",
+                    "overall_score": "総合スコア",
+                },
+                color_continuous_scale=px.colors.sequential.Viridis,
+                title=f"{model} - チャンク分布とスコア",
+            )
+            fig.update_layout(height=450)
+            st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}bubble_{model_str}")
+
+    if "chunk_strategy" in df.columns and "overall_score" in df.columns:
+        st.write("### チャンク戦略別平均スコア")
+        bar_df = (
+            df.groupby("chunk_strategy")["overall_score"].mean().sort_values(ascending=False).reset_index()
+        )
+        fig = px.bar(
+            bar_df,
+            x="chunk_strategy",
+            y="overall_score",
+            title="チャンク戦略別 平均総合スコア",
+            labels={"chunk_strategy": "チャンク戦略", "overall_score": "平均総合スコア"},
+        )
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}chunk_strategy_bar")
+
+
+def apply_bulk_chunk_settings_from_history(row: Mapping[str, Any]) -> None:
+    chunk_strategy = str(row.get("chunk_strategy") or row.get("chunk_method") or "").strip()
+    method_candidates = ["semantic", "recursive", "fixed", "sentence", "paragraph"]
+    chunk_method = None
+    for m in method_candidates:
+        if chunk_strategy.startswith(m):
+            chunk_method = m
+            break
+    if not chunk_method and chunk_strategy:
+        chunk_method = chunk_strategy.split("-", 1)[0]
+    if not chunk_method:
+        return
+
+    st.session_state["bulk_chunk_methods"] = [chunk_method]
+
+    if chunk_method != "semantic":
+        size_val = row.get("chunk_size")
+        overlap_val = row.get("chunk_overlap")
+        if size_val is not None and size_val != "" and not pd.isna(size_val):
+            try:
+                st.session_state["bulk_chunk_sizes_select"] = [int(size_val)]
+            except Exception:
+                pass
+        if overlap_val is not None and overlap_val != "" and not pd.isna(overlap_val):
+            try:
+                st.session_state["bulk_chunk_overlaps_select"] = [int(overlap_val)]
+            except Exception:
+                pass
+
+    embedding_model = row.get("embedding_model")
+    if embedding_model:
+        st.session_state["embedding_model"] = str(embedding_model)
+
 
 def show_evaluation_history(backend_url: str):
     """
@@ -16,240 +327,331 @@ def show_evaluation_history(backend_url: str):
     # タブで機能を分割
     tab1, tab2, tab3 = st.tabs(["実験一覧", "詳細分析", "統計情報"])
     
+    # 履歴APIから実験一覧を取得
+    experiments = []
+    experiments_error = None
+    try:
+        response = http_get(f"{backend_url}/history/experiments")
+        if response.status_code == 200:
+            data = response.json() or {}
+            experiments = data.get("items", data.get("experiments", []))
+        else:
+            experiments_error = f"実験履歴取得エラー: {response.status_code}"
+    except Exception as e:
+        experiments_error = f"実験履歴取得エラー: {str(e)}"
+
     with tab1:
         st.subheader("実験履歴一覧")
-        
-        # 実験一覧を取得
-        try:
-            response = http_get(f"{backend_url}/api/v1/experiments/")
-            if response.status_code == 200:
-                data = response.json()
-                experiments = data.get("experiments", [])
-                
-                if experiments:
-                    # データフレームに変換
-                    df = pd.DataFrame(experiments)
-                    
-                    # 日時フォーマット
-                    if 'created_at' in df.columns:
-                        df['created_at'] = pd.to_datetime(df['created_at']).dt.strftime('%Y-%m-%d %H:%M')
-                    
-                    # 表示用カラム選択
-                    display_columns = ['id', 'experiment_name', 'file_name', 'status', 
-                                     'total_combinations', 'completed_combinations', 'created_at']
-                    available_columns = [col for col in display_columns if col in df.columns]
-                    
-                    # 実験一覧表示
-                    st.dataframe(
-                        df[available_columns], 
-                        use_container_width=True,
-                        column_config={
-                            "id": "実験ID",
-                            "experiment_name": "実験名",
-                            "file_name": "ファイル名",
-                            "status": "ステータス",
-                            "total_combinations": "総組み合わせ数",
-                            "completed_combinations": "完了数",
-                            "created_at": "作成日時"
-                        }
+
+        if experiments_error:
+            st.error(experiments_error)
+        else:
+            if experiments:
+                df = pd.DataFrame(experiments)
+
+                if 'created_at' in df.columns:
+                    df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce')
+                    df['created_date'] = df['created_at'].dt.date
+                else:
+                    df['created_at'] = pd.NaT
+                    df['created_date'] = pd.NaT
+
+                date_options = sorted(df['created_date'].dropna().unique().tolist(), reverse=True)
+                if date_options:
+                    selected_date = st.selectbox(
+                        "表示する日付",
+                        options=[None] + date_options,
+                        format_func=lambda v: "すべて" if v is None else v.isoformat(),
+                        key="history_date_filter_selectbox"
                     )
-                    
-                    # 実験削除機能
-                    st.subheader("実験削除")
-                    delete_exp_id = st.selectbox(
-                        "削除する実験を選択",
-                        options=[None] + df['id'].tolist(),
-                        format_func=lambda x: "選択してください" if x is None else f"ID:{x} - {df[df['id']==x]['experiment_name'].iloc[0] if len(df[df['id']==x]) > 0 else 'Unknown'}",
-                        key="delete_experiment_selectbox"
-                    )
-                    
-                    if delete_exp_id is not None:
-                        st.warning(f"実験ID {delete_exp_id} を削除しますか？この操作は元に戻せません。")
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if st.button("削除実行", type="primary", key="delete_confirm_button"):
-                                try:
-                                    delete_response = http_delete(f"{backend_url}/api/v1/experiments/{delete_exp_id}/")
-                                    if delete_response.status_code == 200:
-                                        st.success("実験を削除しました")
-                                        st.rerun()  # ページをリロード
-                                    else:
-                                        st.error(f"削除エラー: {delete_response.status_code}")
-                                except Exception as e:
-                                    st.error(f"削除エラー: {str(e)}")
-                        with col2:
-                            if st.button("キャンセル", key="delete_cancel_button"):
-                                st.rerun()  # ページをリロード
-                    
-                    # 実験詳細表示
-                    st.subheader("実験詳細")
-                    selected_exp_id = st.selectbox(
-                        "詳細を表示する実験を選択",
-                        options=df['id'].tolist(),
-                        format_func=lambda x: f"ID:{x} - {df[df['id']==x]['experiment_name'].iloc[0] if len(df[df['id']==x]) > 0 else 'Unknown'}",
-                        key="experiment_detail_selectbox"
-                    )
-                    
-                    if selected_exp_id:
-                        # 実験結果を取得
-                        try:
-                            result_response = http_get(f"{backend_url}/api/v1/experiments/{selected_exp_id}/detailed_results/")
-                            if result_response.status_code == 200:
-                                result_data = result_response.json()
-                                results = result_data.get("results", [])
-                                
-                                if results:
-                                    result_df = pd.DataFrame(results)
-                                    
-                                    # メトリクス表示
-                                    metrics_cols = ['overall_score', 'faithfulness', 'answer_relevancy', 
-                                                  'context_recall', 'context_precision', 'answer_correctness']
-                                    available_metrics = [col for col in metrics_cols if col in result_df.columns]
-                                    
-                                    if available_metrics:
-                                        st.write("**評価指標**")
-                                        st.dataframe(
-                                            result_df[['embedding_model', 'chunk_strategy'] + available_metrics],
-                                            use_container_width=True
-                                        )
-                                    
-                                    # チャンク詳細情報を表示
-                                    st.write("**チャンク詳細情報**")
-                                    
-                                    # チャンク詳細情報がある結果をフィルタリング
-                                    results_with_chunks = [r for r in results if r.get('chunks_details')]
-                                    
-                                    if results_with_chunks:
-                                        # チャンク詳細を表示する結果を選択
-                                        chunk_result_options = [
-                                            f"{r['embedding_model']} - {r['chunk_strategy']} (ID: {r['id']})"
-                                            for r in results_with_chunks
-                                        ]
-                                        
-                                        selected_chunk_result = st.selectbox(
-                                            "チャンク詳細を表示する結果を選択",
-                                            options=range(len(results_with_chunks)),
-                                            format_func=lambda i: chunk_result_options[i],
-                                            key="chunk_result_selectbox"
-                                        )
-                                        
-                                        if selected_chunk_result is not None:
-                                            selected_result = results_with_chunks[selected_chunk_result]
-                                            chunks_details = selected_result['chunks_details']
-                                            
-                                            # チャンク戦略情報を表示
-                                            col1, col2, col3 = st.columns(3)
-                                            with col1:
-                                                st.metric("チャンク戦略", chunks_details.get('chunk_strategy', 'N/A'))
-                                            with col2:
-                                                st.metric("総チャンク数", chunks_details.get('total_chunks', 0))
-                                            with col3:
-                                                avg_len = selected_result.get('avg_chunk_len', 0)
-                                                st.metric("平均チャンク長", f"{avg_len:.1f}" if avg_len else "N/A")
-                                            
-                                            # パラメータ情報を表示
-                                            params = chunks_details.get('parameters', {})
-                                            if params:
-                                                st.write("**チャンキングパラメータ**")
-                                                param_cols = st.columns(len(params))
-                                                for i, (key, value) in enumerate(params.items()):
-                                                    if value is not None:
-                                                        with param_cols[i % len(param_cols)]:
-                                                            st.metric(key.replace('_', ' ').title(), str(value))
-                                            
-                                            # チャンクサンプルを表示
-                                            chunks_list = chunks_details.get('chunks', [])
-                                            if chunks_list:
-                                                st.write(f"**チャンクサンプル** (最初の{len(chunks_list)}件を表示)")
-                                                
-                                                # チャンク情報をデータフレームで表示
-                                                chunk_df = pd.DataFrame([
-                                                    {
-                                                        'チャンクID': chunk.get('index', i),
-                                                        '長さ': chunk.get('length', 0),
-                                                        '内容プレビュー': chunk.get('content', '')[:100] + '...' if len(chunk.get('content', '')) > 100 else chunk.get('content', '')
-                                                    }
-                                                    for i, chunk in enumerate(chunks_list)
-                                                ])
-                                                
-                                                st.dataframe(
-                                                    chunk_df,
-                                                    use_container_width=True,
-                                                    column_config={
-                                                        'チャンクID': st.column_config.NumberColumn('チャンクID', width='small'),
-                                                        '長さ': st.column_config.NumberColumn('長さ', width='small'),
-                                                        '内容プレビュー': st.column_config.TextColumn('内容プレビュー', width='large')
-                                                    }
-                                                )
-                                                
-                                                # 選択したチャンクの詳細表示
-                                                if len(chunks_list) > 0:
-                                                    selected_chunk_idx = st.selectbox(
-                                                        "詳細を表示するチャンクを選択",
-                                                        options=range(len(chunks_list)),
-                                                        format_func=lambda i: f"チャンク {chunks_list[i].get('index', i)} (長さ: {chunks_list[i].get('length', 0)})",
-                                                        key="chunk_detail_selectbox"
-                                                    )
-                                                    
-                                                    if selected_chunk_idx is not None:
-                                                        selected_chunk = chunks_list[selected_chunk_idx]
-                                                        st.write(f"**チャンク {selected_chunk.get('index', selected_chunk_idx)} の全内容**")
-                                                        
-                                                        # チャンク内容をコードブロックで表示
-                                                        chunk_content = selected_chunk.get('content', '')
-                                                        if chunk_content:
-                                                            st.code(chunk_content, language='text')
-                                                        else:
-                                                            st.info("チャンク内容が空です")
-                                                
-                                                # チャンク長の分布をグラフで表示
-                                                if len(chunks_list) > 1:
-                                                    st.write("**チャンク長の分布**")
-                                                    chunk_lengths = [chunk.get('length', 0) for chunk in chunks_list]
-                                                    
-                                                    fig = px.histogram(
-                                                        x=chunk_lengths,
-                                                        nbins=min(20, len(chunks_list)),
-                                                        title="チャンク長の分布",
-                                                        labels={'x': 'チャンク長', 'y': '频度'}
-                                                    )
-                                                    st.plotly_chart(fig, use_container_width=True)
-                                            else:
-                                                st.info("チャンクサンプルがありません")
-                                    else:
-                                        st.info("チャンク詳細情報が保存されている結果がありません")
-                                        
-                                        # グラフ表示
-                                        if len(result_df) > 1:
-                                            st.write("**スコア比較**")
-                                            fig = px.bar(
-                                                result_df, 
-                                                x='chunk_strategy', 
-                                                y='overall_score',
-                                                color='embedding_model',
-                                                title="チャンク戦略別総合スコア"
-                                            )
-                                            st.plotly_chart(fig, use_container_width=True)
+                else:
+                    selected_date = None
+                    st.info("作成日時が取得できていないため日付フィルタは利用できません。")
+
+                filtered_df = df.copy()
+                if selected_date is not None:
+                    filtered_df = filtered_df[filtered_df['created_date'] == selected_date]
+
+                if filtered_df.empty:
+                    st.info("選択された条件に一致する実験履歴がありません。")
+                    return
+
+                display_df = filtered_df.copy()
+                if 'created_at' in display_df.columns:
+                    display_df['created_at'] = display_df['created_at'].dt.strftime('%Y-%m-%d %H:%M')
+
+                display_columns = [
+                    'created_date',
+                    'created_at',
+                    'id',
+                    'experiment_name',
+                    'file_name',
+                    'status',
+                    'total_combinations',
+                    'completed_combinations'
+                ]
+                available_columns = [col for col in display_columns if col in display_df.columns]
+
+                st.write(f"**表示中の実験数**: {len(display_df)} 件")
+                st.dataframe(
+                    display_df[available_columns],
+                    use_container_width=True,
+                    column_config={
+                        "created_date": "作成日",
+                        "created_at": "作成日時",
+                        "id": "実験ID",
+                        "experiment_name": "実験名",
+                        "file_name": "ファイル名",
+                        "status": "ステータス",
+                        "total_combinations": "総組み合わせ数",
+                        "completed_combinations": "完了数"
+                    }
+                )
+
+                if filtered_df['created_date'].notna().any():
+                    st.write("**日付別の履歴**")
+                    for date_value in sorted(filtered_df['created_date'].dropna().unique(), reverse=True):
+                        per_day_df = display_df[display_df['created_date'] == date_value]
+                        with st.expander(f"{date_value} の実験 ({len(per_day_df)} 件)", expanded=(selected_date == date_value)):
+                            st.dataframe(
+                                per_day_df[available_columns],
+                                use_container_width=True
+                            )
+
+                st.subheader("実験詳細")
+                detail_df_source = filtered_df
+                selected_exp_id = st.selectbox(
+                    "詳細を表示する実験を選択",
+                    options=detail_df_source['id'].tolist(),
+                    format_func=lambda x: f"ID:{x} - {detail_df_source[detail_df_source['id']==x]['experiment_name'].iloc[0] if len(detail_df_source[detail_df_source['id']==x]) > 0 else 'Unknown'}",
+                    key="experiment_detail_selectbox"
+                )
+                if selected_exp_id:
+                    selected_exp_name_series = detail_df_source.loc[detail_df_source['id'] == selected_exp_id, 'experiment_name']
+                    selected_exp_name = selected_exp_name_series.iloc[0] if not selected_exp_name_series.empty else "unknown"
+                    key_safe_exp_name = str(selected_exp_name).replace(" ", "_") if selected_exp_name else "unknown"
+
+                    # 実験結果を取得
+                    try:
+                        result_response = http_get(f"{backend_url}/history/experiments/{selected_exp_id}/results")
+                        if result_response.status_code == 200:
+                            result_data = result_response.json() or {}
+                            results = result_data.get("items", result_data.get("results", []))
+                            if not isinstance(results, list):
+                                results = []
+
+                            for res in results:
+                                details_dict = {}
+                                details_raw = res.get('details')
+                                if isinstance(details_raw, str):
+                                    try:
+                                        details_dict = json.loads(details_raw)
+                                    except json.JSONDecodeError:
+                                        details_dict = {}
+                                elif isinstance(details_raw, dict):
+                                    details_dict = details_raw
+
+                                if isinstance(details_dict, dict):
+                                    res.setdefault('metrics', details_dict.get('metrics', []))
+                                    res['details_dict'] = details_dict
                                 else:
-                                    st.info("この実験の結果データがありません。")
+                                    res.setdefault('metrics', [])
+                                    res['details_dict'] = {}
+
+                            if results:
+                                result_df = pd.DataFrame(results)
+
+                                result_columns = [
+                                    'embedding_model',
+                                    'chunk_strategy',
+                                    'chunk_size',
+                                    'chunk_overlap',
+                                    'num_chunks',
+                                    'avg_chunk_len',
+                                    'overall_score',
+                                    'faithfulness',
+                                    'answer_relevancy',
+                                    'context_recall',
+                                    'context_precision',
+                                    'answer_correctness',
+                                    'answer_similarity',
+                                ]
+                                available_result_columns = [
+                                    col for col in result_columns if col in result_df.columns
+                                ]
+
+                                if available_result_columns:
+                                    st.write("**評価結果一覧**")
+                                    st.dataframe(
+                                        result_df[available_result_columns],
+                                        use_container_width=True
+                                    )
+
+                                metrics_cols = [
+                                    'overall_score',
+                                    'faithfulness',
+                                    'answer_relevancy',
+                                    'context_recall',
+                                    'context_precision',
+                                    'answer_correctness',
+                                    'answer_similarity',
+                                ]
+                                available_metrics = [col for col in metrics_cols if col in result_df.columns]
+
+                                if available_metrics:
+                                    st.write("**評価指標**")
+                                    st.dataframe(
+                                        result_df[['embedding_model', 'chunk_strategy'] + available_metrics],
+                                        use_container_width=True
+                                    )
+
+                                    # グラフ用にメトリクスを整形（組み合わせごとに棒グラフ表示）
+                                    chart_df = result_df[['embedding_model', 'chunk_strategy'] + available_metrics].copy()
+                                    chart_df['combination'] = chart_df.apply(
+                                        lambda row: f"{row.get('embedding_model', 'unknown')} / {row.get('chunk_strategy', 'unknown')}",
+                                        axis=1
+                                    )
+                                    metric_chart = chart_df.melt(
+                                        id_vars='combination',
+                                        value_vars=available_metrics,
+                                        var_name='metric',
+                                        value_name='score'
+                                    )
+                                    st.write("**評価指標グラフ**")
+                                    metric_fig = px.bar(
+                                        metric_chart,
+                                        x='combination',
+                                        y='score',
+                                        color='metric',
+                                        barmode='group',
+                                        title="メトリクス別スコア比較"
+                                    )
+                                    metric_fig.update_layout(xaxis_title="モデル / チャンク戦略", yaxis_title="スコア")
+                                    st.plotly_chart(
+                                        metric_fig,
+                                        use_container_width=True,
+                                        key=f"detail_metric_bar_{selected_exp_id}_{key_safe_exp_name}"
+                                    )
+
+                                    st.write("**一括評価スタイルのグラフ**")
+                                    _render_bulk_style_charts(
+                                        result_df,
+                                        key_prefix=f"history_exp_{selected_exp_id}_{key_safe_exp_name}_"
+                                    )
+
+                                    row_options = list(range(len(result_df)))
+                                    if row_options:
+                                        labels_for_rows = []
+                                        for idx_row in row_options:
+                                            r = result_df.iloc[idx_row]
+                                            label = (
+                                                f"{r.get('embedding_model', 'unknown')} / "
+                                                f"{r.get('chunk_strategy', r.get('chunk_method', 'unknown'))} / "
+                                                f"size={r.get('chunk_size', '-')}, overlap={r.get('chunk_overlap', '-')}"
+                                            )
+                                            labels_for_rows.append(label)
+
+                                        selected_result_idx_for_apply = st.selectbox(
+                                            "一括評価タブに反映する設定",
+                                            options=row_options,
+                                            format_func=lambda i: labels_for_rows[i],
+                                            key=f"history_result_select_for_apply_{selected_exp_id}",
+                                        )
+                                        if st.button(
+                                            "この設定を一括評価タブに反映",
+                                            key=f"history_apply_to_bulk_tab_{selected_exp_id}",
+                                        ):
+                                            apply_bulk_chunk_settings_from_history(result_df.iloc[selected_result_idx_for_apply])
+                                            st.success("一括評価タブのEmbedding/チャンク設定に反映しました。『RAGAS一括評価』タブを開いて確認してください。")
+
+                                st.write("**質問別メトリクス**")
+                                results_with_metrics = [
+                                    r for r in results if isinstance(r.get('metrics'), list) and r['metrics']
+                                ]
+
+                                if results_with_metrics:
+                                    metrics_options = [
+                                        f"{r.get('embedding_model', 'unknown')} / {r.get('chunk_strategy', 'unknown')}"
+                                        for r in results_with_metrics
+                                    ]
+                                    selected_metric_idx = st.selectbox(
+                                        "質問別メトリクスを表示する結果を選択",
+                                        options=range(len(results_with_metrics)),
+                                        format_func=lambda i: metrics_options[i],
+                                        key="metrics_per_qa_selectbox"
+                                    )
+
+                                    detailed_rows = []
+                                    for item in results_with_metrics[selected_metric_idx].get('metrics', []):
+                                        if not isinstance(item, dict):
+                                            continue
+                                        row = {
+                                            '質問': item.get('question', ''),
+                                            '生成回答': item.get('pred_answer', ''),
+                                            '正解': item.get('ground_truth', ''),
+                                        }
+                                        metric_values = item.get('metrics', {})
+                                        if isinstance(metric_values, dict):
+                                            for key, value in metric_values.items():
+                                                row[key] = value
+                                        detailed_rows.append(row)
+
+                                    if detailed_rows:
+                                        detail_df = pd.DataFrame(detailed_rows)
+                                        metric_columns = [
+                                            col for col in detail_df.columns if col not in ['質問', '生成回答', '正解']
+                                        ]
+                                        for col in metric_columns:
+                                            detail_df[col] = pd.to_numeric(detail_df[col], errors='coerce')
+                                        st.dataframe(detail_df, use_container_width=True)
+
+                                        # 質問ごとのメトリクス推移を折れ線グラフで表示
+                                        numeric_columns = [col for col in metric_columns if detail_df[col].notna().any()]
+                                        if numeric_columns:
+                                            question_chart = detail_df.melt(
+                                                id_vars='質問',
+                                                value_vars=numeric_columns,
+                                                var_name='メトリクス',
+                                                value_name='スコア'
+                                            )
+                                            question_chart.sort_values('質問', inplace=True)
+                                            question_fig = px.line(
+                                                question_chart,
+                                                x='質問',
+                                                y='スコア',
+                                                color='メトリクス',
+                                                markers=True,
+                                                title="質問別メトリクス推移"
+                                            )
+                                            question_fig.update_layout(xaxis_title="質問", yaxis_title="スコア")
+                                            st.plotly_chart(
+                                                question_fig,
+                                                use_container_width=True,
+                                                key=f"detail_question_line_{selected_exp_id}_{key_safe_exp_name}"
+                                            )
+                                    else:
+                                        st.info("質問別メトリクスは取得できませんでした。")
+                                else:
+                                    st.info("質問別メトリクスが保存されている結果がありません。")
                             else:
-                                st.error(f"実験結果取得エラー: {result_response.status_code}")
-                        except Exception as e:
-                            st.error(f"実験結果取得エラー: {str(e)}")
+                                st.info("この実験の結果データがありません。")
+                        else:
+                            st.error(f"実験結果取得エラー: {result_response.status_code}")
+                    except Exception as e:
+                        st.error(f"実験結果取得エラー: {str(e)}")
                     
                     # 実験削除機能
                     st.subheader("実験削除")
                     with st.expander("実験削除（注意）"):
                         delete_exp_id = st.selectbox(
                             "削除する実験を選択",
-                            options=[None] + df['id'].tolist(),
-                            format_func=lambda x: "選択してください" if x is None else f"ID:{x} - {df[df['id']==x]['experiment_name'].iloc[0] if len(df[df['id']==x]) > 0 else 'Unknown'}"
+                            options=[None] + detail_df_source['id'].tolist(),
+                            format_func=lambda x: "選択してください" if x is None else f"ID:{x} - {detail_df_source[detail_df_source['id']==x]['experiment_name'].iloc[0] if len(detail_df_source[detail_df_source['id']==x]) > 0 else 'Unknown'}"
                         )
                         
                         if delete_exp_id and st.button("実験を削除", type="secondary"):
                             try:
-                                delete_response = http_delete(f"{backend_url}/api/v1/experiments/{delete_exp_id}/")
+                                delete_response = http_delete(f"{backend_url}/history/experiments/{delete_exp_id}")
                                 if delete_response.status_code == 200:
                                     st.success("実験を削除しました。")
                                     st.rerun()
@@ -260,29 +662,27 @@ def show_evaluation_history(backend_url: str):
                 else:
                     st.info("実験履歴がありません。")
             else:
-                st.error(f"実験履歴取得エラー: {response.status_code}")
-        except Exception as e:
-            st.error(f"実験履歴取得エラー: {str(e)}")
+                st.info("実験履歴がありません。")
     
     with tab2:
         st.subheader("詳細分析")
         
         # 全実験の結果を統合分析
         try:
-            response = http_get(f"{backend_url}/api/v1/experiments/")
+            response = http_get(f"{backend_url}/history/experiments")
             if response.status_code == 200:
-                data = response.json()
-                experiments = data.get("experiments", [])
+                data = response.json() or {}
+                experiments = data.get("items", data.get("experiments", []))
                 
                 if experiments:
                     # 全実験の結果を取得
                     all_results = []
                     for exp in experiments:
                         try:
-                            result_response = http_get(f"{backend_url}/api/v1/experiments/{exp['id']}/detailed_results/")
+                            result_response = http_get(f"{backend_url}/history/experiments/{exp['id']}/results")
                             if result_response.status_code == 200:
                                 result_data = result_response.json()
-                                results = result_data.get("results", [])
+                                results = result_data.get("items", result_data.get("results", []))
                                 for result in results:
                                     result['experiment_id'] = exp['id']
                                     result['experiment_name'] = exp['experiment_name']
@@ -292,6 +692,11 @@ def show_evaluation_history(backend_url: str):
                     
                     if all_results:
                         all_df = pd.DataFrame(all_results)
+                        if 'experiment_id' in all_df.columns:
+                            suffix_source = tuple(sorted(all_df['experiment_id'].dropna().unique().tolist()))
+                        else:
+                            suffix_source = tuple(range(len(all_df)))
+                        analysis_suffix = f"{len(all_df)}_{abs(hash(suffix_source))}"
                         
                         # モデル別性能比較
                         if 'embedding_model' in all_df.columns and 'overall_score' in all_df.columns:
@@ -305,21 +710,21 @@ def show_evaluation_history(backend_url: str):
                                 error_y='std',
                                 title="モデル別平均スコア（エラーバー：標準偏差）"
                             )
-                            st.plotly_chart(fig, use_container_width=True)
-                        
+                            st.plotly_chart(fig, use_container_width=True, key=f"analysis_model_bar_{analysis_suffix}")
+
                         # チャンク戦略別性能比較
                         if 'chunk_strategy' in all_df.columns:
                             st.write("**チャンク戦略別性能比較**")
                             chunk_avg = all_df.groupby('chunk_strategy')['overall_score'].agg(['mean', 'std', 'count']).reset_index()
                             
                             fig = px.bar(
-                                chunk_avg, 
-                                x='chunk_strategy', 
+                                chunk_avg,
+                                x='chunk_strategy',
                                 y='mean',
                                 error_y='std',
                                 title="チャンク戦略別平均スコア（エラーバー：標準偏差）"
                             )
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, use_container_width=True, key=f"analysis_chunk_bar_{analysis_suffix}")
                         
                         # 相関分析
                         numeric_cols = ['overall_score', 'faithfulness', 'answer_relevancy', 
@@ -337,7 +742,7 @@ def show_evaluation_history(backend_url: str):
                                 aspect="auto",
                                 title="評価指標間の相関係数"
                             )
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, use_container_width=True, key=f"analysis_corr_heatmap_{analysis_suffix}")
                     else:
                         st.info("分析対象の結果データがありません。")
                 else:
@@ -352,60 +757,66 @@ def show_evaluation_history(backend_url: str):
         
         # 統計情報を取得
         try:
-            response = http_get(f"{backend_url}/api/v1/experiments/statistics/")
+            response = http_get(f"{backend_url}/history/experiments")
             if response.status_code == 200:
-                stats = response.json()
-                
-                # 基本統計
-                overall_stats = stats.get("overall", {})
-                col1, col2, col3, col4, col5 = st.columns(5)
+                data = response.json() or {}
+                experiments_detail = data.get("items", data.get("experiments", []))
+                total_experiments = len(experiments_detail)
+
+                col1, col2 = st.columns(2)
                 with col1:
-                    st.metric("総実験数", overall_stats.get("total_experiments", 0))
-                with col2:
-                    st.metric("総評価結果数", overall_stats.get("total_results", 0))
-                with col3:
-                    avg_score = overall_stats.get("avg_overall_score", 0)
-                    st.metric("平均スコア", f"{avg_score:.3f}" if avg_score else "N/A")
-                with col4:
-                    max_score = overall_stats.get("max_overall_score", 0)
-                    st.metric("最高スコア", f"{max_score:.3f}" if max_score else "N/A")
-                with col5:
-                    min_score = overall_stats.get("min_overall_score", 0)
-                    st.metric("最低スコア", f"{min_score:.3f}" if min_score else "N/A")
-                
-                # モデル別統計
-                model_stats = stats.get("by_model", [])
-                if model_stats:
-                    st.write("**モデル別統計**")
-                    model_df = pd.DataFrame(model_stats)
-                    st.dataframe(
-                        model_df,
-                        use_container_width=True,
-                        column_config={
-                            "model": "モデル",
-                            "count": "実行回数",
-                            "avg_score": st.column_config.NumberColumn("平均スコア", format="%.3f"),
-                            "max_score": st.column_config.NumberColumn("最高スコア", format="%.3f"),
-                            "min_score": st.column_config.NumberColumn("最低スコア", format="%.3f")
-                        }
-                    )
-                
-                # チャンク戦略別統計
-                strategy_stats = stats.get("by_strategy", [])
-                if strategy_stats:
-                    st.write("**チャンク戦略別統計**")
-                    strategy_df = pd.DataFrame(strategy_stats)
-                    st.dataframe(
-                        strategy_df,
-                        use_container_width=True,
-                        column_config={
-                            "strategy": "戦略",
-                            "count": "実行回数",
-                            "avg_score": st.column_config.NumberColumn("平均スコア", format="%.3f"),
-                            "max_score": st.column_config.NumberColumn("最高スコア", format="%.3f"),
-                            "min_score": st.column_config.NumberColumn("最低スコア", format="%.3f")
-                        }
-                    )
+                    st.metric("総実験数", total_experiments)
+
+                if experiments_detail:
+                    try:
+                        all_results = []
+                        for exp in experiments_detail:
+                            exp_id = exp.get('id')
+                            if exp_id is None:
+                                continue
+                            resp = http_get(f"{backend_url}/history/experiments/{exp_id}/results")
+                            if resp.status_code != 200:
+                                continue
+                            res_json = resp.json() or {}
+                            items = res_json.get("items", res_json.get("results", []))
+                            for item in items:
+                                item['experiment_id'] = exp_id
+                                item['experiment_name'] = exp.get('experiment_name')
+                            all_results.extend(items)
+
+                        if all_results:
+                            all_df = pd.DataFrame(all_results)
+                            if 'experiment_id' in all_df.columns:
+                                stats_suffix_src = tuple(sorted(all_df['experiment_id'].dropna().unique().tolist()))
+                            else:
+                                stats_suffix_src = tuple(range(len(all_df)))
+                            stats_suffix = f"{len(all_df)}_{abs(hash(stats_suffix_src))}"
+
+                            if 'embedding_model' in all_df.columns and 'overall_score' in all_df.columns:
+                                st.write("**モデル別性能比較**")
+                                model_avg = all_df.groupby('embedding_model')['overall_score'].agg(['mean', 'std', 'count']).reset_index()
+                                fig = px.bar(model_avg, x='embedding_model', y='mean', error_y='std', title="モデル別平均スコア（エラーバー：標準偏差）")
+                                st.plotly_chart(fig, use_container_width=True, key=f"stats_model_bar_{stats_suffix}")
+
+                            if 'chunk_strategy' in all_df.columns and 'overall_score' in all_df.columns:
+                                st.write("**チャンク戦略別性能比較**")
+                                chunk_avg = all_df.groupby('chunk_strategy')['overall_score'].agg(['mean', 'std', 'count']).reset_index()
+                                fig = px.bar(chunk_avg, x='chunk_strategy', y='mean', error_y='std', title="チャンク戦略別平均スコア（エラーバー：標準偏差）")
+                                st.plotly_chart(fig, use_container_width=True, key=f"stats_chunk_bar_{stats_suffix}")
+
+                            numeric_cols = ['overall_score', 'faithfulness', 'answer_relevancy', 'context_recall',
+                                            'context_precision', 'answer_correctness', 'answer_similarity',
+                                            'avg_chunk_len', 'num_chunks']
+                            available_numeric = [col for col in numeric_cols if col in all_df.columns]
+                            if len(available_numeric) > 1:
+                                st.write("**指標間相関分析**")
+                                corr_matrix = all_df[available_numeric].corr()
+                                fig = px.imshow(corr_matrix, text_auto=True, aspect="auto", title="評価指標間の相関係数")
+                                st.plotly_chart(fig, use_container_width=True, key=f"stats_corr_heatmap_{stats_suffix}")
+                        else:
+                            st.info("統計を計算するための結果データがありません。")
+                    except Exception as e:
+                        st.error(f"統計情報取得中にエラー: {str(e)}")
             else:
                 st.error(f"統計情報取得エラー: {response.status_code}")
         except Exception as e:

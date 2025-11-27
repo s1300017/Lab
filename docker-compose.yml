@@ -58,7 +58,7 @@ services:
     image: rag_backend_debug
     # 長時間の評価リクエスト中にリロードや単一ワーカーによるブロッキングで接続が切れないよう、
     # --reload を使わず、ワーカーを複数にして keep-alive を延長
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 120 --workers 2
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 120 --reload --workers 1
     container_name: rag_backend
     ports:
       - "8000:8000"
@@ -93,6 +93,7 @@ services:
       - ./backend/strategies.yaml:/app/strategies.yaml
       - ./backend/logs:/app/logs
       - ./backend/uploads:/app/uploads
+      - ./backend/data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s

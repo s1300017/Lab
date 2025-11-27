@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM public.ecr.aws/docker/library/python:3.10-slim
 
 # 環境変数の設定
 ENV LANG=ja_JP.UTF-8 \

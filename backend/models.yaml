@@ -9,11 +9,6 @@ models:
     category: "LLM"
     display_name: "Llama3 (Ollama)"
     description: "Ollamaで実行されるLlama3モデル。日本語対応が優秀な大規模言語モデルです。"
-  - name: mistral
-    type: ollama
-    category: "LLM"
-    display_name: "Mistral (Ollama)"
-    description: "Ollamaで実行されるMistralモデル。大規模言語モデルとしての能力を提供します。"
   - name: gpt-4o
     type: openai
     category: "LLM"
@@ -24,81 +19,49 @@ models:
     category: "LLM"
     display_name: "GPT-4o-mini (OpenAI)"
     description: "OpenAIのGPT-4o-miniモデル。高品質な応答を提供します。"
+  # --- 日本語/多言語対応のEmbeddingモデルのみ ---
   - name: text-embedding-3-small
     type: openai
     category: "Embedding"
     display_name: "OpenAI text-embedding-3-small"
-    description: "OpenAIの最新の埋め込みモデル（小規模）。高効率な埋め込みを提供します。"
+    description: "OpenAIの最新の多言語対応埋め込みモデル（小規模）。日本語を含む多言語テキストに対応し、高効率な埋め込みを提供します。"
   - name: text-embedding-3-large
     type: openai
     category: "Embedding"
     display_name: "OpenAI text-embedding-3-large"
-    description: "OpenAIの最新の埋め込みモデル（大規模）。より高精度な埋め込みを提供します。"
+    description: "OpenAIの最新の多言語対応埋め込みモデル（大規模）。日本語テキストに対しても高精度な埋め込みを提供します。"
   - name: text-embedding-ada-002
     type: openai
     category: "Embedding"
     display_name: "OpenAI text-embedding-ada-002"
-    description: "OpenAIの従来の埋め込みモデル。広く利用されています。"
-  - name: huggingface_bge_small
-    type: huggingface
-    category: "Embedding"
-    display_name: "BGE-small (HuggingFace)"
-    description: "BAAIのBGE-smallモデル。英語テキストの埋め込みに適しています。"
-  - name: huggingface_bge_large
-    type: huggingface
-    category: "Embedding"
-    display_name: "BGE-large (HuggingFace)"
-    description: "BAAIのBGE-largeモデル。BGE-smallより高精度な埋め込みを提供します。"
-  - name: huggingface_miniLM
-    type: huggingface
-    category: "Embedding"
-    display_name: "MiniLM (HuggingFace)"
-    description: "Sentence TransformersのMiniLMモデル。軽量で高速な埋め込みを提供します。"
-  - name: huggingface_mpnet_base
-    type: huggingface
-    category: "Embedding"
-    display_name: "MPNet Base (HuggingFace)"
-    description: "MPNetベースのモデル。文書の意味的な類似性に優れています。"
-  - name: huggingface_multi_qa_minilm
-    type: huggingface
-    category: "Embedding"
-    display_name: "Multi-QA MiniLM (HuggingFace)"
-    description: "質問応答タスクに最適化されたMiniLMモデル。"
-  - name: huggingface_multi_qa_mpnet
-    type: huggingface
-    category: "Embedding"
-    display_name: "Multi-QA MPNet (HuggingFace)"
-    description: "質問応答タスクに最適化されたMPNetモデル。"
+    description: "OpenAIの多言語対応埋め込みモデル。日本語を含む多言語テキストに広く利用されています。"
+
   - name: huggingface_paraphrase_multilingual
     type: huggingface
     category: "Embedding"
     display_name: "Paraphrase Multilingual (HuggingFace)"
-    description: "多言語対応のパラフレーズ生成モデル。"
+    description: "多言語対応のパラフレーズ生成モデル。日本語を含む複数言語の文意類似度計算に適しています。"
   - name: huggingface_distiluse_multilingual
     type: huggingface
     category: "Embedding"
     display_name: "DistilUSE Multilingual (HuggingFace)"
-    description: "多言語対応の軽量なユニバーサルセンテンスエンコーダー。"
+    description: "多言語対応の軽量なユニバーサルセンテンスエンコーダー。日本語文書にも適した高速な埋め込みを提供します。"
   - name: huggingface_xlm_r
     type: huggingface
     category: "Embedding"
     display_name: "XLM-R (HuggingFace)"
-    description: "100言語に対応した多言語モデル。"
+    description: "100言語に対応した多言語モデル。日本語を含む多言語テキストの意味表現に利用できます。"
 
-  # --- Ollama Embeddings (Japanese/Multilingual capable) ---
+  # --- Ollama Embeddings (日本語/多言語対応) ---
   - name: bge-m3
     type: ollama
     category: "Embedding"
     display_name: "bge-m3 (Ollama)"
-    description: "多言語対応のBGE埋め込み。日本語で高品質な類似度が得られます。Ollamaで `ollama pull bge-m3` が必要です。"
-  - name: jina-embeddings-v3
-    type: ollama
-    category: "Embedding"
-    display_name: "Jina Embeddings v3 (Ollama)"
-    description: "多言語対応の高性能埋め込み。日本語に強い特性があります。Ollamaで `ollama pull jina-embeddings-v3` が必要です。"
+    description: "多言語対応のBGE埋め込み。日本語で高品質な類似度が得られます。利用前にホストで `ollama pull bge-m3` を実行してください。"
+
   # --- HuggingFace: Jina Embeddings v4 ---
   - name: jina-embeddings-v4
     type: huggingface
     category: "Embedding"
     display_name: "Jina Embeddings v4 (HuggingFace)"
-    description: "多言語・マルチモーダル対応の次世代埋め込み。text用途では Retrieval(task) を使用し、query/passages でプロンプトを切替えます。初回にモデルのダウンロードが行われます。"
+    description: "多言語・マルチモーダル対応の次世代埋め込み。日本語を含む多言語テキストの検索用途に対応します（初回にHugging Faceから自動ダウンロードされます）。"

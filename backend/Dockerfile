@@ -1,5 +1,5 @@
 # 最新のセキュリティパッチが適用されたベースイメージの指定
-FROM python:3.10-slim AS base
+FROM public.ecr.aws/docker/library/python:3.10-slim AS base
 
 # ビルド引数
 ARG PIP_CACHE_DIR=/root/.cache/pip
@@ -72,6 +72,7 @@ FROM base
 # システム依存関係のインストール
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # アプリケーションディレクトリの作成
