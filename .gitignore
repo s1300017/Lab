@@ -5,3 +5,12 @@ chunk-cache/
 # PostgreSQL data
 docker_lab_pgdata/
 backend_uvicorn.log
+
+# Python byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Generated PDF/OCR data (not source)
+backend/data/pdf/
+backend/data/images/
+backend/data/extracted/
