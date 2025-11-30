@@ -23,6 +23,29 @@ def _fetch_embedding_models(BACKEND_URL: str) -> List[Dict[str, str]]:
         return []
 
 
+def _fetch_llm_models(BACKEND_URL: str) -> List[Dict[str, str]]:
+    try:
+        resp = http_get(f"{BACKEND_URL}/list_models")
+        resp.raise_for_status()
+        data = resp.json() if resp.headers.get("Content-Type", "").startswith("application/json") else {}
+        return data.get("LLM", []) or []
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"LLMモデル一覧の取得に失敗しました: {e}")
+        return []
+
+
+def _persist_model_selection(BACKEND_URL: str, llm_model: str, embedding_model: str) -> None:
+    """選択されたLLM/Embeddingモデルをバックエンドに保存する。"""
+    payload = {
+        "llm_model": llm_model,
+        "embedding_model": embedding_model,
+    }
+    try:
+        http_post(f"{BACKEND_URL}/config/model_selection", json=payload)
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"モデル選択の保存に失敗しました: {e}")
+
+
 def _fetch_history_pdfs(BACKEND_URL: str) -> List[Dict[str, Any]]:
     """/history/pdf-files からPDF一覧を取得するヘルパー。"""
     try:
@@ -282,21 +305,108 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
         st.markdown("---")
         st.subheader("評価パラメータの設定")
 
+        total_q = len(eval_questions)
+        total_a = len(eval_answers)
+        max_pairs = min(total_q, total_a) if total_q and total_a else 0
+
+        question_mode = st.radio(
+            "評価に使用する質問の範囲",
+            options=["all", "head_n"],
+            format_func=lambda v: "すべての質問を使用" if v == "all" else "先頭 N 問のみ使用",
+            index=0,
+            key="bulk_eval_question_mode",
+        )
+
+        if question_mode == "head_n" and max_pairs > 0:
+            default_n = min(10, max_pairs)
+            st.slider(
+                "使用する質問数",
+                min_value=1,
+                max_value=max_pairs,
+                value=default_n,
+                step=1,
+                key="bulk_eval_question_count",
+            )
+
+        # RAG回答生成に使用するLLMの選択
+        llm_models = _fetch_llm_models(BACKEND_URL.rstrip("/"))
+        selected_llm_model: str | None = None
+        if llm_models:
+            provider_labels = {"huggingface": "HuggingFace", "ollama": "Ollama", "openai": "OpenAI"}
+            llm_names = [m.get("name", "") for m in llm_models]
+            llm_labels: List[str] = []
+            for m in llm_models:
+                t = m.get("type") or "unknown"
+                prefix = provider_labels.get(t, t)
+                base_label = m.get("display_name") or m.get("name") or "unknown"
+                llm_labels.append(f"[{prefix}] {base_label}")
+            default_llm_name = st.session_state.get("llm_model") or "gpt-oss"
+            if default_llm_name in llm_names:
+                default_llm_index = llm_names.index(default_llm_name)
+            else:
+                default_llm_index = 0
+            selected_llm_index = st.selectbox(
+                "RAG回答生成に使用するLLM",
+                options=list(range(len(llm_names))),
+                format_func=lambda i: llm_labels[i],
+                index=default_llm_index,
+                key="bulk_llm_model_select",
+            )
+            if 0 <= selected_llm_index < len(llm_names):
+                selected_llm_model = llm_names[selected_llm_index]
+                # グローバルなLLMモデルとして反映
+                st.session_state.llm_model = selected_llm_model
+                # chat_modelが未設定なら同期
+                if not st.session_state.get("chat_model"):
+                    st.session_state.chat_model = selected_llm_model
+
         # Embeddingモデルの選択（複数選択）
         embedding_models = _fetch_embedding_models(BACKEND_URL.rstrip("/"))
         if embedding_models:
-            embedding_names = [m.get("name", "") for m in embedding_models]
-            embedding_labels = [
-                m.get("display_name") or m.get("name") or "unknown"
-                for m in embedding_models
+            provider_labels = {"huggingface": "HuggingFace", "ollama": "Ollama", "openai": "OpenAI"}
+            providers = [m.get("type", "unknown") for m in embedding_models]
+            unique_providers = []
+            for p in providers:
+                if p not in unique_providers:
+                    unique_providers.append(p)
+            provider_options = ["すべて"] + [
+                provider_labels.get(p, p) for p in unique_providers if p
             ]
+            selected_provider_label = st.selectbox(
+                "Embeddingプロバイダ",
+                provider_options,
+                index=0,
+                key="bulk_embedding_provider_filter",
+            )
+            selected_type = None
+            if selected_provider_label != "すべて":
+                for k, v in provider_labels.items():
+                    if v == selected_provider_label:
+                        selected_type = k
+                        break
+            if selected_type:
+                filtered_models = [
+                    m for m in embedding_models if m.get("type") == selected_type
+                ]
+            else:
+                filtered_models = embedding_models
+            if not filtered_models:
+                st.info("選択されたプロバイダに対応するEmbeddingモデルがありません。")
+                filtered_models = embedding_models
+            embedding_names = [m.get("name", "") for m in filtered_models]
+            embedding_labels = []
+            for m in filtered_models:
+                t = m.get("type") or "unknown"
+                prefix = provider_labels.get(t, t)
+                base_label = m.get("display_name") or m.get("name") or "unknown"
+                embedding_labels.append(f"[{prefix}] {base_label}")
             default_name = st.session_state.get("embedding_model")
             default_indices = []
             if default_name in embedding_names:
                 default_indices = [embedding_names.index(default_name)]
             selected_indices = st.multiselect(
                 "埋め込みモデル（複数選択可）",
-                options=list(range(len(embedding_models))),
+                options=list(range(len(embedding_names))),
                 format_func=lambda i: embedding_labels[i],
                 default=default_indices or [0],
                 key="bulk_embedding_models_select",
@@ -304,6 +414,14 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
             selected_embeddings = [
                 embedding_names[i] for i in selected_indices if 0 <= i < len(embedding_names)
             ]
+            # 先頭のEmbeddingを「共通Embedding」として扱い、グローバルに反映
+            if selected_embeddings:
+                primary_emb = selected_embeddings[0]
+                st.session_state.embedding_model = primary_emb
+                # LLMモデルが決まっていればDBにも保存
+                base_llm_for_persist = selected_llm_model or st.session_state.get("llm_model", "gpt-oss")
+                if base_llm_for_persist:
+                    _persist_model_selection(BACKEND_URL.rstrip("/"), base_llm_for_persist, primary_emb)
         else:
             # バックエンドから取得できなかった場合のフォールバック
             options = [
@@ -390,17 +508,31 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 )
             else:
                 # 質問数と回答数が揃っていない場合は短い方に揃える
-                if len(eval_questions) != len(eval_answers):
-                    min_len = min(len(eval_questions), len(eval_answers))
-                    st.warning(
-                        f"質問数({len(eval_questions)})と回答数({len(eval_answers)})が一致しません。"
-                        f"評価には先頭 {min_len} 件のみを使用します。"
+                total_q = len(eval_questions)
+                total_a = len(eval_answers)
+                max_pairs = min(total_q, total_a)
+                if max_pairs == 0:
+                    st.error(
+                        "評価対象のテキストまたはQ&Aが見つかりません。PDFアップロードとQA自動生成、"
+                        "もしくは『履歴』タブからの復元を行ってから再試行してください。"
                     )
-                    questions_eval = eval_questions[:min_len]
-                    answers_eval = eval_answers[:min_len]
+                    return
+                if total_q != total_a:
+                    st.warning(
+                        f"質問数({total_q})と回答数({total_a})が一致しません。"
+                        f"評価には先頭 {max_pairs} 件のみを使用します。"
+                    )
+
+                question_mode = st.session_state.get("bulk_eval_question_mode", "all")
+                n_limit = st.session_state.get("bulk_eval_question_count")
+
+                if question_mode == "head_n" and isinstance(n_limit, int):
+                    use_n = min(max(n_limit, 1), max_pairs)
                 else:
-                    questions_eval = eval_questions
-                    answers_eval = eval_answers
+                    use_n = max_pairs
+
+                questions_eval = eval_questions[:use_n]
+                answers_eval = eval_answers[:use_n]
 
                 if not selected_embeddings:
                     st.error("少なくとも1つの埋め込みモデルを選択してください。")
@@ -429,6 +561,8 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                             }
                             if file_id:
                                 job["file_id"] = file_id
+                            if selected_llm_model:
+                                job["llm_model"] = selected_llm_model
                             jobs.append(job)
                         else:
                             for size in chunk_sizes:
@@ -445,6 +579,8 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                                     }
                                     if file_id:
                                         job["file_id"] = file_id
+                                    if selected_llm_model:
+                                        job["llm_model"] = selected_llm_model
                                     jobs.append(job)
 
                 if not jobs:
@@ -487,15 +623,36 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                             elif isinstance(data, dict):
                                 flat_results.append(data)
 
-                            if not flat_results:
+                            # エントリを分類: error を含むものはエラー結果として扱い、それ以外を有効結果とする
+                            valid_results: List[Dict[str, Any]] = [
+                                r
+                                for r in flat_results
+                                if isinstance(r, dict) and not r.get("error")
+                            ]
+                            error_results: List[Dict[str, Any]] = [
+                                r
+                                for r in flat_results
+                                if isinstance(r, dict) and r.get("error")
+                            ]
+
+                            if not valid_results:
+                                # すべてエラーだった場合は成功扱いにせず、代表的なエラーを表示して終了
                                 st.error(
-                                    "一括評価APIから有効な結果が返されませんでした。ログを確認してください。"
+                                    "一括評価がすべてエラーで終了しました。設定とバックエンドログを確認してください。"
                                 )
+                                if error_results:
+                                    with st.expander("エラー詳細", expanded=False):
+                                        st.json(error_results[:3])
                             else:
-                                st.session_state.bulk_evaluation_results = flat_results
-                                st.success(
-                                    f"一括評価が完了しました。{len(flat_results)} 件の設定が評価されました。"
+                                st.session_state.bulk_evaluation_results = valid_results
+                                msg = (
+                                    f"一括評価が完了しました。有効な設定: {len(valid_results)} 件"
                                 )
+                                if error_results:
+                                    msg += f"（エラー: {len(error_results)} 件は除外）"
+                                st.success(msg)
+                                # 一括評価完了後に画面を即時更新して結果セクションを表示
+                                st.rerun()
 
         # --- 結果の表示（セッションに保存されたものを使用） ---
         results: List[Dict[str, Any]] = (

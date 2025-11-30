@@ -11,12 +11,100 @@ import streamlit as st
 from http_client import http_get, http_post
 
 
+def _fetch_models(BACKEND_URL: str) -> tuple[list[dict], list[dict]]:
+    """バックエンドの /list_models からLLM/Embeddingモデル一覧を取得する。"""
+    try:
+        resp = http_get(f"{BACKEND_URL}/list_models")
+        resp.raise_for_status()
+        data = (
+            resp.json()
+            if resp.headers.get("Content-Type", "").startswith("application/json")
+            else {}
+        )
+        return data.get("LLM", []) or [], data.get("Embedding", []) or []
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"モデル一覧の取得に失敗しました: {e}")
+        return [], []
+
+
+def _persist_model_selection(BACKEND_URL: str, llm_model: str, embedding_model: str) -> None:
+    """選択されたLLM/Embeddingモデルをバックエンドに保存する。"""
+    payload = {
+        "llm_model": llm_model,
+        "embedding_model": embedding_model,
+    }
+    try:
+        http_post(f"{BACKEND_URL}/config/model_selection", json=payload)
+    except Exception as e:  # noqa: BLE001
+        # 永続化に失敗しても致命的ではないため警告のみにとどめる
+        st.warning(f"モデル選択の保存に失敗しました: {e}")
+
+
 def render_chatbot_tab(
     tab, BACKEND_URL: str, save_state_to_localstorage: Callable[[], None]
 ) -> None:
     """チャットボットタブのUIとロジックを描画する。"""
     with tab:
         st.header("チャットボット")
+
+        # --- チャット用LLM / Embeddingモデルの選択 ---
+        llm_models, embedding_models = _fetch_models(BACKEND_URL.rstrip("/"))
+
+        # LLMモデル選択
+        selected_llm_name = (
+            st.session_state.get("chat_model")
+            or st.session_state.get("llm_model")
+            or "gpt-oss"
+        )
+        if llm_models:
+            llm_names = [m.get("name", "") for m in llm_models]
+            llm_labels: list[str] = []
+            for m in llm_models:
+                provider = m.get("type") or "unknown"
+                display = m.get("display_name") or m.get("name") or "unknown"
+                llm_labels.append(f"[{provider}] {display}")
+            if selected_llm_name in llm_names:
+                default_llm_idx = llm_names.index(selected_llm_name)
+            else:
+                default_llm_idx = 0
+                selected_llm_name = llm_names[0]
+            idx_llm = st.selectbox(
+                "チャット用LLMモデル",
+                options=list(range(len(llm_names))),
+                format_func=lambda i: llm_labels[i],
+                index=default_llm_idx,
+                key="chat_llm_model_select",
+            )
+            selected_llm_name = llm_names[idx_llm]
+        st.session_state.chat_model = selected_llm_name
+        st.session_state.llm_model = selected_llm_name
+
+        # Embeddingモデル選択
+        selected_emb_name = st.session_state.get("embedding_model", "huggingface_bge_small")
+        if embedding_models:
+            emb_names = [m.get("name", "") for m in embedding_models]
+            emb_labels: list[str] = []
+            for m in embedding_models:
+                provider = m.get("type") or "unknown"
+                display = m.get("display_name") or m.get("name") or "unknown"
+                emb_labels.append(f"[{provider}] {display}")
+            if selected_emb_name in emb_names:
+                default_emb_idx = emb_names.index(selected_emb_name)
+            else:
+                default_emb_idx = 0
+                selected_emb_name = emb_names[0]
+            idx_emb = st.selectbox(
+                "チャット用Embeddingモデル",
+                options=list(range(len(emb_names))),
+                format_func=lambda i: emb_labels[i],
+                index=default_emb_idx,
+                key="chat_embedding_model_select",
+            )
+            selected_emb_name = emb_names[idx_emb]
+        st.session_state.embedding_model = selected_emb_name
+
+        # 選択内容をバックエンドに永続化
+        _persist_model_selection(BACKEND_URL.rstrip("/"), selected_llm_name, selected_emb_name)
 
         # チャット送信後に入力欄が画面下に来るように自動スクロール
         if st.session_state.get("chat_scroll_to_bottom"):
@@ -389,4 +477,7 @@ def render_chatbot_tab(
 
             # 画面を更新
             st.session_state["chat_scroll_to_bottom"] = True
+            # 新しいメッセージ送信時は日付フィルタをリセットして全履歴を表示する
+            if "chat_history_date_selectbox" in st.session_state:
+                st.session_state["chat_history_date_selectbox"] = None
             st.rerun()

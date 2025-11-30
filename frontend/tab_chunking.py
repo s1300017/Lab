@@ -56,6 +56,18 @@ def _fetch_embedding_models(BACKEND_URL: str) -> List[Dict[str, str]]:
         return []
 
 
+def _persist_model_selection(BACKEND_URL: str, llm_model: str, embedding_model: str) -> None:
+    """選択されたLLM/Embeddingモデルをバックエンドに保存する。"""
+    payload = {
+        "llm_model": llm_model,
+        "embedding_model": embedding_model,
+    }
+    try:
+        http_post(f"{BACKEND_URL}/config/model_selection", json=payload)
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"モデル選択の保存に失敗しました: {e}")
+
+
 def render_chunking_tab(
     tab_chunking: Any,
     BACKEND_URL: str,
@@ -76,6 +88,32 @@ def render_chunking_tab(
             "PDFから抽出したテキストをどのようにチャンク分割するかを試行できます。\n"
             "一括評価タブと同じパラメータ体系で、サンプルテキストに対するチャンキング結果を確認できます。"
         )
+
+        # --- 共通Embeddingモデルの選択（RAG/チャンキング用） ---
+        embedding_models_all = _fetch_embedding_models(BACKEND_URL)
+        if embedding_models_all:
+            embedding_names_all = [m.get("name", "") for m in embedding_models_all]
+            embedding_labels_all = [
+                m.get("display_name") or m.get("name") or "unknown" for m in embedding_models_all
+            ]
+            current_emb = st.session_state.get("embedding_model", "huggingface_bge_small")
+            default_emb_idx = (
+                embedding_names_all.index(current_emb)
+                if current_emb in embedding_names_all
+                else 0
+            )
+            idx_global_emb = st.selectbox(
+                "RAG/チャンキング用の共通Embeddingモデル",
+                options=list(range(len(embedding_names_all))),
+                format_func=lambda i: embedding_labels_all[i],
+                index=default_emb_idx,
+                key="chunking_global_embedding_select",
+            )
+            selected_global_emb = embedding_names_all[idx_global_emb]
+            st.session_state["embedding_model"] = selected_global_emb
+            # 現在のLLMモデルとあわせて永続化（LLMは既存の選択をそのまま利用）
+            current_llm = st.session_state.get("llm_model", "gpt-oss")
+            _persist_model_selection(BACKEND_URL, current_llm, selected_global_emb)
 
         # --- 対象PDFの選択 ---
         history_pdfs = _fetch_history_pdfs(BACKEND_URL)
@@ -179,7 +217,7 @@ def render_chunking_tab(
         similarity_threshold = 0.7
         if chunk_method == "semantic":
             st.markdown("### セマンティックチャンキング設定")
-            embedding_models = _fetch_embedding_models(BACKEND_URL)
+            embedding_models = embedding_models_all or _fetch_embedding_models(BACKEND_URL)
             if embedding_models:
                 embedding_names = [m.get("name", "") for m in embedding_models]
                 embedding_labels = [
@@ -235,6 +273,8 @@ def render_chunking_tab(
                     chunks = data.get("chunks", []) or []
                     st.session_state["chunk_preview_chunks"] = chunks
                     st.success(f"{len(chunks)} 個のチャンクを生成しました。下で内容を確認できます。")
+                    # チャンキング結果を反映した後に画面を再実行して統計・プレビューを更新
+                    st.rerun()
 
         chunks_preview: List[str] = st.session_state.get("chunk_preview_chunks", []) or []
         if chunks_preview:
@@ -271,45 +311,52 @@ def render_chunking_tab(
                         "chunk_overlap": int(chunk_overlap) if chunk_method != "semantic" else None,
                         "similarity_threshold": float(similarity_threshold) if chunk_method == "semantic" else None,
                     }
-                    try:
-                        resp_vs = http_post(f"{BACKEND_URL}/build_vectorstore/", json=payload_vs)
-                    except Exception as e:  # noqa: BLE001
-                        st.error(f"/build_vector_store API呼び出し中にエラーが発生しました: {e}")
-                    else:
-                        if resp_vs.status_code != 200:
-                            st.error(f"ベクトルストア再構築APIエラー: {resp_vs.status_code} {resp_vs.text}")
+                    progress_placeholder = st.empty()
+                    with st.spinner("ベクトルストアを再構築中です…（数分かかる場合があります）"):
+                        progress_placeholder.info(
+                            "ベクトルストア再構築を開始しました。バックエンドでチャンク化とPGVector構築を実行しています…"
+                        )
+                        try:
+                            resp_vs = http_post(f"{BACKEND_URL}/build_vectorstore/", json=payload_vs)
+                        except Exception as e:  # noqa: BLE001
+                            progress_placeholder.empty()
+                            st.error(f"/build_vector_store API呼び出し中にエラーが発生しました: {e}")
                         else:
-                            data_vs = (
-                                resp_vs.json()
-                                if resp_vs.headers.get("Content-Type", "").startswith("application/json")
-                                else {}
-                            )
-                            num_chunks = data_vs.get("num_chunks")
-                            collection_name = data_vs.get("collection_name")
-
-                            lines: list[str] = []
-                            if isinstance(num_chunks, int):
-                                lines.append(
-                                    f"ベクトルストアの再構築が完了しました。（チャンク数: {num_chunks}）"
-                                )
+                            progress_placeholder.empty()
+                            if resp_vs.status_code != 200:
+                                st.error(f"ベクトルストア再構築APIエラー: {resp_vs.status_code} {resp_vs.text}")
                             else:
-                                lines.append("ベクトルストアの再構築が完了しました。")
-
-                            # 画面上で指定されたチャンキング設定をまとめて表示
-                            if chunk_method == "semantic":
-                                detail = (
-                                    f"方式: semantic / Embedding: {payload_vs.get('embedding_model')} / "
-                                    f"類似度しきい値: {payload_vs.get('similarity_threshold')}"
+                                data_vs = (
+                                    resp_vs.json()
+                                    if resp_vs.headers.get("Content-Type", "").startswith("application/json")
+                                    else {}
                                 )
-                            else:
-                                detail = (
-                                    f"方式: {chunk_method} / サイズ: {payload_vs.get('chunk_size')} / "
-                                    f"オーバーラップ: {payload_vs.get('chunk_overlap')}"
-                                )
-                            lines.append(f"チャンキング設定: {detail}")
+                                num_chunks = data_vs.get("num_chunks")
+                                collection_name = data_vs.get("collection_name")
 
-                            if collection_name:
-                                lines.append(f"コレクション名: {collection_name}")
+                                lines: list[str] = []
+                                if isinstance(num_chunks, int):
+                                    lines.append(
+                                        f"ベクトルストアの再構築が完了しました。（チャンク数: {num_chunks}）"
+                                    )
+                                else:
+                                    lines.append("ベクトルストアの再構築が完了しました。")
 
-                            st.success("\n".join(lines))
+                                # 画面上で指定されたチャンキング設定をまとめて表示
+                                if chunk_method == "semantic":
+                                    detail = (
+                                        f"方式: semantic / Embedding: {payload_vs.get('embedding_model')} / "
+                                        f"類似度しきい値: {payload_vs.get('similarity_threshold')}"
+                                    )
+                                else:
+                                    detail = (
+                                        f"方式: {chunk_method} / サイズ: {payload_vs.get('chunk_size')} / "
+                                        f"オーバーラップ: {payload_vs.get('chunk_overlap')}"
+                                    )
+                                lines.append(f"チャンキング設定: {detail}")
+
+                                if collection_name:
+                                    lines.append(f"コレクション名: {collection_name}")
+
+                                st.success("\n".join(lines))
 

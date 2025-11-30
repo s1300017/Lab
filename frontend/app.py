@@ -127,6 +127,165 @@ except Exception as e:
     BACKEND_URL = os.environ.get('BACKEND_URL', 'http://backend:8000')
 
 
+def sync_model_selection_from_backend(ttl_sec: float = 60.0) -> None:
+    """バックエンドの /config/model_selection からLLM/Embedding選択を復元し、
+    session_state に反映する。ttl_sec 以内に同期済みなら再取得しない。"""
+    now = time.time()
+    cached_ts = st.session_state.get("_model_selection_synced_ts")
+    if isinstance(cached_ts, (int, float)) and now - cached_ts < ttl_sec:
+        return
+
+    try:
+        resp = http_get(f"{BACKEND_URL}/config/model_selection")
+    except Exception as e:  # noqa: BLE001
+        # バックエンド未起動などの場合はデフォルトのまま進める
+        print(f"[WARN] model_selection取得エラー: {e}")
+        return
+
+    if resp.status_code != 200 or not resp.headers.get("Content-Type", "").startswith("application/json"):
+        return
+
+    try:
+        data = resp.json() or {}
+    except Exception:
+        return
+
+    llm = (data.get("llm_model") or st.session_state.get("llm_model") or "gpt-oss").strip()
+    emb = (data.get("embedding_model") or st.session_state.get("embedding_model") or "huggingface_bge_small").strip()
+    # DBに保存されているモデル選択をグローバル状態に反映
+    st.session_state.llm_model = llm
+    st.session_state.embedding_model = emb
+    # チャットタブで使用する chat_model も常に最新の llm_model に合わせる
+    # （以前は初期化時のみ同期していたため、リロード直後に旧デフォルトで上書きされてしまっていた）
+    st.session_state.chat_model = llm
+    st.session_state["_model_selection_synced_ts"] = now
+
+
+# 起動時に一度だけモデル選択状態を同期
+sync_model_selection_from_backend()
+
+
+def fetch_inference_mode(ttl_sec: float = 30.0) -> str:
+    """バックエンドから現在の推論モードを取得する。失敗時はmac_localを返す。
+
+    ttl_sec 秒以内に取得済みの値があれば、そのキャッシュを優先する。
+    """
+    now = time.time()
+    cached_mode = st.session_state.get("_inference_mode_cache")
+    cached_ts = st.session_state.get("_inference_mode_cache_ts")
+    if cached_mode is not None and isinstance(cached_ts, (int, float)) and now - cached_ts < ttl_sec:
+        return cached_mode
+
+    new_mode: str | None = None
+    try:
+        resp = http_get(f"{BACKEND_URL}/config/inference_mode")
+        if resp.status_code == 200 and resp.headers.get("Content-Type", "").startswith("application/json"):
+            data = resp.json() or {}
+            mode_candidate = data.get("mode") or "mac_local"
+            if mode_candidate in ("mac_local", "windows_gpu"):
+                new_mode = mode_candidate
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"推論モード取得中にエラーが発生しました: {e}")
+
+    if new_mode is not None:
+        st.session_state["_inference_mode_cache"] = new_mode
+        st.session_state["_inference_mode_cache_ts"] = now
+        return new_mode
+
+    # HTTP取得に失敗した場合は既存キャッシュを優先し、それもなければmac_localを返す
+    if cached_mode is not None:
+        return cached_mode
+
+    st.session_state["_inference_mode_cache"] = "mac_local"
+    st.session_state["_inference_mode_cache_ts"] = now
+    return "mac_local"
+
+
+def fetch_inference_health(ttl_sec: float = 30.0) -> dict | None:
+    """現在の推論モードに基づき、バックエンド経由で Ollama API への疎通状況を取得する。
+
+    ttl_sec 秒以内に取得済みの値があれば、そのキャッシュを優先する。
+    """
+    now = time.time()
+    cached_health = st.session_state.get("_inference_health_cache")
+    cached_ts = st.session_state.get("_inference_health_cache_ts")
+    if cached_health is not None and isinstance(cached_ts, (int, float)) and now - cached_ts < ttl_sec:
+        return cached_health
+
+    try:
+        resp = http_get(f"{BACKEND_URL}/config/inference_health")
+        if resp.status_code == 200 and resp.headers.get("Content-Type", "").startswith("application/json"):
+            health = resp.json() or {}
+            st.session_state["_inference_health_cache"] = health
+            st.session_state["_inference_health_cache_ts"] = now
+            return health
+        st.error(f"推論先疎通テストに失敗しました: {resp.status_code} {resp.text}")
+    except Exception as e:  # noqa: BLE001
+        st.error(f"推論先疎通テスト中にエラーが発生しました: {e}")
+
+    # HTTP取得に失敗した場合は既存キャッシュを優先し、それもなければNone
+    if cached_health is not None:
+        return cached_health
+    return None
+
+
+# --- 推論先（Mac / Windows）の切り替えUI ---
+mode_labels = {
+    "mac_local": "Macローカル（このMacで実行）",
+    "windows_gpu": "Windows GPU（RTX 3080 Tiで実行）",
+}
+current_mode = fetch_inference_mode()
+current_label = mode_labels.get(current_mode, mode_labels["mac_local"])
+label_list = list(mode_labels.values())
+try:
+    current_index = label_list.index(current_label)
+except ValueError:
+    current_index = 0
+selected_label = st.radio(
+    "推論先（LLM / OCR の実行環境）",
+    options=label_list,
+    index=current_index,
+    horizontal=True,
+)
+label_to_mode = {v: k for k, v in mode_labels.items()}
+selected_mode = label_to_mode.get(selected_label, "mac_local")
+if selected_mode != current_mode:
+    try:
+        resp = http_post(f"{BACKEND_URL}/config/inference_mode", json={"mode": selected_mode})
+        if resp.status_code != 200:
+            st.error(f"推論モード更新に失敗しました: {resp.status_code} {resp.text}")
+        else:
+            # モード更新に成功した場合はキャッシュを即時反映し、ヘルスチェックキャッシュを無効化
+            st.session_state["_inference_mode_cache"] = selected_mode
+            st.session_state["_inference_mode_cache_ts"] = time.time()
+            st.session_state.pop("_inference_health_cache", None)
+            st.session_state.pop("_inference_health_cache_ts", None)
+            try:
+                st.toast(f"推論先を「{selected_label}」に切り替えました。")
+            except Exception:
+                st.info(f"推論先を「{selected_label}」に切り替えました。")
+    except Exception as e:  # noqa: BLE001
+        st.error(f"推論モード更新中にエラーが発生しました: {e}")
+
+# 常に現在の疎通状況を確認して表示
+health = fetch_inference_health()
+if health is not None:
+    mode = health.get("mode", "mac_local")
+    base_url = health.get("base_url", "-")
+    ok = bool(health.get("ok", False))
+    status_code = health.get("status_code")
+    error = health.get("error")
+    mode_label = mode_labels.get(mode, mode)
+    if ok:
+        msg = f"現在の推論先: {mode_label} @ {base_url}（Ollama API 応答OK: status={status_code}）"
+        st.success(msg)
+    else:
+        msg = f"現在の推論先: {mode_label} @ {base_url} への疎通に失敗しました。status={status_code if status_code is not None else '-'}"
+        if error:
+            msg += f" / error={error}"
+        st.error(msg)
+
+
 def clear_database():
     try:
         response = http_post(f"{BACKEND_URL}/clear_db/")
@@ -280,7 +439,8 @@ render_overview_tab(tab_overview)
 # タブ1: チャンキング設定
 render_chunking_tab(tab1, BACKEND_URL, save_state_to_localstorage)
 # メインコンテンツ
-if not st.session_state.text:
+upload_processing = bool(st.session_state.get("upload_processing", False))
+if (not st.session_state.text) and (not upload_processing):
     # 歴史データの有無を確認し、全画面アクセス可否を案内（停止はしない）
     try:
         resp_pdf = http_get(f"{BACKEND_URL}/history/pdf-files")
@@ -477,12 +637,56 @@ with tab_history:
                             st.success("PDFを復元しました。各タブから操作できます。")
                             st.rerun()
 
+                col_generate_qa, _ = st.columns([1, 3])
+                with col_generate_qa:
+                    if st.button("このPDFから質問を生成する", key=f"generate_qa_for_history_{selected_pdf['id']}"):
+                        with st.spinner("このPDFから質問を生成中です..."):
+                            try:
+                                question_model = selected_pdf.get("question_llm_model") or "mistral"
+                                answer_model = selected_pdf.get("answer_llm_model") or "mistral"
+                                resp_qa = http_post(
+                                    f"{BACKEND_URL}/pdf/{selected_pdf['id']}/generate_qa",
+                                    data={
+                                        "question_llm_model": question_model,
+                                        "answer_llm_model": answer_model,
+                                    },
+                                )
+                                if resp_qa.status_code == 200:
+                                    qa_data = (
+                                        resp_qa.json()
+                                        if resp_qa.headers.get("Content-Type", "").startswith("application/json")
+                                        else {}
+                                    )
+                                    st.success("質問・回答の自動生成が完了しました。")
+                                    st.rerun()
+                                else:
+                                    st.error(f"質問生成APIエラー: {resp_qa.status_code} {resp_qa.text}")
+                            except Exception as e:
+                                st.error(f"質問生成API呼び出し中にエラーが発生しました: {e}")
+
                 # 生成QA一覧
                 st.markdown("### 生成QA一覧")
                 with st.spinner("生成QAを取得中..."):
                     code_q, data_q = history_api_get(f"{BACKEND_URL}/history/pdf-files/{selected_pdf['id']}/questions")
                 if code_q == 200 and isinstance(data_q, dict):
                     qa_items = data_q.get("items", [])
+                    if not qa_items:
+                        code_x, data_x = history_api_get(f"{BACKEND_URL}/get_extracted/{selected_pdf['id']}")
+                        if code_x == 200 and isinstance(data_x, dict):
+                            extracted_questions = data_x.get("questions") or []
+                            extracted_answers = data_x.get("answers") or []
+                            extracted_meta = data_x.get("qa_meta") or []
+                            for idx_q, q in enumerate(extracted_questions):
+                                a = extracted_answers[idx_q] if idx_q < len(extracted_answers) else ""
+                                meta_val = extracted_meta[idx_q] if idx_q < len(extracted_meta) else {}
+                                qa_items.append(
+                                    {
+                                        "question": q,
+                                        "answer": a,
+                                        "meta_json": meta_val,
+                                    }
+                                )
+
                     if qa_items:
                         import pandas as pd
 
@@ -566,16 +770,14 @@ with tab_history:
                                 candidates = meta.get("candidates", [])
                                 candidate_scores = meta.get("candidate_scores", [])
                                 if candidates and len(candidates) > 1:
-                                    with st.expander("候補回答リスト（スコア付き）"):
+                                    with st.expander("候補回答リスト（スコア付き"):
                                         for cand, cand_score in zip(candidates, candidate_scores):
                                             if isinstance(cand_score, (int, float)):
                                                 st.markdown(f"- {cand}（スコア: {cand_score:.3f}）")
                                             else:
                                                 st.markdown(f"- {cand}")
-                        else:
-                            st.info("生成QAはまだ保存されていません。")
                     else:
-                        st.error(f"生成QA取得エラー: {code_q} {data_q}")
+                        st.info("生成QAはまだ保存されていません。")
                 else:
                     st.error(f"生成QA取得エラー: {code_q} {data_q}")
                 st.markdown("### チャンク一覧")

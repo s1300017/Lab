@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from http_client import http_post, http_delete
-from evaluation_history_ui import show_evaluation_history
+from evaluation_history_ui import show_evaluation_history, _render_bulk_style_charts
 
 
 def render_history_tab(
@@ -402,6 +402,93 @@ def render_history_tab(
                                         st.rerun()
                     else:
                         st.error(f"チャンク取得エラー: {code_c} {data_c}")
+
+                    # このPDFに紐づく一括評価結果の再表示
+                    st.markdown("### このPDFの一括評価結果")
+                    with st.spinner("評価結果を取得中..."):
+                        code_e, data_e = history_api_get(
+                            f"{BACKEND_URL}/history/experiments"
+                        )
+                    if code_e == 200 and isinstance(data_e, dict):
+                        exp_items = data_e.get("items", data_e.get("experiments", [])) or []
+                        pdf_id = selected_pdf.get("id")
+                        # experimentsテーブルのpdf_file_idと紐づけて、このPDFに対応する実験のみ抽出
+                        exp_for_pdf = [
+                            it for it in exp_items if str(it.get("pdf_file_id")) == str(pdf_id)
+                        ]
+                        if not exp_for_pdf:
+                            st.info("このPDFに対する一括評価結果はまだありません。")
+                        else:
+                            # 実験ごとのラベル（実験名＋作成日時）を整形
+                            exp_labels: list[str] = []
+                            for it in exp_for_pdf:
+                                name = it.get("experiment_name") or f"ID:{it.get('id')}"
+                                created_at = it.get("created_at") or ""
+                                label = name
+                                if created_at:
+                                    label = f"{name}（{created_at}）"
+                                exp_labels.append(label)
+
+                            selected_exp_idx = st.selectbox(
+                                "評価結果を表示する実験",
+                                options=list(range(len(exp_for_pdf))),
+                                format_func=lambda i: exp_labels[i],
+                                key=f"pdf_eval_experiment_select_{pdf_id}",
+                            )
+                            selected_exp = exp_for_pdf[selected_exp_idx]
+                            exp_id = selected_exp.get("id")
+
+                            if exp_id is not None:
+                                with st.spinner("実験結果を取得中..."):
+                                    code_r, data_r = history_api_get(
+                                        f"{BACKEND_URL}/history/experiments/{exp_id}/results"
+                                    )
+                                if code_r == 200 and isinstance(data_r, dict):
+                                    results = data_r.get("items", data_r.get("results", [])) or []
+                                    if results:
+                                        result_df = pd.DataFrame(results)
+
+                                        # 一覧用の代表的なカラムのみ抜粋して表示
+                                        result_columns = [
+                                            "embedding_model",
+                                            "chunk_strategy",
+                                            "chunk_size",
+                                            "chunk_overlap",
+                                            "num_chunks",
+                                            "avg_chunk_len",
+                                            "overall_score",
+                                            "faithfulness",
+                                            "answer_relevancy",
+                                            "context_recall",
+                                            "context_precision",
+                                            "answer_correctness",
+                                            "answer_similarity",
+                                        ]
+                                        available_result_columns = [
+                                            col
+                                            for col in result_columns
+                                            if col in result_df.columns
+                                        ]
+                                        if available_result_columns:
+                                            st.write("**評価結果一覧（このPDF）**")
+                                            st.dataframe(
+                                                result_df[available_result_columns],
+                                                use_container_width=True,
+                                            )
+
+                                        # evaluation_history_uiと同じスタイルのグラフ群を再利用
+                                        st.write("**このPDFの一括評価グラフ**")
+                                        key_prefix = f"pdf_{pdf_id}_exp_{exp_id}_"
+                                        _render_bulk_style_charts(
+                                            result_df,
+                                            key_prefix=key_prefix,
+                                        )
+                                    else:
+                                        st.info("この実験の結果データがありません。")
+                                else:
+                                    st.error(f"評価結果取得エラー: {code_r} {data_r}")
+                    else:
+                        st.error(f"実験履歴取得エラー: {code_e} {data_e}")
 
                     # チャット履歴（PDF単位／全PDF横断）
                     st.markdown("### チャット履歴")

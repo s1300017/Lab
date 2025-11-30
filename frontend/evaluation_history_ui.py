@@ -16,8 +16,11 @@ def _create_label(row: pd.Series) -> str:
     chunk_size = row.get("chunk_size")
     if chunk_strategy.lower() in {"semantic", "sentence", "paragraph"}:
         return chunk_strategy.lower()
-    if chunk_size is not None and chunk_size != "" and not pd.isna(chunk_size):
-        return f"{chunk_strategy}-{chunk_size}"
+    # pandas.NA を含む値に対して直接 ==/!= を行うと "boolean value of NA is ambiguous" になるため、
+    # 先に pd.isna で判定してからその他の条件をチェックする
+    if chunk_size is not None and not pd.isna(chunk_size):
+        if chunk_size != "":
+            return f"{chunk_strategy}-{chunk_size}"
     return chunk_strategy or "unknown"
 
 
@@ -166,6 +169,10 @@ def _render_bulk_style_charts(results_df: pd.DataFrame, key_prefix: str = "") ->
 
     df = results_df.copy()
 
+    # embedding_model 列が存在しない場合はダミー値で補完し、グラフ描画時の KeyError を防ぐ
+    if "embedding_model" not in df.columns:
+        df["embedding_model"] = "unknown"
+
     if "chunk_strategy" not in df.columns and "chunk_method" in df.columns:
         df["chunk_strategy"] = df["chunk_method"]
     if "overlap" not in df.columns and "chunk_overlap" in df.columns:
@@ -302,12 +309,13 @@ def apply_bulk_chunk_settings_from_history(row: Mapping[str, Any]) -> None:
     if chunk_method != "semantic":
         size_val = row.get("chunk_size")
         overlap_val = row.get("chunk_overlap")
-        if size_val is not None and size_val != "" and not pd.isna(size_val):
+        # pandas.NA に対しては常にスキップする
+        if size_val is not None and not pd.isna(size_val) and size_val != "":
             try:
                 st.session_state["bulk_chunk_sizes_select"] = [int(size_val)]
             except Exception:
                 pass
-        if overlap_val is not None and overlap_val != "" and not pd.isna(overlap_val):
+        if overlap_val is not None and not pd.isna(overlap_val) and overlap_val != "":
             try:
                 st.session_state["bulk_chunk_overlaps_select"] = [int(overlap_val)]
             except Exception:

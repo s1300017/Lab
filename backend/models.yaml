@@ -4,6 +4,16 @@ models:
     category: "LLM"
     display_name: "GPT-OSS 20B (Ollama)"
     description: "Ollamaで実行されるGPT-OSS 20Bモデル。オープンソースの大規模言語モデルで、高性能な推論が可能です。"
+  - name: gpt-oss-20b-cloud
+    type: ollama
+    category: "LLM"
+    display_name: "GPT-OSS 20B Cloud (Ollama Cloud)"
+    description: "Ollama Cloudで実行されるGPT-OSS 20Bモデル。大規模パラメータ版をクラウドGPUで利用します。利用前にホストで `ollama signin` と `ollama pull gpt-oss:20b-cloud` を実行してください。"
+  - name: gpt-oss-120b-cloud
+    type: ollama
+    category: "LLM"
+    display_name: "GPT-OSS 120B Cloud (Ollama Cloud)"
+    description: "Ollama Cloudで実行されるGPT-OSS 120Bモデル。より高性能な推論が可能です。利用前にホストで `ollama signin` と `ollama pull gpt-oss:120b-cloud` を実行してください。"
   - name: llama3
     type: ollama
     category: "LLM"
@@ -58,6 +68,18 @@ models:
     category: "Embedding"
     display_name: "bge-m3 (Ollama)"
     description: "多言語対応のBGE埋め込み。日本語で高品質な類似度が得られます。利用前にホストで `ollama pull bge-m3` を実行してください。"
+
+  - name: qwen3-embedding
+    type: ollama
+    category: "Embedding"
+    display_name: "Qwen3 Embedding (Ollama)"
+    description: "Qwen3シリーズの多言語対応埋め込みモデル。日本語を含む100以上の言語に対応した高精度な埋め込みです。利用前にホストで `ollama pull qwen3-embedding` を実行してください。"
+
+  - name: snowflake-arctic-embed2
+    type: ollama
+    category: "Embedding"
+    display_name: "Snowflake Arctic Embed 2 (Ollama)"
+    description: "Snowflakeの多言語対応埋め込みモデル Arctic Embed 2.0。日本語を含む多言語テキスト検索に適した高品質なベクトル表現を提供します。利用前にホストで `ollama pull snowflake-arctic-embed2` を実行してください。"
 
   # --- HuggingFace: Jina Embeddings v4 ---
   - name: jina-embeddings-v4

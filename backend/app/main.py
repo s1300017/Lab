@@ -49,6 +49,40 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 app = FastAPI()
 
 
+# --- Ollama接続先の推論モード管理（mac_local / windows_gpu） ---
+_ALLOWED_INFERENCE_MODES = {"mac_local", "windows_gpu"}
+_INFERENCE_MODE_LOCK = threading.Lock()
+_INFERENCE_MODE = os.environ.get("INFERENCE_MODE", "mac_local")
+if _INFERENCE_MODE not in _ALLOWED_INFERENCE_MODES:
+    _INFERENCE_MODE = "mac_local"
+
+
+def get_inference_mode() -> str:
+    """現在の推論モードを取得する（スレッドセーフ）。"""
+    with _INFERENCE_MODE_LOCK:
+        return _INFERENCE_MODE
+
+
+def set_inference_mode(mode: str) -> None:
+    """推論モードを更新する（スレッドセーフ）。"""
+    if mode not in _ALLOWED_INFERENCE_MODES:
+        raise ValueError(f"未対応の推論モードです: {mode}")
+    global _INFERENCE_MODE
+    with _INFERENCE_MODE_LOCK:
+        _INFERENCE_MODE = mode
+
+
+def get_ollama_base_url() -> str:
+    """推論モードに応じてOllamaのベースURLを返すヘルパー。"""
+    mode = get_inference_mode()
+    mac_url = os.environ.get("OLLAMA_BASE_URL_MAC") or os.environ.get("OLLAMA_BASE_URL") or "http://ollama:11434"
+    if mode == "windows_gpu":
+        windows_url = os.environ.get("OLLAMA_BASE_URL_WINDOWS")
+        if windows_url:
+            return windows_url
+    return mac_url
+
+
 class UploadJobStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -229,7 +263,7 @@ async def startup_event():
             try:
                 import urllib.request, urllib.error
                 import json as _json
-                base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+                base_url = get_ollama_base_url()
                 targets = [
                     {"model": "mistral:latest", "prompt": "ping", "stream": False},
                     {"model": "llama3:latest", "prompt": "ping", "stream": False},
@@ -411,6 +445,16 @@ def init_db():
                     );
                 """))
 
+                # モデル選択状態を永続化するためのテーブル
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS model_selection (
+                        id INTEGER PRIMARY KEY,
+                        llm_model TEXT,
+                        embedding_model TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """))
+
                 # コミットは自動的に行われる
                 
     except Exception as e:
@@ -549,11 +593,14 @@ def _run_pdf_upload_pipeline_sync(
     answer_llm_model: str,
     generate_image_captions: bool,
     ocr_engine: str,
+    ocr_quality: str = "balanced",
+    ocr_image_compression: str = "balanced",
     job_id: Optional[str] = None,
 ) -> dict:
     """PDFアップロード処理パイプラインを同期的に実行するヘルパー関数。
 
-    job_id が指定された場合は、進捗更新とキャンセルチェックを行う。
+    ここでは PDF→テキスト抽出（+クレンジング）までを行い、その結果のみを
+    JSON/ストレージ/DB に保存する。QA生成やチャンク生成は別APIで行う。
     """
     import io
 
@@ -576,6 +623,23 @@ def _run_pdf_upload_pipeline_sync(
         _update_job_progress(job_id, "PDFテキストを抽出中です（OCRエンジン選択中）…")
         text = ""
         normalized_engine = (ocr_engine or "").lower()
+        ocr_quality = (ocr_quality or "balanced").lower()
+        if ocr_quality not in {"fast", "balanced", "high"}:
+            ocr_quality = "balanced"
+
+        ocr_image_compression = (ocr_image_compression or "balanced").lower()
+        if ocr_image_compression not in {"light", "balanced", "high"}:
+            ocr_image_compression = "balanced"
+
+        if ocr_image_compression == "light":
+            resize_max = int(os.getenv("OLLAMA_DEEPSEEK_IMG_MAX_LIGHT", "1200"))
+            jpeg_quality = int(os.getenv("OLLAMA_DEEPSEEK_JPEG_Q_LIGHT", "70"))
+        elif ocr_image_compression == "high":
+            resize_max = int(os.getenv("OLLAMA_DEEPSEEK_IMG_MAX_HIGH", "2048"))
+            jpeg_quality = int(os.getenv("OLLAMA_DEEPSEEK_JPEG_Q_HIGH", "92"))
+        else:
+            resize_max = int(os.getenv("OLLAMA_DEEPSEEK_IMG_MAX_BALANCED", "1600"))
+            jpeg_quality = int(os.getenv("OLLAMA_DEEPSEEK_JPEG_Q_BALANCED", "85"))
         use_mlx_ocr = normalized_engine in {"mlx", "deepseek_mlx"}
         use_ollama_ocr = normalized_engine in {"ollama_deepseek", "deepseek_ocr", "deepseek-ocr"}
         if use_ollama_ocr:
@@ -596,15 +660,23 @@ def _run_pdf_upload_pipeline_sync(
         if use_ollama_ocr:
             _raise_if_job_cancelled(job_id)
             _update_job_progress(job_id, "Ollama DeepSeek OCR でPDFテキストを抽出中です…")
+            if ocr_quality == "fast":
+                quality_max_pages = 5
+            elif ocr_quality == "high":
+                quality_max_pages = None
+            else:
+                quality_max_pages = 20
             try:
                 text = run_deepseek_ocr_via_ollama_for_pdf(
                     contents,
                     model=os.getenv("OLLAMA_DEEPSEEK_OCR_MODEL"),
                     prompt=os.getenv("OLLAMA_DEEPSEEK_OCR_PROMPT", DEFAULT_OCR_PROMPT),
-                    max_pages=None,
+                    max_pages=quality_max_pages,
                     dpi=int(os.getenv("OLLAMA_DEEPSEEK_DPI", "300")),
                     timeout=int(os.getenv("OLLAMA_DEEPSEEK_TIMEOUT", "600")),
                     image_output_dir=IMAGES_DIR / file_id,
+                    resize_max=resize_max,
+                    jpeg_quality=jpeg_quality,
                 )
             except Exception as e:
                 warning_message += "Ollama DeepSeek OCR によるテキスト抽出に失敗したため、PyPDFベースにフォールバックします。\n"
@@ -699,7 +771,6 @@ def _run_pdf_upload_pipeline_sync(
             text = cleanse_pdf_text(text)
 
         sample_text = text[:3000] if len(text) > 3000 else text
-        context_sentences = split_sentences(text)
         print(
             f"[重要] PDF抽出完了: 合計{len(text)}文字, サンプル={sample_text[:100]}..."
         )
@@ -709,291 +780,16 @@ def _run_pdf_upload_pipeline_sync(
 
     _raise_if_job_cancelled(job_id)
 
-    _update_job_progress(job_id, "質問生成用 LLM を初期化中です…")
-    print("[重要] LLM質問生成開始 (選択モデル)")
-    llm_q_instance, resolved_question_llm = init_generation_llm(
-        question_llm_model,
-        purpose="question_generation",
-        temperature=0.2,
-        top_p=0.85,
-        num_predict=320,
-        max_tokens=320,
-    )
-    print(f"[重要] 質問生成LLM: {resolved_question_llm}")
-    prompt_q = textwrap.dedent(
-        f"""
-        あなたはPDF文書の内容を確認する質問を生成する専門アシスタントです。
-        以下の制約を守り、日本語で代表的な質問を5件作成してください。
-        - 質問は具体的かつ本文に直接基づく内容にすること。
-        - 文書に記載がない推測的な質問は避けること。
-        - 質問は箇条書きではなく、1行の文章形式で記述すること。
-
-        ### 文書抜粋
-        {text[:1800]}
-
-        ### 出力形式
-        質問のみを1行ずつ列挙してください。
-        """
-    ).strip()
-    try:
-        _raise_if_job_cancelled(job_id)
-        _update_job_progress(job_id, "PDF内容に基づく質問を生成中です…")
-        questions_resp = llm_q_instance.invoke(prompt_q)
-        raw_questions_text = _extract_answer_text(questions_resp)
-        print(f"[重要] LLM質問生成レスポンス取得: {len(raw_questions_text)}文字")
-        questions = [q.strip() for q in raw_questions_text.split("\n") if q.strip()]
-        print(f"[重要] 質問リスト生成完了: {len(questions)}件")
-    except Exception as e:
-        print(f"[重要] LLM質問生成例外: {e}")
-        questions = []
-
-    answers: list[str] = []
-    llm_a_instance = None
-    resolved_answer_llm = None
-    if not questions:
-        _raise_if_job_cancelled(job_id)
-        _update_job_progress(job_id, "フォールバックロジックで質問・回答候補を抽出中です…")
-        print("[重要] 正規表現によるQA/箇条書き抽出開始")
-        bullets = re.findall(r"^[\*\-\d\.]+\s*(.+)", text, re.MULTILINE)
-        qas = re.findall(
-            r"Q[\d：: ]*(.+?)\nA[\d：: ]*(.+?)(?=\nQ|\n\Z)",
-            text,
-            re.DOTALL,
-        )
-        if qas:
-            questions = [q.strip() for q, a in qas]
-            answers = [a.strip() for q, a in qas]
-        elif bullets:
-            questions = bullets[:5]
-            answers = ["該当内容を本文から要約してください。"] * len(questions)
-        else:
-            paras = [p.strip() for p in text.split("\n") if p.strip()]
-            questions = [f"{p[:20]}について説明してください。" for p in paras[:5]]
-            answers = ["該当内容を本文から要約してください。"] * len(questions)
-        resolved_answer_llm = resolved_question_llm
-    else:
-        _raise_if_job_cancelled(job_id)
-        _update_job_progress(job_id, "回答生成用 LLM を初期化中です…")
-        llm_a_instance, resolved_answer_llm = init_generation_llm(
-            answer_llm_model,
-            purpose="answer_generation",
-            temperature=0.25,
-            top_p=0.85,
-            num_predict=640,
-            max_tokens=640,
-        )
-        print(f"[重要] 回答生成LLM: {resolved_answer_llm}")
-        answer_system_prompt = textwrap.dedent(
-            """
-            あなたは日本語のRAGシステムにおける回答エンジンです。以下の制約を厳密に守ってください。
-            - 提供されたコンテキストに含まれる事実のみを用いて回答すること。
-            - 文書内に記載が見つからない場合は「本文に該当記述がありません。」と明示すること。
-            - 回答は自然な日本語で2〜3文以内にまとめること。
-            - 重要な根拠がある場合はその文を要約して含めること。
-            """
-        ).strip()
-        for i, q in enumerate(questions):
-            _raise_if_job_cancelled(job_id)
-            _update_job_progress(
-                job_id,
-                f"質問 {i + 1}/{len(questions)} に対する回答を生成中です…",
-            )
-            try:
-                prompt_a = textwrap.dedent(
-                    f"""
-                    {answer_system_prompt}
-
-                    ### コンテキスト
-                    {sample_text}
-
-                    ### 質問
-                    {q}
-
-                    ### 回答
-                    """
-                ).strip()
-                answer_resp = llm_a_instance.invoke(prompt_a, max_tokens=640)
-                normalized_answer = _extract_answer_text(answer_resp)
-                answer = normalized_answer.strip().split("\n")[0]
-                if answer and answer[-1] not in {"。", "！", "？", ".", "!", "?"}:
-                    answer = f"{answer}。"
-                print(f"[重要] LLM回答{i + 1}生成完了: {len(answer)}文字")
-                answers.append(answer)
-            except Exception as e:
-                import traceback
-
-                print(f"[重要] LLM回答{i + 1}生成例外: {e}")
-                traceback.print_exc()
-                answers.append("該当内容を本文から要約してください。")
-
-    if len(questions) < 5:
-        _raise_if_job_cancelled(job_id)
-        _update_job_progress(job_id, "不足分の質問と回答をフォールバック生成中です…")
-        print(f"[警告] 質問数が不足: {len(questions)}件。フォールバックで補完します。")
-        fallback_needed = 5 - len(questions)
-        paras = [p.strip() for p in text.split("\n") if p.strip()]
-        fallback_questions = []
-        for para in paras:
-            candidate = f"{para[:20]}について説明してください。"
-            if candidate not in questions and candidate not in fallback_questions:
-                fallback_questions.append(candidate)
-            if len(fallback_questions) >= fallback_needed:
-                break
-        while len(fallback_questions) < fallback_needed:
-            fallback_questions.append("本文の主要な論点について説明してください。")
-        print(f"[重要] フォールバック質問を追加: {fallback_questions}")
-        for fallback_q in fallback_questions:
-            _raise_if_job_cancelled(job_id)
-            questions.append(fallback_q)
-            if llm_a_instance is not None:
-                try:
-                    prompt_a = textwrap.dedent(
-                        f"""
-                        {answer_system_prompt}
-
-                        ### コンテキスト
-                        {sample_text}
-
-                        ### 質問
-                        {fallback_q}
-
-                        ### 回答
-                        """
-                    ).strip()
-                    answer_resp = llm_a_instance.invoke(prompt_a, max_tokens=640)
-                    normalized_answer = _extract_answer_text(answer_resp)
-                    fallback_answer = normalized_answer.strip().split("\n")[0]
-                    if fallback_answer and fallback_answer[-1] not in {
-                        "。",
-                        "！",
-                        "？",
-                        ".",
-                        "!",
-                        "?",
-                    }:
-                        fallback_answer = f"{fallback_answer}。"
-                except Exception as e:
-                    import traceback
-
-                    print(f"[重要] フォールバック質問の回答生成例外: {e}")
-                    traceback.print_exc()
-                    fallback_answer = "本文を要約してください。"
-            else:
-                fallback_answer = "本文を要約してください。"
-            answers.append(fallback_answer)
-
-    if not questions or not answers:
-        print("[重要] ダミーQAセットを返却（questions/answersが空）")
-        questions = ["この文書の主題は何ですか？"]
-        answers = ["本文を要約してください。"]
-        if resolved_answer_llm is None:
-            resolved_answer_llm = resolved_question_llm
-
-    qa_meta: list[dict] = []
-    try:
-        _raise_if_job_cancelled(job_id)
-        _update_job_progress(job_id, "生成したQAの品質評価と自動補正を実行中です…")
-        for idx, (question, answer) in enumerate(zip(questions, answers)):
-            _raise_if_job_cancelled(job_id)
-            context_snippet = extract_relevant_context(
-                question, context_sentences, max_sentences=6
-            )
-            context_lines = context_snippet.splitlines()
-            quality = evaluate_answer_quality(answer, context_lines)
-            retry_count = 0
-            regenerated_answer = answer
-
-            if quality.get("needs_retry") and llm_a_instance is not None:
-                refined = regenerate_answer_with_context(
-                    question,
-                    context_snippet or sample_text,
-                    llm_a_instance,
-                    max_tokens=640,
-                )
-                refined_quality = evaluate_answer_quality(refined, context_lines)
-                if refined_quality.get("score", 0.0) >= quality.get("score", 0.0):
-                    regenerated_answer = refined
-                    quality = refined_quality
-                    retry_count = 1
-                    answers[idx] = regenerated_answer
-
-            qa_meta.append(
-                {
-                    "score": quality.get("score", 0.0),
-                    "is_auto_fixed": retry_count > 0,
-                    "is_dummy_answer": quality.get("is_dummy", False),
-                    "quality": quality,
-                    "context_snippet": context_snippet,
-                    "retry_count": retry_count,
-                    "candidates": [regenerated_answer],
-                    "candidate_scores": [quality.get("score", 0.0)],
-                }
-            )
-    except Exception as e:
-        print(f"[警告] qa_meta生成時に例外: {e}。全件デフォルト値を設定します")
-        qa_meta = [
-            {
-                "score": 1.0,
-                "is_auto_fixed": False,
-                "is_dummy_answer": False,
-                "quality": {
-                    "score": 1.0,
-                    "is_dummy": False,
-                    "needs_retry": False,
-                },
-                "context_snippet": "",
-                "retry_count": 0,
-                "candidates": [a],
-                "candidate_scores": [1.0],
-            }
-            for a in answers
-        ]
-
-    image_captions: list[dict] = []
-    if generate_image_captions:
-        _raise_if_job_cancelled(job_id)
-        _update_job_progress(job_id, "PDF内の画像キャプションを生成中です…")
-        try:
-            image_captions = generate_image_captions_from_pdf(contents)
-        except Exception as e:
-            print(
-                f"[警告] 画像キャプション生成中に例外: {e}. キャプションなしで続行します。"
-            )
-
-    if use_mlx_ocr and mlx_image_captions:
-        image_captions = mlx_image_captions + image_captions
-
-    combined_captions: list[str] = []
-    if extracted_captions:
-        combined_captions.append(extracted_captions)
-    if image_captions:
-        combined_captions.append(
-            "\n".join(
-                [f"- p{c.get('page')}: {c.get('caption', '')}" for c in image_captions]
-            )
-        )
-
-    if combined_captions:
-        captions_text = "\n".join([block for block in combined_captions if block.strip()])
-        combined_text = text + "\n\n【画像キャプション】\n" + captions_text
-    else:
-        combined_text = text
-
-    _raise_if_job_cancelled(job_id)
-    _update_job_progress(job_id, "チャンクを生成し、保存用データを整形中です…")
-    chunks_for_storage = generate_default_chunks_for_storage(combined_text)
-    print(f"[重要] API返却直前: questions={questions}, answers={answers}")
-
-    _raise_if_job_cancelled(job_id)
+    # --- ここからは抽出結果のみを保存するフェーズ（QA生成は別APIで実施） ---
     _update_job_progress(job_id, "抽出結果をJSONとして保存中です…")
     extracted_path = EXTRACTED_DIR / f"{file_id}.json"
     with open(extracted_path, "w", encoding="utf-8") as f_json:
         json.dump(
             {
                 "text": sample_text,
-                "questions": questions,
-                "answers": answers,
-                "qa_meta": qa_meta,
+                "questions": [],
+                "answers": [],
+                "qa_meta": [],
                 "file_name": file_name,
                 "settings": {
                     "cleanse_used": bool(cleanse),
@@ -1001,7 +797,7 @@ def _run_pdf_upload_pipeline_sync(
                     "ocr_engine_selected": normalized_engine or "auto",
                     "ocr_engine_used": actual_ocr_engine,
                 },
-                "image_captions": image_captions,
+                "image_captions": [],
             },
             f_json,
             ensure_ascii=False,
@@ -1014,7 +810,7 @@ def _run_pdf_upload_pipeline_sync(
         f_pdf.write(contents)
 
     _raise_if_job_cancelled(job_id)
-    _update_job_progress(job_id, "データベースにPDFとQA情報を保存中です…")
+    _update_job_progress(job_id, "データベースにPDF情報を保存中です…")
     persist_pdf_upload_to_db(
         file_id=file_id,
         file_name=file_name or f"{file_id}.pdf",
@@ -1022,25 +818,25 @@ def _run_pdf_upload_pipeline_sync(
         file_size=len(contents),
         storage_path=str(pdf_path),
         cleanse_used=cleanse,
-        question_llm_model=resolved_question_llm,
-        answer_llm_model=resolved_answer_llm or resolved_question_llm,
-        chunks=chunks_for_storage,
-        questions=questions,
-        answers=answers,
-        qa_meta=qa_meta,
+        question_llm_model=question_llm_model,
+        answer_llm_model=answer_llm_model,
+        chunks=[],
+        questions=[],
+        answers=[],
+        qa_meta=[],
         file_hash=file_hash,
         ocr_engine_used=actual_ocr_engine,
         ocr_engine_selected=normalized_engine or "auto",
     )
-    print(f"[{jst_now_str()}][INFO] upload_job パイプラインでの永続化処理が完了しました")
+    print(f"[{jst_now_str()}][INFO] upload_job 抽出フェーズでの永続化処理が完了しました")
 
-    _update_job_progress(job_id, "PDF処理パイプラインが完了しました。")
+    _update_job_progress(job_id, "PDF抽出フェーズが完了しました。")
     return {
         "file_id": file_id,
         "text": sample_text,
-        "questions": questions,
-        "answers": answers,
-        "qa_meta": qa_meta,
+        "questions": [],
+        "answers": [],
+        "qa_meta": [],
         "file_name": file_name,
         "warning": warning_message,
         "ocr_engine_used": actual_ocr_engine,
@@ -1056,6 +852,8 @@ async def upload_job_start(
     answer_llm_model: str = Form("mistral"),
     generate_image_captions: bool = Form(True),
     ocr_engine: str = Form("auto"),
+    ocr_quality: str = Form("balanced"),
+    ocr_image_compression: str = Form("balanced"),
 ):
     """PDFアップロード処理をバックグラウンドジョブとして開始するAPI。"""
     contents = await file.read()
@@ -1092,6 +890,8 @@ async def upload_job_start(
                 answer_llm_model=answer_llm_model,
                 generate_image_captions=generate_image_captions,
                 ocr_engine=ocr_engine,
+                ocr_quality=ocr_quality,
+                ocr_image_compression=ocr_image_compression,
                 job_id=job_id,
             )
             with _UPLOAD_JOBS_LOCK:
@@ -1249,6 +1049,7 @@ async def uploadfile(
     answer_llm_model: str = Form("mistral"),
     generate_image_captions: bool = Form(True),
     ocr_engine: str = Form("auto"),
+    ocr_image_compression: str = Form("balanced"),
 ):
     """
     PDFアップロード時にテキスト抽出→LLMで質問自動生成→LLMで回答自動生成まで行い、
@@ -1289,6 +1090,20 @@ async def uploadfile(
             extracted_captions = ""
             mlx_image_captions: list[dict[str, str | int | None]] = []
 
+            ocr_image_compression = (ocr_image_compression or "balanced").lower()
+            if ocr_image_compression not in {"light", "balanced", "high"}:
+                ocr_image_compression = "balanced"
+
+            if ocr_image_compression == "light":
+                resize_max = int(os.getenv("OLLAMA_DEEPSEEK_IMG_MAX_LIGHT", "1200"))
+                jpeg_quality = int(os.getenv("OLLAMA_DEEPSEEK_JPEG_Q_LIGHT", "70"))
+            elif ocr_image_compression == "high":
+                resize_max = int(os.getenv("OLLAMA_DEEPSEEK_IMG_MAX_HIGH", "2048"))
+                jpeg_quality = int(os.getenv("OLLAMA_DEEPSEEK_JPEG_Q_HIGH", "92"))
+            else:
+                resize_max = int(os.getenv("OLLAMA_DEEPSEEK_IMG_MAX_BALANCED", "1600"))
+                jpeg_quality = int(os.getenv("OLLAMA_DEEPSEEK_JPEG_Q_BALANCED", "85"))
+
             if use_ollama_ocr:
                 try:
                     text = run_deepseek_ocr_via_ollama_for_pdf(
@@ -1299,6 +1114,8 @@ async def uploadfile(
                         dpi=int(os.getenv("OLLAMA_DEEPSEEK_DPI", "300")),
                         timeout=int(os.getenv("OLLAMA_DEEPSEEK_TIMEOUT", "600")),
                         image_output_dir=IMAGES_DIR / file_id,
+                        resize_max=resize_max,
+                        jpeg_quality=jpeg_quality,
                     )
                 except Exception as e:
                     warning_message += "Ollama DeepSeek OCR によるテキスト抽出に失敗したため、PyPDFベースにフォールバックします。\n"
@@ -1656,21 +1473,75 @@ async def uploadfile(
 
 # --- PDFクレンジング関数 ---
 def cleanse_pdf_text(text: str) -> str:
-    """PDF抽出テキストを表構造を維持しつつノイズ除去するユーティリティ。"""
+    """PDF抽出テキストを表構造を維持しつつノイズ除去するユーティリティ。
+
+    主な処理内容:
+    - ページ全体で頻出するヘッダ/フッタ相当のボイラープレート行を検出して除去
+    - 明らかなページ番号行 ("1/10", "Page 3" など) を除去
+    - 表っぽい行はタブ区切りに正規化してひとまとまりのブロックとして残す
+    - 連続ハイフネーションによる単語分割 (exam-\nple) を簡易的に解消
+    - 過剰な空行を1行までに圧縮
+    """
     import re
 
+    # --- 1. 行単位に分割 ---
     lines = text.splitlines()
+
+    # --- 2. 行末ハイフネーションを簡易的に解消 ---
+    # "exam-\nple" -> "example" のようなケースを前処理で連結する。
+    merged_lines: list[str] = []
+    for line in lines:
+        if merged_lines:
+            prev = merged_lines[-1]
+            # 前の行がハイフンで終わり、次の行が英字で始まる場合は連結
+            if prev.rstrip().endswith("-") and re.match(r"^[A-Za-zぁ-んァ-ン一-龥0-9]", line.lstrip() or ""):
+                merged_lines[-1] = prev.rstrip()[:-1] + line.lstrip()
+                continue
+        merged_lines.append(line)
+    lines = merged_lines
+
+    # --- 3. 頻出行に基づくボイラープレート候補の検出 ---
+    def _normalize_for_boilerplate(s: str) -> str:
+        s_norm = re.sub(r"\s+", " ", s.strip())
+        return s_norm.lower()
+
+    freq: dict[str, int] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # ごく短い行や極端に長い行はボイラープレート候補から除外
+        if len(stripped) < 5 or len(stripped) > 200:
+            continue
+        norm = _normalize_for_boilerplate(stripped)
+        freq[norm] = freq.get(norm, 0) + 1
+
+    # 多くのページに繰り返し現れる行をボイラープレートとみなす
+    boilerplate_norms: set[str] = {norm for norm, count in freq.items() if count >= 5}
+
+    # --- 4. ページ番号などの明らかなボイラープレートを検出するパターン ---
+    page_number_pattern = re.compile(
+        r"^(?:"  # 例: '3', '12'
+        r"\d{1,4}"
+        r"|"  # 例: '3/10', '12 / 100'
+        r"\d{1,4}\s*/\s*\d{1,4}"
+        r"|"  # 例: 'Page 3', 'Page 3/10'
+        r"page\s+\d{1,4}(?:\s*/\s*\d{1,4})?"
+        r")$",
+        re.IGNORECASE,
+    )
+
     cleaned: list[str] = []
     table_buffer: list[str] = []
 
     table_border_pattern = re.compile(r'^[\s\-=~_`+*•·―—┄┅┈┉┌┐└┘┬┴┼┤├╴╶╷╵╸╹╺╻╾╿]+$')
     table_delimiter_pattern = re.compile(r'[\|│┃┆┊┋┇┈┉┌┐└┘┬┴┼┤├]')
 
-    def flush_table():
+    def flush_table() -> None:
         """バッファに貯めた表行をタブ区切りで整形して出力"""
         if not table_buffer:
             return
-        normalized_rows = []
+        normalized_rows: list[str] = []
         for raw in table_buffer:
             row = table_delimiter_pattern.sub('\t', raw)
             row = re.sub(r'\s{2,}', '\t', row.strip())
@@ -1686,11 +1557,23 @@ def cleanse_pdf_text(text: str) -> str:
     for line in lines:
         stripped = line.strip()
 
+        # 空行はそのまま扱う（ただし後で連続空行は圧縮）
         if not stripped:
             flush_table()
             if not prev_blank:
                 cleaned.append("")
             prev_blank = True
+            continue
+
+        # ページ番号のみの行など、明らかなボイラープレート行は除去
+        if page_number_pattern.match(stripped):
+            flush_table()
+            continue
+
+        # ドキュメント全体で頻出するボイラープレート行（ヘッダ/フッタ相当）は除去
+        norm = _normalize_for_boilerplate(stripped)
+        if norm in boilerplate_norms:
+            flush_table()
             continue
 
         # 罫線のみの行は無視
@@ -1711,13 +1594,14 @@ def cleanse_pdf_text(text: str) -> str:
             prev_blank = False
             continue
 
+        # 通常テキスト行
         flush_table()
         cleaned.append(stripped)
         prev_blank = False
 
     flush_table()
 
-    # 末尾の空行は1つだけ残す
+    # --- 5. 末尾および連続する空行を整理（最大1行に圧縮） ---
     while len(cleaned) > 1 and cleaned[-1] == "" and cleaned[-2] == "":
         cleaned.pop()
 
@@ -1746,6 +1630,8 @@ def run_deepseek_ocr_via_ollama_for_pdf(
     dpi: int = 150,
     timeout: int = 60,
     image_output_dir: Path | None = None,
+    resize_max: int | None = None,
+    jpeg_quality: int = 85,
 ) -> str:
     """PDFバイト列をOllama deepseek-ocrに渡してOCRテキストを取得するユーティリティ。
 
@@ -1759,11 +1645,16 @@ def run_deepseek_ocr_via_ollama_for_pdf(
         print(f"[警告] pdf2imageによるページ画像化に失敗: {e}. Ollama DeepSeek OCR処理を中止します。")
         raise
 
+    if max_pages is None:
+        max_pages_env = os.getenv("OLLAMA_DEEPSEEK_MAX_PAGES")
+        if max_pages_env:
+            try:
+                max_pages = int(max_pages_env)
+            except ValueError:
+                max_pages = None
     if max_pages is not None:
         pages = pages[:max_pages]
 
-    base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").rstrip('/')
-    generate_url = f"{base_url}/api/generate"
     model_name = model or os.getenv("OLLAMA_DEEPSEEK_OCR_MODEL", "deepseek-ocr:latest")
     ocr_prompt = prompt or os.getenv("OLLAMA_DEEPSEEK_OCR_PROMPT", DEFAULT_OCR_PROMPT)
 
@@ -1771,35 +1662,40 @@ def run_deepseek_ocr_via_ollama_for_pdf(
 
     for idx, pil_img in enumerate(pages):
         try:
-            # PIL画像をPNGバイト列に変換し、base64エンコードして images フィールドで送信する
+            img = pil_img.convert("RGB")
+            if resize_max is not None:
+                try:
+                    if max(img.size) > resize_max:
+                        img.thumbnail((resize_max, resize_max))
+                except Exception as resize_err:
+                    print(f"[警告] DeepSeek OCR画像リサイズに失敗 (page={idx+1}): {resize_err}")
+
             buf = io.BytesIO()
-            pil_img.save(buf, format="PNG")
-            png_bytes = buf.getvalue()
+            try:
+                img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+            except Exception as jpeg_err:
+                print(f"[警告] DeepSeek OCR画像JPEGエンコードに失敗 (page={idx+1}): {jpeg_err}. PNGで再試行します。")
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+            image_bytes = buf.getvalue()
+
             if image_output_dir is not None:
                 try:
                     image_output_dir.mkdir(parents=True, exist_ok=True)
-                    save_path = image_output_dir / f"page_{idx + 1:03d}.png"
+                    save_path = image_output_dir / f"page_{idx + 1:03d}.jpg"
                     with save_path.open("wb") as f:
-                        f.write(png_bytes)
+                        f.write(image_bytes)
                 except Exception as save_err:
                     print(f"[警告] DeepSeek OCRページ画像の保存に失敗 (page={idx+1}): {save_err}")
-            img_b64 = base64.b64encode(png_bytes).decode("utf-8")
-
-            body = {
-                "model": model_name,
-                "prompt": ocr_prompt,
-                "images": [img_b64],
-                "stream": False,
-            }
-            resp = requests.post(generate_url, json=body, timeout=timeout)
-            resp.raise_for_status()
-            j = resp.json()
-            page_text = (
-                j.get("response")
-                or j.get("message", {}).get("content")
-                or ""
+            # 画像1枚に対するDeepSeek-OCR処理は、CLI互換ヘルパーを利用して実行
+            # PDF経由でもCLI / /ocr/imageと同じシンプルプロンプトを使うため、promptは指定しない
+            page_text = _run_deepseek_ocr_for_image_bytes(
+                image_bytes,
+                model=model_name,
+                resize_max=None,  # ここまでの処理でリサイズ済みのためヘルパー側ではリサイズしない
+                jpeg_quality=jpeg_quality,
+                timeout=timeout,
             )
-            page_text = _normalize_deepseek_ocr_html(page_text)
             label = f"PAGE {idx + 1}"
             page_text_str = str(page_text).strip()
             if page_text_str:
@@ -1813,6 +1709,127 @@ def run_deepseek_ocr_via_ollama_for_pdf(
         raise RuntimeError("Ollama DeepSeek OCRから有効なテキストを取得できませんでした。")
 
     return "\n\n".join(text_blocks).strip()
+
+
+def _run_deepseek_ocr_for_image_bytes(
+    image_bytes: bytes,
+    *,
+    model: str | None = None,
+    prompt: str | None = None,
+    resize_max: int | None = None,
+    jpeg_quality: int = 85,
+    timeout: int = 300,
+) -> str:
+    """単一画像バイト列に対して DeepSeek-OCR (Ollama) を実行するヘルパー。
+
+    CLIサンプル(ocr.py)と同等の挙動になるように、/api/chat + stream=True を利用する。
+    """
+
+    # 画像をPillowで開く
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"DeepSeek OCR画像の読み込みに失敗しました: {e}") from e
+
+    # 必要に応じてリサイズ
+    if resize_max is not None:
+        try:
+            if max(img.size) > resize_max:
+                img.thumbnail((resize_max, resize_max))
+        except Exception as resize_err:  # noqa: BLE001
+            print(f"[警告] DeepSeek OCR画像リサイズに失敗: {resize_err}")
+
+    # JPEGに再エンコード（CLIと同様の挙動）
+    buf = io.BytesIO()
+    try:
+        img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+    except Exception as jpeg_err:  # noqa: BLE001
+        print(f"[警告] DeepSeek OCR画像JPEGエンコードに失敗: {jpeg_err}. PNGで再試行します。")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+    encoded_bytes = buf.getvalue()
+
+    img_b64 = base64.b64encode(encoded_bytes).decode("utf-8")
+
+    base_url = get_ollama_base_url().rstrip("/")
+    chat_url = f"{base_url}/api/chat"
+    model_name = model or os.getenv("OLLAMA_DEEPSEEK_OCR_MODEL", "deepseek-ocr:latest")
+    # 画像専用APIではCLIサンプル(ocr.py)と同等のシンプルなプロンプトを使用する
+    cli_ocr_prompt = (
+        "You are an OCR engine. Read all text in the image and output only the plain text. "
+        "Do not explain anything, just output the recognized text."
+    )
+    ocr_prompt = prompt or cli_ocr_prompt
+
+    body = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "user",
+                "content": ocr_prompt,
+                "images": [img_b64],
+            }
+        ],
+        "stream": True,
+    }
+
+    chunks: list[str] = []
+    with requests.post(chat_url, json=body, stream=True, timeout=timeout) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            message = event.get("message") or {}
+            delta = message.get("content")
+            if delta:
+                chunks.append(delta)
+            if event.get("done"):
+                break
+
+    text = "".join(chunks)
+    text = _normalize_deepseek_ocr_html(text)
+    return text.strip()
+
+
+@app.post("/ocr/image")
+async def ocr_image(file: UploadFile = File(...)):
+    """単一画像ファイルに対して DeepSeek-OCR (Ollama) を実行するAPI。
+
+    CLIスクリプト(ocr.py)と同等の挙動を提供する簡易エンドポイント。
+    """
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="画像ファイルが空です。")
+
+    try:
+        resize_max = int(os.getenv("OLLAMA_DEEPSEEK_IMG_MAX_BALANCED", "1600"))
+        jpeg_quality = int(os.getenv("OLLAMA_DEEPSEEK_JPEG_Q_BALANCED", "85"))
+        timeout = int(os.getenv("OLLAMA_DEEPSEEK_TIMEOUT", "300"))
+    except Exception:  # noqa: BLE001
+        resize_max = 1600
+        jpeg_quality = 85
+        timeout = 300
+
+    try:
+        text = _run_deepseek_ocr_for_image_bytes(
+            contents,
+            resize_max=resize_max,
+            jpeg_quality=jpeg_quality,
+            timeout=timeout,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[{jst_now_str()}][ERROR] /ocr/image DeepSeek OCR失敗: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"DeepSeek OCR実行中にエラーが発生しました: {e}",
+        ) from e
+
+    return {"text": text}
 
 
 # --- 画像キャプション生成（LLAVA 7B / Ollama）ユーティリティ ---
@@ -1834,8 +1851,15 @@ def generate_image_captions_from_pdf(contents: bytes, max_pages: int | None = No
     if max_pages is not None:
         pages = pages[:max_pages]
 
-    base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").rstrip('/')
+    base_url = get_ollama_base_url().rstrip('/')
     chat_url = f"{base_url}/api/chat"
+
+    # 画像キャプション用モデルとプロンプトは環境変数で差し替え可能にする（デフォルトは llava:7b）
+    caption_model = os.getenv("OLLAMA_IMAGE_CAPTION_MODEL", "llava:7b")
+    caption_prompt = os.getenv(
+        "OLLAMA_IMAGE_CAPTION_PROMPT",
+        "この画像の内容を日本語で簡潔に説明してください。",
+    )
 
     for idx, pil_img in enumerate(pages):
         try:
@@ -1847,13 +1871,13 @@ def generate_image_captions_from_pdf(contents: bytes, max_pages: int | None = No
             data_url = f"data:image/png;base64,{img_b64}"
 
             body = {
-                "model": "llava:7b",
+                "model": caption_model,
                 "messages": [
                     {
                         "role": "user",
                         "content": [
                             {"type": "image", "image_url": data_url},
-                            {"type": "text", "text": "この画像の内容を日本語で簡潔に説明してください。"},
+                            {"type": "text", "text": caption_prompt},
                         ],
                     }
                 ],
@@ -1878,11 +1902,11 @@ def generate_image_captions_from_pdf(contents: bytes, max_pages: int | None = No
 
 # --- 新規: file_idで抽出済みデータ取得API ---
 from fastapi import HTTPException
+
+
 @app.get("/get_extracted/{file_id}")
 def get_extracted(file_id: str):
-    """
-    指定file_idの抽出テキスト・QA・ファイル名を返すAPI。
-    """
+    """指定file_idの抽出テキスト・QA・ファイル名を返すAPI。"""
     extracted_path = EXTRACTED_DIR / f"{file_id}.json"
     if not extracted_path.exists():
         raise HTTPException(status_code=404, detail=f"file_id={file_id}の抽出データが見つかりません")
@@ -1893,11 +1917,363 @@ def get_extracted(file_id: str):
     if pdf_path.exists():
         import base64
         with open(pdf_path, "rb") as f_pdf:
-            data["pdf_bytes_base64"] = base64.b64encode(f_pdf.read()).decode('utf-8')
+            data["pdf_bytes_base64"] = base64.b64encode(f_pdf.read()).decode("utf-8")
     # file_nameがなければfile_id.pdfをセット（後方互換）
     if "file_name" not in data:
         data["file_name"] = f"{file_id}.pdf"
     return data
+
+
+def _generate_qa_for_existing_pdf(
+    file_id: str,
+    question_llm_model: str,
+    answer_llm_model: str,
+) -> dict:
+    """抽出済みテキストを用いて既存PDFに対するQAを生成し、JSON/DBを更新するヘルパー。"""
+    try:
+        # 抽出済みJSONの読み込み
+        extracted_path = EXTRACTED_DIR / f"{file_id}.json"
+        if not extracted_path.exists():
+            raise HTTPException(status_code=404, detail=f"file_id={file_id}の抽出データが見つかりません")
+        with open(extracted_path, "r", encoding="utf-8") as f_json:
+            data = json.load(f_json)
+
+        text = data.get("text") or ""
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="抽出テキストが空のためQAを生成できません。")
+
+        settings = data.get("settings") or {}
+        cleanse_used = bool(settings.get("cleanse_used", False))
+        generate_image_captions = bool(settings.get("generate_image_captions", True))
+        ocr_engine_selected = settings.get("ocr_engine_selected") or "auto"
+        ocr_engine_used = settings.get("ocr_engine_used") or ocr_engine_selected
+        file_name = data.get("file_name") or f"{file_id}.pdf"
+        warning_message = data.get("warning") or ""
+
+        pdf_path = PDF_DIR / f"{file_id}.pdf"
+        if not pdf_path.exists():
+            raise HTTPException(status_code=404, detail=f"file_id={file_id}のPDF本体が見つかりません")
+        with open(pdf_path, "rb") as f_pdf:
+            contents = f_pdf.read()
+        file_hash = hashlib.sha256(contents).hexdigest()
+
+        # 元実装と同じサンプルテキスト・文分割
+        sample_text = text[:3000] if len(text) > 3000 else text
+        context_sentences = split_sentences(text)
+        print(f"[{jst_now_str()}][重要] generate_qa: 抽出テキスト長={len(text)}  サンプル={sample_text[:100]}...")
+
+        # 画像キャプション（必要に応じて生成）
+        image_captions: list[dict] = []
+        if generate_image_captions:
+            try:
+                image_captions = generate_image_captions_from_pdf(contents)
+            except Exception as e:
+                print(f"[警告] generate_qa: 画像キャプション生成中に例外: {e}. キャプションなしで続行します。")
+
+        # MLX由来のキャプションはここでは再計算しない
+        extracted_captions = ""
+        mlx_image_captions: list[dict] = []
+
+        # 質問生成（元uploadfileと同じプロンプト）
+        print("[重要] generate_qa: LLM質問生成開始")
+        llm_q_instance, resolved_question_llm = init_generation_llm(
+            question_llm_model,
+            purpose="question_generation",
+            temperature=0.2,
+            top_p=0.85,
+            num_predict=320,
+            max_tokens=320,
+        )
+        print(f"[重要] generate_qa: 質問生成LLM={resolved_question_llm}")
+
+        prompt_q = textwrap.dedent(
+            f"""
+            あなたはPDF文書の内容を確認する質問を生成する専門アシスタントです。
+            以下の制約を守り、日本語で代表的な質問を5件作成してください。
+            - 質問は具体的かつ本文に直接基づく内容にすること。
+            - 文書に記載がない推測的な質問は避けること。
+            - 質問は箇条書きではなく、1行の文章形式で記述すること。
+
+            ### 文書抜粋
+            {text[:1800]}
+
+            ### 出力形式
+            質問のみを1行ずつ列挙してください。
+            """
+        ).strip()
+
+        try:
+            questions_resp = llm_q_instance.invoke(prompt_q)
+            raw_questions_text = _extract_answer_text(questions_resp)
+            print(f"[重要] generate_qa: LLM質問生成レスポンス長={len(raw_questions_text)}")
+            questions = [q.strip() for q in raw_questions_text.split("\n") if q.strip()]
+            print(f"[重要] generate_qa: 質問リスト生成完了 件数={len(questions)}")
+        except Exception as e:
+            print(f"[重要] generate_qa: LLM質問生成例外: {e}")
+            questions = []
+
+        answers: list[str] = []
+        llm_a_instance = None
+        resolved_answer_llm: Optional[str] = None
+
+        if not questions:
+            print("[重要] generate_qa: 正規表現によるQA/箇条書き抽出開始")
+            bullets = re.findall(r'^[\*\-\d\.]+\s*(.+)', text, re.MULTILINE)
+            qas = re.findall(r'Q[\d：: ]*(.+?)\nA[\d：: ]*(.+?)(?=\nQ|\n\Z)', text, re.DOTALL)
+            if qas:
+                questions = [q.strip() for q, a in qas]
+                answers = [a.strip() for q, a in qas]
+            elif bullets:
+                questions = bullets[:5]
+                answers = ["該当内容を本文から要約してください。"] * len(questions)
+            else:
+                paras = [p.strip() for p in text.split("\n") if p.strip()]
+                questions = [f"{p[:20]}について説明してください。" for p in paras[:5]]
+                answers = ["該当内容を本文から要約してください。"] * len(questions)
+            resolved_answer_llm = resolved_question_llm
+        else:
+            llm_a_instance, resolved_answer_llm = init_generation_llm(
+                answer_llm_model,
+                purpose="answer_generation",
+                temperature=0.25,
+                top_p=0.85,
+                num_predict=640,
+                max_tokens=640,
+            )
+            print(f"[重要] generate_qa: 回答生成LLM={resolved_answer_llm}")
+            answer_system_prompt = textwrap.dedent(
+                """
+                あなたは日本語のRAGシステムにおける回答エンジンです。以下の制約を厳密に守ってください。
+                - 提供されたコンテキストに含まれる事実のみを用いて回答すること。
+                - 文書内に記載が見つからない場合は「本文に該当記述がありません。」と明示すること。
+                - 回答は自然な日本語で2〜3文以内にまとめること。
+                - 重要な根拠がある場合はその文を要約して含めること。
+                """
+            ).strip()
+
+            for i, q in enumerate(questions):
+                try:
+                    prompt_a = textwrap.dedent(
+                        f"""
+                        {answer_system_prompt}
+
+                        ### コンテキスト
+                        {sample_text}
+
+                        ### 質問
+                        {q}
+
+                        ### 回答
+                        """
+                    ).strip()
+                    answer_resp = llm_a_instance.invoke(prompt_a, max_tokens=640)
+                    normalized_answer = _extract_answer_text(answer_resp)
+                    answer = normalized_answer.strip().split("\n")[0]
+                    if answer and answer[-1] not in {"。", "！", "？", ".", "!", "?"}:
+                        answer = f"{answer}。"
+                    print(f"[重要] generate_qa: LLM回答{i+1}生成完了 文字数={len(answer)}")
+                    answers.append(answer)
+                except Exception as e:
+                    import traceback
+                    print(f"[重要] generate_qa: LLM回答{i+1}生成例外: {e}")
+                    traceback.print_exc()
+                    answers.append("該当内容を本文から要約してください。")
+
+        if len(questions) < 5:
+            print(f"[警告] generate_qa: 質問数が不足 ({len(questions)}件)。フォールバックで補完します。")
+            fallback_needed = 5 - len(questions)
+            paras = [p.strip() for p in text.split("\n") if p.strip()]
+            fallback_questions: list[str] = []
+            for para in paras:
+                candidate = f"{para[:20]}について説明してください。"
+                if candidate not in questions and candidate not in fallback_questions:
+                    fallback_questions.append(candidate)
+                if len(fallback_questions) >= fallback_needed:
+                    break
+            while len(fallback_questions) < fallback_needed:
+                fallback_questions.append("本文の主要な論点について説明してください。")
+            print(f"[重要] generate_qa: フォールバック質問を追加 {fallback_questions}")
+            for fallback_q in fallback_questions:
+                questions.append(fallback_q)
+                if llm_a_instance is not None:
+                    try:
+                        prompt_a = textwrap.dedent(
+                            f"""
+                            {answer_system_prompt}
+
+                            ### コンテキスト
+                            {sample_text}
+
+                            ### 質問
+                            {fallback_q}
+
+                            ### 回答
+                            """
+                        ).strip()
+                        answer_resp = llm_a_instance.invoke(prompt_a, max_tokens=640)
+                        normalized_answer = _extract_answer_text(answer_resp)
+                        fallback_answer = normalized_answer.strip().split("\n")[0]
+                        if fallback_answer and fallback_answer[-1] not in {"。", "！", "？", ".", "!", "?"}:
+                            fallback_answer = f"{fallback_answer}。"
+                    except Exception as e:
+                        import traceback
+                        print(f"[重要] generate_qa: フォールバック質問の回答生成例外: {e}")
+                        traceback.print_exc()
+                        fallback_answer = "本文を要約してください。"
+                else:
+                    fallback_answer = "本文を要約してください。"
+                answers.append(fallback_answer)
+
+        if not questions or not answers:
+            print("[重要] generate_qa: ダミーQAセットを返却（questions/answersが空）")
+            questions = ["この文書の主題は何ですか？"]
+            answers = ["本文を要約してください。"]
+            if resolved_answer_llm is None:
+                resolved_answer_llm = resolved_question_llm
+
+        # qa_meta生成（元実装と同様）
+        qa_meta: list[dict] = []
+        try:
+            for idx, (question, answer) in enumerate(zip(questions, answers)):
+                context_snippet = extract_relevant_context(question, context_sentences, max_sentences=6)
+                context_lines = context_snippet.splitlines()
+                quality = evaluate_answer_quality(answer, context_lines)
+                retry_count = 0
+                regenerated_answer = answer
+
+                if quality.get("needs_retry") and llm_a_instance is not None:
+                    refined = regenerate_answer_with_context(
+                        question,
+                        context_snippet or sample_text,
+                        llm_a_instance,
+                        max_tokens=640,
+                    )
+                    refined_quality = evaluate_answer_quality(refined, context_lines)
+                    if refined_quality.get("score", 0.0) >= quality.get("score", 0.0):
+                        regenerated_answer = refined
+                        quality = refined_quality
+                        retry_count = 1
+                        answers[idx] = regenerated_answer
+
+                qa_meta.append(
+                    {
+                        "score": quality.get("score", 0.0),
+                        "is_auto_fixed": retry_count > 0,
+                        "is_dummy_answer": quality.get("is_dummy", False),
+                        "quality": quality,
+                        "context_snippet": context_snippet,
+                        "retry_count": retry_count,
+                        "candidates": [regenerated_answer],
+                        "candidate_scores": [quality.get("score", 0.0)],
+                    }
+                )
+        except Exception as e:
+            print(f"[警告] generate_qa: qa_meta生成時に例外: {e}。全件デフォルト値を設定します")
+            qa_meta = [
+                {
+                    "score": 1.0,
+                    "is_auto_fixed": False,
+                    "is_dummy_answer": False,
+                    "quality": {"score": 1.0, "is_dummy": False, "needs_retry": False},
+                    "context_snippet": "",
+                    "retry_count": 0,
+                    "candidates": [a],
+                    "candidate_scores": [1.0],
+                }
+                for a in answers
+            ]
+
+        # DeepSeek MLXキャプションとの統合は行わないが、llava由来キャプションはチャンクテキストに含める
+        combined_captions: list[str] = []
+        if extracted_captions:
+            combined_captions.append(extracted_captions)
+        if image_captions:
+            combined_captions.append(
+                "\n".join([f"- p{c.get('page')}: {c.get('caption', '')}" for c in image_captions])
+            )
+
+        if combined_captions:
+            captions_text = "\n".join([block for block in combined_captions if block.strip()])
+            combined_text = text + "\n\n【画像キャプション】\n" + captions_text
+        else:
+            combined_text = text
+
+        chunks_for_storage = generate_default_chunks_for_storage(combined_text)
+        print(f"[重要] generate_qa: チャンク数={len(chunks_for_storage)}")
+
+        # 抽出JSONを上書き保存
+        with open(extracted_path, "w", encoding="utf-8") as f_json:
+            json.dump(
+                {
+                    "text": sample_text,
+                    "questions": questions,
+                    "answers": answers,
+                    "qa_meta": qa_meta,
+                    "file_name": file_name,
+                    "settings": {
+                        "cleanse_used": bool(cleanse_used),
+                        "generate_image_captions": bool(generate_image_captions),
+                        "ocr_engine_selected": ocr_engine_selected,
+                        "ocr_engine_used": ocr_engine_used,
+                    },
+                    "image_captions": image_captions,
+                },
+                f_json,
+                ensure_ascii=False,
+            )
+
+        # DB更新（既存レコードを上書き）
+        persist_pdf_upload_to_db(
+            file_id=file_id,
+            file_name=file_name,
+            original_name=file_name,
+            file_size=len(contents),
+            storage_path=str(pdf_path),
+            cleanse_used=cleanse_used,
+            question_llm_model=resolved_question_llm,
+            answer_llm_model=resolved_answer_llm or resolved_question_llm,
+            chunks=chunks_for_storage,
+            questions=questions,
+            answers=answers,
+            qa_meta=qa_meta,
+            file_hash=file_hash,
+            ocr_engine_used=ocr_engine_used,
+            ocr_engine_selected=ocr_engine_selected,
+        )
+        print(f"[{jst_now_str()}][INFO] generate_qa: 永続化処理が完了しました (file_id={file_id})")
+
+        return {
+            "file_id": file_id,
+            "text": sample_text,
+            "questions": questions,
+            "answers": answers,
+            "qa_meta": qa_meta,
+            "file_name": file_name,
+            "warning": warning_message,
+            "ocr_engine_used": ocr_engine_used,
+            "ocr_engine_selected": ocr_engine_selected,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"[{jst_now_str()}][重要] generate_qa全体例外: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/pdf/{file_id}/generate_qa")
+def generate_qa_for_pdf(
+    file_id: str,
+    question_llm_model: str = Form("mistral"),
+    answer_llm_model: str = Form("mistral"),
+):
+    """既存PDF(file_id)に対してQA生成を実行するAPI。"""
+    return _generate_qa_for_existing_pdf(
+        file_id=file_id,
+        question_llm_model=question_llm_model,
+        answer_llm_model=answer_llm_model,
+    )
 
 
 from pydantic import BaseModel
@@ -2971,8 +3347,10 @@ def build_collection_name_for_pdf(embedding_model: str, scope: str, pdf_file_id:
 DEFAULT_LLM_NAME = "gpt-oss"
 
 LLM_MODEL_CONFIG = {
-    # Ollama系
+    # Ollama系（ローカル／Cloud 含む）
     "gpt-oss": {"provider": "ollama", "model": "gpt-oss:20b"},
+    "gpt-oss-20b-cloud": {"provider": "ollama", "model": "gpt-oss:20b-cloud"},
+    "gpt-oss-120b-cloud": {"provider": "ollama", "model": "gpt-oss:120b-cloud"},
     "llama3": {"provider": "ollama", "model": "llama3"},
     "mistral": {"provider": "ollama", "model": "mistral"},
     "gemma2": {"provider": "ollama", "model": "gemma2"},
@@ -3006,7 +3384,7 @@ def get_llm_generation(
     resolved_name, entry = _resolve_llm_entry(model_name)
     provider = entry["provider"]
     if provider == "ollama":
-        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+        ollama_base_url = get_ollama_base_url()
         print(f"[INFO] generation LLM (Ollama) = {entry['model']} @ {ollama_base_url}")
         options = {
             "temperature": max(0.0, min(temperature, 1.0)),
@@ -3038,7 +3416,7 @@ def get_llm_eval():
     """RAGAS評価専用にGPT-OSSを返す。"""
     return RAGASCompatibleOllamaLLM(
         model=LLM_MODEL_CONFIG[DEFAULT_LLM_NAME]["model"],
-        base_url=os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+        base_url=get_ollama_base_url()
     )
 
 
@@ -3141,14 +3519,16 @@ def get_embeddings(model_name: str):
     embedder: Any
     
     # Ollama埋め込みモデル（優先使用）
-    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+    ollama_base_url = get_ollama_base_url()
     ollama_embedding_models = {
         "nomic-embed-text": "nomic-embed-text",
         "mxbai-embed-large": "mxbai-embed-large",
         "all-minilm": "all-minilm",
         # 日本語/多言語対応のモデル（Ollama）
-        # 事前に `ollama pull bge-m3` / `ollama pull jina-embeddings-v3` を実行しておくこと
+        # 事前に `ollama pull bge-m3` / `ollama pull qwen3-embedding` / `ollama pull snowflake-arctic-embed2` / `ollama pull jina-embeddings-v3` を実行しておくこと
         "bge-m3": "bge-m3",
+        "qwen3-embedding": "qwen3-embedding",
+        "snowflake-arctic-embed2": "snowflake-arctic-embed2",
         "jina-embeddings-v3": "jina-embeddings-v3",
     }
     if model_name in ollama_embedding_models:
@@ -3189,12 +3569,26 @@ def get_embeddings(model_name: str):
             }
             
             if model_name in hf_models:
+                hf_id = hf_models[model_name]
+                hf_local_root = os.getenv("HF_LOCAL_DIR", "/app/local_models")
+                hf_local_path = os.path.join(hf_local_root, hf_id)
+                # HF_LOCAL_DIR/hf_id 配下を再帰的に探索し、config.json を含むディレクトリがあればそれをローカルモデルディレクトリとみなす
+                local_model_dir = None
+                if os.path.isdir(hf_local_path):
+                    for root, dirs, files in os.walk(hf_local_path):
+                        if "config.json" in files:
+                            local_model_dir = root
+                            break
+                if local_model_dir is not None:
+                    target_model_name = local_model_dir
+                else:
+                    target_model_name = hf_id
                 # Jina Embeddings v4 はエンコード前にタスク指定が必須
                 # 参考: エラーメッセージ "Task must be specified before encoding data..."
                 if model_name == "jina-embeddings-v4":
                     # 初期化時に default_task は渡さず、エンコード時に task を指定する
                     embedder = RAGASCompatibleHuggingFaceEmbeddings(
-                        model_name=hf_models[model_name],
+                        model_name=target_model_name,
                         model_kwargs={
                             'device': device,
                             'trust_remote_code': True,
@@ -3207,7 +3601,7 @@ def get_embeddings(model_name: str):
                 else:
                     # それ以外は共通設定を適用
                     embedder = RAGASCompatibleHuggingFaceEmbeddings(
-                        model_name=hf_models[model_name],
+                        model_name=target_model_name,
                         **common_kwargs
                     )
             else:
@@ -3248,6 +3642,28 @@ except Exception as e:
         current_embeddings = None
 
 # --- Pydantic Models ---
+class InferenceModeResponse(BaseModel):
+    """現在の推論モードを返すレスポンスモデル。"""
+
+    mode: str
+
+
+class InferenceModeUpdateRequest(BaseModel):
+    """推論モードを更新するリクエストモデル。"""
+
+    mode: str
+
+
+class InferenceHealthResponse(BaseModel):
+    """現在の推論モードと Ollama API の疎通状況を返すレスポンスモデル。"""
+
+    mode: str
+    base_url: str
+    ok: bool
+    status_code: int | None = None
+    error: str | None = None
+
+
 class ChunkRequest(BaseModel):
     text: str
     chunk_size: int = 1000
@@ -3283,6 +3699,109 @@ class BuildVectorStoreRequest(BaseModel):
 class ModelSelection(BaseModel):
     llm_model: str
     embedding_model: str
+
+
+def _db_get_model_selection() -> dict[str, str]:
+    """DBからモデル選択状態を取得する。存在しなければデフォルト値を返す。"""
+    default_llm = DEFAULT_LLM_NAME
+    default_emb = "huggingface_bge_small"
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT llm_model, embedding_model FROM model_selection WHERE id = 1")
+            ).fetchone()
+        if row:
+            llm = (row[0] or default_llm).strip()
+            emb = (row[1] or default_emb).strip()
+            return {"llm_model": llm, "embedding_model": emb}
+    except Exception as e:
+        print(f"[{jst_now_str()}][ERROR] model_selection取得失敗: {e}")
+    return {"llm_model": default_llm, "embedding_model": default_emb}
+
+
+def _db_update_model_selection(selection: ModelSelection) -> None:
+    """DB上のモデル選択状態を更新する。"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO model_selection (id, llm_model, embedding_model, updated_at)
+                    VALUES (1, :llm_model, :embedding_model, CURRENT_TIMESTAMP)
+                    ON CONFLICT (id) DO UPDATE
+                    SET llm_model = EXCLUDED.llm_model,
+                        embedding_model = EXCLUDED.embedding_model,
+                        updated_at = CURRENT_TIMESTAMP
+                    """
+                ),
+                {
+                    "llm_model": selection.llm_model,
+                    "embedding_model": selection.embedding_model,
+                },
+            )
+    except Exception as e:
+        print(f"[{jst_now_str()}][ERROR] model_selection更新失敗: {e}")
+
+
+@app.get("/config/inference_mode", response_model=InferenceModeResponse)
+def get_inference_mode_api():
+    """現在の推論モードを取得するAPI。"""
+    mode = get_inference_mode()
+    return {"mode": mode}
+
+
+@app.get("/config/model_selection", response_model=ModelSelection)
+def get_model_selection_api():
+    """現在のLLM/Embeddingモデル選択状態を取得するAPI。"""
+    data = _db_get_model_selection()
+    return ModelSelection(**data)
+
+
+@app.post("/config/model_selection", response_model=ModelSelection)
+def update_model_selection_api(req: ModelSelection):
+    """LLM/Embeddingモデル選択状態を更新するAPI。"""
+    # 最低限、空文字の場合はデフォルトへフォールバック
+    llm = (req.llm_model or DEFAULT_LLM_NAME).strip()
+    emb = (req.embedding_model or "huggingface_bge_small").strip()
+    sel = ModelSelection(llm_model=llm, embedding_model=emb)
+    _db_update_model_selection(sel)
+    return sel
+
+
+@app.get("/config/inference_health", response_model=InferenceHealthResponse)
+def get_inference_health_api():
+    """現在の推論モードで利用される Ollama API への疎通状況を返す。"""
+    mode = get_inference_mode()
+    base_url = get_ollama_base_url().rstrip("/")
+    url = f"{base_url}/api/version"
+    status_code: int | None = None
+    error: str | None = None
+    ok = False
+    try:
+        resp = requests.get(url, timeout=15)
+        status_code = resp.status_code
+        ok = resp.ok
+    except Exception as e:  # noqa: BLE001
+        error = str(e)
+    return {
+        "mode": mode,
+        "base_url": base_url,
+        "ok": ok,
+        "status_code": status_code,
+        "error": error,
+    }
+
+
+@app.post("/config/inference_mode", response_model=InferenceModeResponse)
+def update_inference_mode_api(req: InferenceModeUpdateRequest):
+    """推論モードを更新するAPI。"""
+    try:
+        set_inference_mode(req.mode)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    mode = get_inference_mode()
+    return {"mode": mode}
+
 
 # --- API Endpoints ---
 
@@ -4087,7 +4606,7 @@ async def bulk_evaluate(request: Request):
                     'huggingface_paraphrase_multilingual', 'huggingface_distiluse_multilingual',
                     'huggingface_xlm_r', 'jina-embeddings-v4',
                     # Ollama埋め込みモデル
-                    'nomic-embed-text', 'mxbai-embed-large', 'all-minilm', 'bge-m3', 'jina-embeddings-v3',
+                    'nomic-embed-text', 'mxbai-embed-large', 'all-minilm', 'bge-m3', 'qwen3-embedding', 'snowflake-arctic-embed2', 'jina-embeddings-v3',
                 }
                 
                 if embedding_model not in supported_models:
