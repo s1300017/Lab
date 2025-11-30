@@ -23,7 +23,7 @@ from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_js_eval import streamlit_js_eval  # localStorage操作用
-from http_client import http_get, http_post, http_delete
+from http_client import http_get, http_post, http_delete, format_http_error
 from evaluation_history_ui import show_evaluation_history
 from graph_utils import (
     japanese_font,
@@ -103,7 +103,7 @@ def init_session_state():
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
     if 'llm_model' not in st.session_state:
-        st.session_state.llm_model = "ollama_llama2" # Default to Ollama
+        st.session_state.llm_model = "gpt-oss"  # Default to GPT-OSS
     if 'embedding_model' not in st.session_state:
         st.session_state.embedding_model = "huggingface_bge_small" # Default to HuggingFace
     # --- chat_modelもllm_modelと同期して初期化 ---
@@ -660,7 +660,7 @@ with tab_history:
                                     st.success("質問・回答の自動生成が完了しました。")
                                     st.rerun()
                                 else:
-                                    st.error(f"質問生成APIエラー: {resp_qa.status_code} {resp_qa.text}")
+                                    st.error(f"質問生成APIエラー: {format_http_error(resp_qa)}")
                             except Exception as e:
                                 st.error(f"質問生成API呼び出し中にエラーが発生しました: {e}")
 

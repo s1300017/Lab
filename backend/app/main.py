@@ -445,6 +445,16 @@ def init_db():
                     );
                 """))
 
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS chat_contexts (
+                        id SERIAL PRIMARY KEY,
+                        chat_log_id INTEGER REFERENCES chat_logs(id) ON DELETE CASCADE,
+                        context_index INTEGER NOT NULL,
+                        content TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """))
+
                 # モデル選択状態を永続化するためのテーブル
                 conn.execute(text("""
                     CREATE TABLE IF NOT EXISTS model_selection (
@@ -697,6 +707,11 @@ def _run_pdf_upload_pipeline_sync(
                 use_mlx_ocr = True
             else:
                 actual_ocr_engine = "pypdf"
+
+        if use_mlx_ocr and not MLX_OCR_AVAILABLE:
+            print("[警告] MLX DeepSeek OCRモジュールが利用できないため、PyPDFベースにフォールバックします。")
+            use_mlx_ocr = False
+            actual_ocr_engine = "pypdf"
 
         if use_mlx_ocr:
             _raise_if_job_cancelled(job_id)
@@ -1309,19 +1324,7 @@ async def uploadfile(
                 questions.append(fallback_q)
                 if llm_a_instance is not None:
                     try:
-                        prompt_a = textwrap.dedent(
-                            f"""
-                            {answer_system_prompt}
-
-                            ### コンテキスト
-                            {sample_text}
-
-                            ### 質問
-                            {fallback_q}
-
-                            ### 回答
-                            """
-                        ).strip()
+                        prompt_a = build_rag_answer_prompt(sample_text, fallback_q)
                         answer_resp = llm_a_instance.invoke(prompt_a, max_tokens=640)
                         normalized_answer = _extract_answer_text(answer_resp)
                         fallback_answer = normalized_answer.strip().split('\n')[0]
@@ -1842,6 +1845,23 @@ def generate_image_captions_from_pdf(contents: bytes, max_pages: int | None = No
         list[dict]: [{"page": 1, "caption": "..."}, ...]
     """
     captions: list[dict] = []
+
+    # 環境変数からページ数とタイムアウトのデフォルト値を上書き可能にする
+    try:
+        max_pages_env = os.getenv("OLLAMA_IMAGE_CAPTION_MAX_PAGES", "").strip()
+        if max_pages_env:
+            max_pages = int(max_pages_env)
+    except Exception:
+        # 無効な値が設定されていても処理は継続する
+        pass
+
+    try:
+        timeout_env = os.getenv("OLLAMA_IMAGE_CAPTION_TIMEOUT", "").strip()
+        if timeout_env:
+            timeout = int(timeout_env)
+    except Exception:
+        pass
+
     try:
         pages = convert_from_bytes(contents, dpi=dpi)
     except Exception as e:
@@ -1896,7 +1916,6 @@ def generate_image_captions_from_pdf(contents: bytes, max_pages: int | None = No
             captions.append({"page": idx + 1, "caption": str(caption).strip()})
         except Exception as e:
             print(f"[警告] llava:7bによる画像キャプション生成に失敗 (page={idx+1}): {e}")
-            captions.append({"page": idx + 1, "caption": f"画像キャプション生成失敗: {e}"})
 
     return captions
 
@@ -2041,31 +2060,10 @@ def _generate_qa_for_existing_pdf(
                 max_tokens=640,
             )
             print(f"[重要] generate_qa: 回答生成LLM={resolved_answer_llm}")
-            answer_system_prompt = textwrap.dedent(
-                """
-                あなたは日本語のRAGシステムにおける回答エンジンです。以下の制約を厳密に守ってください。
-                - 提供されたコンテキストに含まれる事実のみを用いて回答すること。
-                - 文書内に記載が見つからない場合は「本文に該当記述がありません。」と明示すること。
-                - 回答は自然な日本語で2〜3文以内にまとめること。
-                - 重要な根拠がある場合はその文を要約して含めること。
-                """
-            ).strip()
 
             for i, q in enumerate(questions):
                 try:
-                    prompt_a = textwrap.dedent(
-                        f"""
-                        {answer_system_prompt}
-
-                        ### コンテキスト
-                        {sample_text}
-
-                        ### 質問
-                        {q}
-
-                        ### 回答
-                        """
-                    ).strip()
+                    prompt_a = build_rag_answer_prompt(sample_text, q)
                     answer_resp = llm_a_instance.invoke(prompt_a, max_tokens=640)
                     normalized_answer = _extract_answer_text(answer_resp)
                     answer = normalized_answer.strip().split("\n")[0]
@@ -2292,7 +2290,6 @@ try:
     )
     MLX_OCR_AVAILABLE = True
 except Exception as e:  # noqa: BLE001
-    print(f"[警告] MLX DeepSeek OCRモジュール読み込みに失敗: {e}. MLX OCRを無効化します。")
     MLX_OCR_AVAILABLE = False
     # Ollama DeepSeek用に最低限のデフォルトプロンプトをここで定義
     DEFAULT_OCR_PROMPT = (
@@ -2345,7 +2342,8 @@ import os
 nltk.data.path = ['/usr/local/share/nltk_data', '/usr/local/lib/nltk_data'] + nltk.data.path
 print('[NLTK] data search path:', nltk.data.path)
 # punktを明示的にダウンロード
-nltk.download('punkt', download_dir='/usr/local/share/nltk_data')
+if os.getenv("NLTK_AUTO_DOWNLOAD", "0").lower() in {"1", "true", "yes"}:
+    nltk.download('punkt', download_dir='/usr/local/share/nltk_data')
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -2714,7 +2712,8 @@ LOCAL_MODEL_PATH = Path("/app/models/BAAI_bge-small-en-v1.5")
 # セキュリティ注意: 本番環境ではAPIキーの表示は避けてください
 import logging
 logging.basicConfig(level=logging.INFO)
-logging.info(f"[起動時] OPENAI_API_KEY: {os.getenv('OPENAI_API_KEY')}")
+_openai_key = os.getenv('OPENAI_API_KEY')
+logging.info("[起動時] OPENAI_API_KEY: 設定あり" if _openai_key else "[起動時] OPENAI_API_KEY: 未設定")
 
 # --- RAGAS互換ラッパー（set_run_config を要求する環境向け）---
 def _extract_answer_text(llm_response):
@@ -2729,6 +2728,33 @@ def _extract_answer_text(llm_response):
     except Exception:
         pass
     return str(llm_response)
+
+
+def build_rag_answer_prompt(context: str, question: str) -> str:
+    """RAG回答用の共通プロンプト文字列を構築するユーティリティ。"""
+    answer_system_prompt = textwrap.dedent(
+        """
+        あなたは日本語のRAGシステムにおける回答エンジンです。以下の制約を厳密に守ってください。
+        - 提供されたコンテキストに含まれる事実のみを用いて回答すること。
+        - 文書内に記載が見つからない場合は「本文に該当記述がありません。」と明示すること。
+        - 回答は自然な日本語で2〜3文以内にまとめること。
+        - 重要な根拠がある場合はその文を要約して含めること。
+        """
+    ).strip()
+
+    return textwrap.dedent(
+        f"""
+        {answer_system_prompt}
+
+        ### コンテキスト
+        {context}
+
+        ### 質問
+        {question}
+
+        ### 回答
+        """
+    ).strip()
 
 
 ANSWER_DUMMY_PATTERNS = [
@@ -4143,28 +4169,70 @@ def query_rag(request: QueryRequest):
 
         retriever = vectorstore.as_retriever()
 
-        # プロンプトテンプレート
-        template = """以下の文脈に基づいて質問に答えてください。
-
-文脈:
-{context}
-
-質問: {question}"""
-        prompt = ChatPromptTemplate.from_template(template)
-
         # 関連するドキュメントを取得し、コンテキスト文字列を構築
         retrieved_docs = retriever.get_relevant_documents(request.query)
         contexts = [doc.page_content for doc in retrieved_docs]
-        context_text = "\n\n".join(contexts) if contexts else "(関連文脈が見つかりませんでした)"
+        try:
+            print(f"[DEBUG] /query retrieved_docs={len(retrieved_docs)}, contexts_len={len(contexts)}")
+            if contexts:
+                snippet = contexts[0][:120].replace("\n", " ")
+                print(f"[DEBUG] /query first_context_snippet={snippet!r}")
+        except Exception:
+            pass
 
-        # LLMへ渡すプロンプト文字列を生成し、RAGAS互換ラッパを直接呼び出す
-        prompt_text = template.format(context=context_text, question=request.query)
-        raw_answer = llm_instance.invoke(prompt_text)
-        answer = _extract_answer_text(raw_answer)
+        if not contexts:
+            # コンテキストが全く取得できなかった場合は、PDFに基づく回答ができないことを明示
+            answer = "本文に該当記述がありません。PDF内にこの質問に対応する情報が見つかりませんでした。"
+        else:
+            context_text = "\n\n".join(contexts)
+
+            # 共通のRAG回答プロンプトを使用
+            prompt_text = build_rag_answer_prompt(context_text, request.query)
+            raw_answer = llm_instance.invoke(prompt_text)
+            answer = _extract_answer_text(raw_answer).strip()
+            try:
+                print(f"[DEBUG] /query llm_answer_head={answer[:120]!r}")
+            except Exception:
+                pass
+
+            normalized_answer = answer.replace(" ", "").replace("　", "")
+            fallback_needed = False
+            if not normalized_answer:
+                fallback_needed = True
+            elif "本文に該当記述がありません" in normalized_answer and contexts:
+                fallback_needed = True
+
+            if fallback_needed and contexts:
+                try:
+                    fallback_prompt = textwrap.dedent(
+                        f"""
+                        あなたは日本語のRAGシステムにおける回答エンジンです。
+                        以下のコンテキストに基づいて、質問に対してできるだけ近い答えを推測して下さい。
+                        完全に一致する記述がなくても、関連しそうな情報から妥当な推測を含めて回答してください。
+                        「本文に該当記述がありません」のようなメッセージは禁止です。
+
+                        ### コンテキスト
+                        {context_text}
+
+                        ### 質問
+                        {request.query}
+
+                        ### 回答
+                        """
+                    ).strip()
+                    raw_fallback = llm_instance.invoke(fallback_prompt)
+                    fallback_answer = _extract_answer_text(raw_fallback).strip()
+                    if fallback_answer:
+                        answer = fallback_answer
+                except Exception as e:
+                    print(f"[WARN] /query fallback generation failed: {e}")
+
+            if not answer:
+                answer = "本文に該当記述がありません。"
 
         try:
             with engine.begin() as conn:
-                conn.execute(
+                result = conn.execute(
                     text(
                         """
                         INSERT INTO chat_logs (
@@ -4183,6 +4251,7 @@ def query_rag(request: QueryRequest):
                             :embedding_model,
                             :scope
                         )
+                        RETURNING id
                         """
                     ),
                     {
@@ -4194,6 +4263,37 @@ def query_rag(request: QueryRequest):
                         "scope": scope,
                     },
                 )
+                chat_log_id = result.scalar()
+
+                if chat_log_id and contexts:
+                    try:
+                        context_rows = [
+                            {
+                                "chat_log_id": chat_log_id,
+                                "context_index": idx,
+                                "content": ctx,
+                            }
+                            for idx, ctx in enumerate(contexts)
+                        ]
+                        conn.execute(
+                            text(
+                                """
+                                INSERT INTO chat_contexts (
+                                    chat_log_id,
+                                    context_index,
+                                    content
+                                )
+                                VALUES (
+                                    :chat_log_id,
+                                    :context_index,
+                                    :content
+                                )
+                                """
+                            ),
+                            context_rows,
+                        )
+                    except Exception as e_ctx:
+                        print(f"[WARN] chat_contexts insert failed: {e_ctx}")
         except Exception as e:
             print(f"[WARN] chat_logs insert failed: {e}")
 
@@ -4482,9 +4582,9 @@ def get_available_models():
             sum(f.stat().st_size for f in LOCAL_MODEL_PATH.glob('**/*') if f.is_file()) / (1024 * 1024)
         ) if model_exists else 0
     }
-    
+
     return {
-        "llm_models": ["ollama_llama2", "gpt-4o"],
+        "llm_models": [DEFAULT_LLM_NAME, "gpt-4o"],
         "embedding_models": ["huggingface_bge_small", "gpt-4o"],
         "current_embedding_model": {
             "name": "huggingface_bge_small",
@@ -4502,6 +4602,64 @@ from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi import Request
 import asyncio
+
+# /bulk_evaluate 用ヘルパー
+SUPPORTED_EMBEDDING_MODELS = {
+    # OpenAIモデル
+    "openai",
+    "text-embedding-3-small",
+    "text-embedding-3-large",
+    "text-embedding-ada-002",
+    # HuggingFaceモデル
+    "huggingface_bge_small",
+    "huggingface_bge_large",
+    "huggingface_miniLM",
+    "huggingface_mpnet_base",
+    "huggingface_multi_qa_minilm",
+    "huggingface_multi_qa_mpnet",
+    "huggingface_paraphrase_multilingual",
+    "huggingface_distiluse_multilingual",
+    "huggingface_xlm_r",
+    "jina-embeddings-v4",
+    # Ollama埋め込みモデル
+    "nomic-embed-text",
+    "mxbai-embed-large",
+    "all-minilm",
+    "bge-m3",
+    "qwen3-embedding",
+    "snowflake-arctic-embed2",
+    "jina-embeddings-v3",
+}
+
+
+def _parse_timeout_env(key: str, default_seconds: int):
+    val = os.getenv(key, str(default_seconds))
+    if val is None:
+        return default_seconds
+    v = str(val).strip().lower()
+    if v in ("none", "no", "off", "false", "0", "-1"):
+        return None  # 無制限
+    try:
+        return int(v)
+    except Exception:
+        return default_seconds
+
+
+def _bool_env(val, default=True):
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            return True
+        if v in {"0", "false", "no", "off"}:
+            return False
+    return default
+
 
 @app.post("/bulk_evaluate/")
 async def bulk_evaluate(request: Request):
@@ -4561,17 +4719,6 @@ async def bulk_evaluate(request: Request):
                 print("[進捗] 評価データを処理中...")
                 # タイムアウト設定（環境変数で調整可能）
                 # 既定値: LLM呼び出し=45秒, 評価全体は質問数に応じて自動調整
-                def _parse_timeout_env(key: str, default_seconds: int):
-                    val = os.getenv(key, str(default_seconds))
-                    if val is None:
-                        return default_seconds
-                    v = str(val).strip().lower()
-                    if v in ("none", "no", "off", "false", "0", "-1"):
-                        return None  # 無制限
-                    try:
-                        return int(v)
-                    except Exception:
-                        return default_seconds
                 LLM_TIMEOUT = _parse_timeout_env("EVAL_LLM_TIMEOUT_SECONDS", 45)
                 EVAL_TIMEOUT = None  # 後段で質問数を基に算出
                 embedding_model = data.get("embedding_model")
@@ -4597,19 +4744,7 @@ async def bulk_evaluate(request: Request):
                     raise ValueError("textが指定されていません")
                     
                 # サポートされているモデルかチェック
-                supported_models = {
-                    # OpenAIモデル
-                    'openai', 'text-embedding-3-small', 'text-embedding-3-large', 'text-embedding-ada-002',
-                    # HuggingFaceモデル
-                    'huggingface_bge_small', 'huggingface_bge_large', 'huggingface_miniLM', 'huggingface_mpnet_base',
-                    'huggingface_multi_qa_minilm', 'huggingface_multi_qa_mpnet',
-                    'huggingface_paraphrase_multilingual', 'huggingface_distiluse_multilingual',
-                    'huggingface_xlm_r', 'jina-embeddings-v4',
-                    # Ollama埋め込みモデル
-                    'nomic-embed-text', 'mxbai-embed-large', 'all-minilm', 'bge-m3', 'qwen3-embedding', 'snowflake-arctic-embed2', 'jina-embeddings-v3',
-                }
-                
-                if embedding_model not in supported_models:
+                if embedding_model not in SUPPORTED_EMBEDDING_MODELS:
                     raise ValueError(f"未サポートの埋め込みモデルが指定されました: {embedding_model}")
                 
                 # OpenAI埋め込みの旧指定に対する注意喚起
@@ -4623,21 +4758,6 @@ async def bulk_evaluate(request: Request):
                     raise ValueError("questions/answersが指定されていません。PDFアップロード時の自動生成結果をそのまま送信してください。")
                 if not (sample_text and questions and answers):
                     raise ValueError("PDFアップロードとQA自動生成を先に実施してください（text, questions, answers必須）。")
-
-                def _bool_env(val, default=True):
-                    if val is None:
-                        return default
-                    if isinstance(val, bool):
-                        return val
-                    if isinstance(val, (int, float)):
-                        return bool(val)
-                    if isinstance(val, str):
-                        v = val.strip().lower()
-                        if v in {"1", "true", "yes", "on"}:
-                            return True
-                        if v in {"0", "false", "no", "off"}:
-                            return False
-                    return default
 
                 include_answer_similarity = _bool_env(data.get("include_answer_similarity"), True)
 
@@ -5283,6 +5403,12 @@ def admin_wipe_all(payload: dict):
                 "generated_questions",
                 "experiments",
                 "experiment_results",
+                "upload_jobs",
+                "chat_logs",
+                "chat_contexts",
+                "model_selection",
+                "langchain_pg_embedding",
+                "langchain_pg_collection",
             ]
             table_dumps = []
             with engine.begin() as conn:
@@ -5322,11 +5448,27 @@ def admin_wipe_all(payload: dict):
         # --- DB削除（外部キー制約に配慮し順序を決定） ---
         with engine.begin() as conn:
             # 依存の深い順に消す
-            conn.execute(text("DELETE FROM experiment_results"))
-            conn.execute(text("DELETE FROM experiments"))
-            conn.execute(text("DELETE FROM generated_questions"))
-            conn.execute(text("DELETE FROM pdf_chunks"))
-            conn.execute(text("DELETE FROM pdf_files"))
+            tables_to_delete = [
+                "experiment_results",
+                "experiments",
+                "generated_questions",
+                "pdf_chunks",
+                "chat_contexts",
+                "chat_logs",
+                "upload_jobs",
+                "model_selection",
+                "langchain_pg_embedding",
+                "langchain_pg_collection",
+            ]
+            for t in tables_to_delete:
+                try:
+                    conn.execute(text(f"DELETE FROM {t}"))
+                except Exception:
+                    pass
+            try:
+                conn.execute(text("DELETE FROM pdf_files"))
+            except Exception:
+                pass
             try:
                 conn.execute(text("DELETE FROM embeddings"))
             except Exception:
@@ -5337,7 +5479,7 @@ def admin_wipe_all(payload: dict):
         file_details = []
         if delete_files:
             import itertools
-            for target_dir in (PDF_DIR, EXTRACTED_DIR):
+            for target_dir in (PDF_DIR, EXTRACTED_DIR, IMAGES_DIR):
                 if target_dir.exists():
                     for p in list(target_dir.glob("*")):
                         try:
@@ -5681,7 +5823,33 @@ def history_chat_logs(pdf_file_id: str | None = None, limit: int = 200):
                     ),
                     {"limit": limit},
                 ).fetchall()
-            items = [dict(r._mapping) for r in rows]
+
+            items = []
+            for r in rows:
+                base = dict(r._mapping)
+                contexts_list: list[str] = []
+                try:
+                    ctx_rows = conn.execute(
+                        text(
+                            """
+                            SELECT context_index, content
+                            FROM chat_contexts
+                            WHERE chat_log_id = :cid
+                            ORDER BY context_index ASC
+                            """
+                        ),
+                        {"cid": base.get("id")},
+                    ).fetchall()
+                    for cr in ctx_rows:
+                        m = cr._mapping
+                        content = m.get("content")
+                        if isinstance(content, str):
+                            contexts_list.append(content)
+                except Exception:
+                    contexts_list = []
+                base["contexts"] = contexts_list
+                items.append(base)
+
             return JSONResponse(content=jsonable_encoder({"items": items}))
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})

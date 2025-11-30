@@ -6,7 +6,7 @@ import base64
 import pandas as pd
 import streamlit as st
 
-from http_client import http_get, http_post
+from http_client import http_get, http_post, format_http_error
 from evaluation_history_ui import _render_bulk_style_charts, apply_bulk_chunk_settings_from_history
 from graph_utils import create_zip_with_graphs
 
@@ -607,7 +607,7 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                     else:
                         if resp.status_code != 200:
                             st.error(
-                                f"一括評価APIエラー: {resp.status_code} {resp.text}"
+                                f"一括評価APIエラー: {format_http_error(resp)}"
                             )
                         else:
                             data = resp.json()

@@ -8,7 +8,7 @@ import pandas as pd
 from pytz import timezone
 import streamlit as st
 
-from http_client import http_get, http_post
+from http_client import http_get, http_post, format_http_error
 
 
 def _fetch_models(BACKEND_URL: str) -> tuple[list[dict], list[dict]]:
@@ -241,6 +241,7 @@ def render_chatbot_tab(
                                 user_msg = row.get("user_message", "")
                                 assistant_msg = row.get("assistant_message", "")
                                 model_used = row.get("llm_model_used")
+                                ctx_list = row.get("contexts") or []
                                 st.session_state.chat_messages.append(
                                     {
                                         "role": "user",
@@ -255,10 +256,15 @@ def render_chatbot_tab(
                                         "content": assistant_msg,
                                         "model": model_used,
                                         "timestamp": ts,
+                                        "contexts": ctx_list,
                                     }
                                 )
                 except Exception as e:  # noqa: BLE001
                     st.warning(f"チャット履歴の取得に失敗しました: {e}")
+
+        reset_filter = st.session_state.pop("chat_reset_history_filter", False)
+        if reset_filter and "chat_history_date_selectbox" in st.session_state:
+            del st.session_state["chat_history_date_selectbox"]
 
         # チャットメッセージの整形と日付フィルタ
         tz_jst = timezone("Asia/Tokyo")
@@ -341,6 +347,20 @@ def render_chatbot_tab(
                             f'title="回答生成に使用したモデル">🛈 {tooltip_text}</span>',
                             unsafe_allow_html=True,
                         )
+                        contexts_hist = message.get("contexts") or []
+                        if contexts_hist:
+                            with st.expander(
+                                "この応答で使用したコンテキストを表示",
+                                expanded=False,
+                            ):
+                                for i, ctx in enumerate(contexts_hist, start=1):
+                                    st.markdown(f"**コンテキスト {i}**")
+                                    st.text_area(
+                                        f"hist_context_{timestamp_label}_{i}",
+                                        value=str(ctx),
+                                        height=120,
+                                        key=f"chat_hist_context_{timestamp_label}_{i}",
+                                    )
         elif filter_applied:
             st.info("選択された日付のチャット履歴はありません。")
 
@@ -417,6 +437,7 @@ def render_chatbot_tab(
                 )
             else:
                 # --- RAGバックエンドAPIを呼び出して実際の応答を取得 ---
+                contexts: list[str] | None = None
                 try:
                     current_scope = st.session_state.get("rag_scope", "single")
                     current_pdf_id = (
@@ -444,13 +465,16 @@ def render_chatbot_tab(
                         data = response.json()
                         response_text = data.get("answer", "（応答がありません）")
                         model_used = data.get("llm_model_used", chat_model)
+                        contexts = data.get("contexts") or []
                     else:
                         response_text = (
-                            f"APIエラー: {response.status_code} - {response.text}"
+                            f"APIエラー: {format_http_error(response)}"
                         )
+                        contexts = None
                 except Exception as e:  # noqa: BLE001
                     response_text = f"リクエストエラー: {str(e)}"
                     model_used = None
+                    contexts = None
             # --- バックエンドAPIの応答のみを表示・履歴追加 ---
             with st.chat_message("assistant"):
                 response_timestamp = datetime.now(tz_jst).isoformat()
@@ -466,6 +490,19 @@ def render_chatbot_tab(
                         f'title="回答生成に使用したモデル">🛈 {html.escape(model_used)}</span>',
                         unsafe_allow_html=True,
                     )
+                if contexts:
+                    with st.expander(
+                        "この応答で使用したコンテキストを表示",
+                        expanded=False,
+                    ):
+                        for i, ctx in enumerate(contexts, start=1):
+                            st.markdown(f"**コンテキスト {i}**")
+                            st.text_area(
+                                f"live_context_{response_timestamp}_{i}",
+                                value=str(ctx),
+                                height=120,
+                                key=f"chat_live_context_{response_timestamp}_{i}",
+                            )
                 st.session_state.chat_messages.append(
                     {
                         "role": "assistant",
@@ -478,6 +515,5 @@ def render_chatbot_tab(
             # 画面を更新
             st.session_state["chat_scroll_to_bottom"] = True
             # 新しいメッセージ送信時は日付フィルタをリセットして全履歴を表示する
-            if "chat_history_date_selectbox" in st.session_state:
-                st.session_state["chat_history_date_selectbox"] = None
+            st.session_state["chat_reset_history_filter"] = True
             st.rerun()

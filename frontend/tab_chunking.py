@@ -4,7 +4,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import streamlit as st
 
-from http_client import http_get, http_post
+from http_client import http_get, http_post, format_http_error
 
 
 def _fetch_history_pdfs(BACKEND_URL: str) -> List[Dict[str, Any]]:
@@ -267,7 +267,7 @@ def render_chunking_tab(
                 st.error(f"/chunk API呼び出し中にエラーが発生しました: {e}")
             else:
                 if resp.status_code != 200:
-                    st.error(f"/chunk APIエラー: {resp.status_code} {resp.text}")
+                    st.error(f"/chunk APIエラー: {format_http_error(resp)}")
                 else:
                     data = resp.json() if resp.headers.get("Content-Type", "").startswith("application/json") else {}
                     chunks = data.get("chunks", []) or []
@@ -324,7 +324,7 @@ def render_chunking_tab(
                         else:
                             progress_placeholder.empty()
                             if resp_vs.status_code != 200:
-                                st.error(f"ベクトルストア再構築APIエラー: {resp_vs.status_code} {resp_vs.text}")
+                                st.error(f"ベクトルストア再構築APIエラー: {format_http_error(resp_vs)}")
                             else:
                                 data_vs = (
                                     resp_vs.json()

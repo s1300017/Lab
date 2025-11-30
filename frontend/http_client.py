@@ -48,3 +48,24 @@ def http_post(url: str, **kwargs):
 def http_delete(url: str, **kwargs):
     """共通DELETE。timeoutは指定しない。"""
     return get_http_session().delete(url, **kwargs)
+
+
+def format_http_error(resp: requests.Response) -> str:
+    """HTTPレスポンスからステータスコードとエラーメッセージを整形して返す。
+
+    - Content-Type が JSON の場合は detail / error フィールドを優先して利用
+    - それ以外の場合は resp.text をそのまま利用
+    """
+    status = getattr(resp, "status_code", None)
+    text = ""
+    try:
+        if resp.headers.get("Content-Type", "").startswith("application/json"):
+            data = resp.json() or {}
+            text = data.get("detail") or data.get("error") or resp.text
+        else:
+            text = resp.text
+    except Exception:
+        text = getattr(resp, "text", "")
+    if status is None:
+        return text or "不明なエラーが発生しました。"
+    return f"{status} {text}" if text else str(status)

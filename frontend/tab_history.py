@@ -588,6 +588,21 @@ def render_history_tab(
                                         if meta_parts:
                                             st.caption(" / ".join(meta_parts))
 
+                                        contexts = row.get("contexts") or []
+                                        if contexts:
+                                            with st.expander(
+                                                "この応答で使用したコンテキストを表示",
+                                                expanded=False,
+                                            ):
+                                                for i, ctx in enumerate(contexts, start=1):
+                                                    st.markdown(f"**コンテキスト {i}**")
+                                                    st.text_area(
+                                                        f"context_{row.get('id')}_{i}",
+                                                        value=str(ctx),
+                                                        height=120,
+                                                        key=f"chatlog_context_{row.get('id')}_{i}",
+                                                    )
+
                                 processed_rows: list[dict[str, Any]] = []
                                 for row in log_items:
                                     created_at = row.get("created_at")
@@ -601,6 +616,8 @@ def render_history_tab(
                                     else:
                                         date_str = None
                                         time_str = ""
+
+                                    ctx_list = row.get("contexts") or []
                                     processed_rows.append(
                                         {
                                             "日付": date_str,
@@ -616,6 +633,7 @@ def render_history_tab(
                                                 "embedding_model"
                                             ),
                                             "scope": row.get("scope"),
+                                            "コンテキスト数": len(ctx_list),
                                         }
                                     )
                                 log_df = pd.DataFrame(processed_rows)
@@ -661,6 +679,7 @@ def render_history_tab(
                                         fid,
                                         str(fid) if fid else "（PDF未指定）",
                                     )
+                                    ctx_list = row.get("contexts") or []
                                     processed_rows_all.append(
                                         {
                                             "PDF": pdf_label,

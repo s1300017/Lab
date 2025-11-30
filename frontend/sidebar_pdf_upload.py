@@ -10,7 +10,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_js_eval import streamlit_js_eval
 
-from http_client import http_get, http_post
+from http_client import http_get, http_post, format_http_error
 
 
 def render_pdf_upload_sidebar(
@@ -784,7 +784,7 @@ def render_pdf_upload_sidebar(
                             st.session_state["upload_job_started_at"] = None
                             st.session_state["upload_job_status"] = None
                             st.session_state["upload_error_message"] = (
-                                f"PDF処理ジョブ状態取得に失敗しました: {resp_status.status_code} {resp_status.text}"
+                                f"PDF処理ジョブ状態取得に失敗しました: {format_http_error(resp_status)}"
                             )
                             save_state_to_localstorage()
                     except Exception as e:
@@ -828,7 +828,7 @@ def render_pdf_upload_sidebar(
                         else:
                             if resp_qa.status_code != 200:
                                 st.error(
-                                    f"質問生成APIエラー: {resp_qa.status_code} {resp_qa.text}"
+                                    f"質問生成APIエラー: {format_http_error(resp_qa)}"
                                 )
                             else:
                                 qa_data = (
