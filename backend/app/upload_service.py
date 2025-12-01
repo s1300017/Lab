@@ -55,24 +55,14 @@ engine = create_engine(DB_URL)
 IMAGES_DIR = DATA_DIR / "images"
 
 
-# MLX DeepSeek OCR (任意機能): main.py と同様に安全にインポートする
-try:
-    from .mlx_deepseek_ocr_check import (
-        DEFAULT_OCR_PROMPT,
-        DEFAULT_PHOTO_PROMPT,
-        run_deepseek_ocr,
-    )
-
-    MLX_OCR_AVAILABLE = True
-except Exception:  # noqa: BLE001
-    MLX_OCR_AVAILABLE = False
-    DEFAULT_OCR_PROMPT = (
-        "Please transcribe every visible character from this image in Japanese. "
-        "Do not describe the scene. If any part is unreadable, leave it blank without guessing."
-    )
-    DEFAULT_PHOTO_PROMPT = (
-        "Please describe the content of this image in Japanese briefly and clearly."
-    )
+# DeepSeek OCR 用のデフォルトプロンプト（現在は Ollama deepseek-ocr のみ利用）
+DEFAULT_OCR_PROMPT = (
+    "Please transcribe every visible character from this image in Japanese. "
+    "Do not describe the scene. If any part is unreadable, leave it blank without guessing."
+)
+DEFAULT_PHOTO_PROMPT = (
+    "Please describe the content of this image in Japanese briefly and clearly."
+)
 
 
 class UploadJobStatus(str, Enum):
@@ -290,19 +280,17 @@ def run_pdf_upload_pipeline_sync(
         )
         ocr_image_compression = normalized_compression
 
-        use_mlx_ocr = normalized_engine in {"mlx", "deepseek_mlx"}
-        use_ollama_ocr = normalized_engine in {"ollama_deepseek", "deepseek_ocr", "deepseek-ocr"}
+        # deepseek 系エンジン指定はすべて Ollama deepseek-ocr に統一
+        use_ollama_ocr = normalized_engine in {
+            "ollama_deepseek",
+            "deepseek_ocr",
+            "deepseek-ocr",
+            "deepseek",
+        }
         if use_ollama_ocr:
             actual_ocr_engine = "ollama_deepseek"
-        elif use_mlx_ocr:
-            actual_ocr_engine = "mlx"
         else:
             actual_ocr_engine = "pypdf"
-
-        if normalized_engine == "deepseek":
-            warning_message += "DeepSeek OCR (PyTorch版) は廃止されました。MLX版スクリプトをご利用ください。\n"
-            logger.warning("[警告] DeepSeek OCR (PyTorch) はサポート終了のためMLX版にフォールバックします。")
-            use_mlx_ocr = True
 
         extracted_captions = ""
         mlx_image_captions: list[dict[str, str | int | None]] = []
@@ -338,95 +326,20 @@ def run_pdf_upload_pipeline_sync(
                 use_ollama_ocr = False
                 actual_ocr_engine = "pypdf"
 
-        if not use_mlx_ocr and not use_ollama_ocr:
+        if not use_ollama_ocr:
             raise_if_job_cancelled(job_id)
             update_job_progress(job_id, "PyPDF でテキストを抽出中です…")
             text = extract_pdf_text_layout(contents)
             auto_threshold = int(os.getenv("OCR_AUTO_MIN_CHARS", "200"))
             if len(text.strip()) < auto_threshold:
                 logger.warning(
-                    "[警告] PyPDF抽出が短いためMLX OCRへフォールバック: %d < %d",
+                    "[警告] PyPDF抽出が短いためOCR結果が不十分な可能性があります: %d < %d",
                     len(text.strip()),
                     auto_threshold,
                     extra={"file_id": file_id, "job_id": job_id, "component": "upload", "endpoint": "upload_pipeline"},
                 )
-                use_mlx_ocr = True
-            else:
-                actual_ocr_engine = "pypdf"
-
-        if use_mlx_ocr and not MLX_OCR_AVAILABLE:
-            logger.warning(
-                "[警告] MLX DeepSeek OCRモジュールが利用できないため、PyPDFベースにフォールバックします。",
-                extra={"file_id": file_id, "job_id": job_id, "component": "upload", "endpoint": "upload_pipeline"},
-            )
-            use_mlx_ocr = False
-            actual_ocr_engine = "pypdf"
-
-        if use_mlx_ocr:
-            raise_if_job_cancelled(job_id)
-            update_job_progress(job_id, "MLX DeepSeek OCR でPDFテキストを抽出中です…")
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
-                tmp_pdf.write(contents)
-                tmp_pdf_path = Path(tmp_pdf.name)
-            try:
-                ocr_results = run_deepseek_ocr(
-                    input_path=tmp_pdf_path,
-                    model_path=os.getenv("MLX_DEEPSEEK_MODEL", "quocnguyen/DeepSeek-OCR-bf16-mlx"),
-                    prompt=os.getenv("MLX_DEEPSEEK_PROMPT", DEFAULT_OCR_PROMPT),
-                    describe_photos=bool(
-                        os.getenv("MLX_DEEPSEEK_DESCRIBE_PHOTOS", "0")
-                        not in {"0", "false", "False"}
-                    ),
-                    photo_prompt=os.getenv("MLX_DEEPSEEK_PHOTO_PROMPT", DEFAULT_PHOTO_PROMPT),
-                    max_tokens=int(os.getenv("MLX_DEEPSEEK_MAX_TOKENS", "3000")),
-                    temperature=float(os.getenv("MLX_DEEPSEEK_TEMPERATURE", "0.0")),
-                    max_pages=None,
-                    dpi=int(os.getenv("MLX_DEEPSEEK_DPI", "300")),
-                    margin=int(os.getenv("MLX_DEEPSEEK_MARGIN", "16")),
-                    contrast=float(os.getenv("MLX_DEEPSEEK_CONTRAST", "1.0")),
-                    color_mode=os.getenv("MLX_DEEPSEEK_COLOR_MODE", "grayscale"),
-                    image_format=os.getenv("MLX_DEEPSEEK_IMAGE_FORMAT", "png"),
-                    binarize_threshold=(
-                        lambda v: int(v) if v else None
-                    )(os.getenv("MLX_DEEPSEEK_BINARIZE_THRESHOLD", "")),
-                    sharpen=bool(
-                        os.getenv("MLX_DEEPSEEK_SHARPEN", "0")
-                        not in {"0", "false", "False"}
-                    ),
-                    ocr_min_length=int(os.getenv("MLX_DEEPSEEK_OCR_MIN_LENGTH", "20")),
-                    fallback_text_crop_ratio=float(
-                        os.getenv("MLX_DEEPSEEK_FALLBACK_TEXT_CROP_RATIO", "0.4")
-                    ),
-                    save_images_dir=None,
-                    verbose=False,
-                )
-            finally:
-                tmp_pdf_path.unlink(missing_ok=True)
-
-            text_blocks: list[str] = []
-            caption_lines: list[str] = []
-            for page in ocr_results:
-                raise_if_job_cancelled(job_id)
-                if page.ocr.strip():
-                    text_blocks.append(f"[{page.label}]\n{page.ocr.strip()}")
-                if page.photo and page.photo.strip():
-                    caption_lines.append(
-                        f"- {page.label if page.page is None else f'p{page.page}'}: {page.photo.strip()}"
-                    )
-                    mlx_image_captions.append(
-                        {
-                            "source": "mlx_deepseek",
-                            "page": page.page,
-                            "label": page.label,
-                            "caption": page.photo.strip(),
-                        }
-                    )
-            if text_blocks:
-                text = "\n\n".join(text_blocks).strip()
-            else:
-                text = ""
-            extracted_captions = "\n".join(caption_lines)
-            actual_ocr_engine = "mlx"
+            # ここでは追加のOCRフォールバックは行わず、PyPDF結果をそのまま利用する
+            # actual_ocr_engine はデフォルトの "pypdf" のまま
 
         if cleanse:
             raise_if_job_cancelled(job_id)

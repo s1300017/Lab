@@ -935,25 +935,6 @@ import sys
 logger.critical("[CRITICAL] main.pyロード開始")
 from pathlib import Path
 
-# MLX DeepSeek OCR (任意機能): コンテナ環境ではmlx_vlmが無いことがあるため、安全にインポートする
-try:
-    from .mlx_deepseek_ocr_check import (
-        DEFAULT_OCR_PROMPT,
-        DEFAULT_PHOTO_PROMPT,
-        run_deepseek_ocr,
-    )
-    MLX_OCR_AVAILABLE = True
-except Exception as e:  # noqa: BLE001
-    MLX_OCR_AVAILABLE = False
-    # Ollama DeepSeek用に最低限のデフォルトプロンプトをここで定義
-    DEFAULT_OCR_PROMPT = (
-        "Please transcribe every visible character from this image in Japanese. "
-        "Do not describe the scene. If any part is unreadable, leave it blank without guessing."
-    )
-    DEFAULT_PHOTO_PROMPT = (
-        "Please describe the content of this image in Japanese briefly and clearly."
-    )
-
 # 画像キャプション生成・PDF画像化用の追加インポート（上部で集約）
 import base64
 import tempfile
