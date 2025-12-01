@@ -6,11 +6,9 @@ import json
 from datetime import datetime
 from pytz import timezone
 
+from .settings import DB_URL
+
 # データベース接続設定
-POSTGRES_DB = os.environ.get("POSTGRES_DB", "rag_db")
-POSTGRES_USER = os.environ.get("POSTGRES_USER", "rag_user")
-POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "rag_password")
-DB_URL = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@db:5432/{POSTGRES_DB}"
 engine = create_engine(DB_URL)
 
 router = APIRouter()

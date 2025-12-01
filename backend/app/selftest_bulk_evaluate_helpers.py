@@ -1,6 +1,10 @@
 import os
+import logging
 
 from app.main import _parse_timeout_env, _bool_env, SUPPORTED_EMBEDDING_MODELS
+
+
+logger = logging.getLogger(__name__)
 
 
 def _test_parse_timeout_env():
@@ -43,5 +47,6 @@ def run_all_tests():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     run_all_tests()
-    print("selftest_bulk_evaluate_helpers: OK")
+    logger.info("selftest_bulk_evaluate_helpers: OK")

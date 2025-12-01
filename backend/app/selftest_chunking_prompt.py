@@ -1,4 +1,8 @@
 from app.main import fixed_chunk_text, paragraph_chunk_text, build_rag_answer_prompt
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def _test_fixed_chunk_text():
@@ -32,5 +36,6 @@ def run_all_tests():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     run_all_tests()
-    print("selftest_chunking_prompt: OK")
+    logger.info("selftest_chunking_prompt: OK")
