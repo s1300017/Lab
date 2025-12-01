@@ -304,6 +304,10 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
 
         st.markdown("---")
         st.subheader("評価パラメータの設定")
+        st.caption(
+            "※ 質問数や組み合わせ（Embedding×チャンク設定）が多いほど処理時間が長くなります。"
+            " まずは少ない質問・少ない組み合わせで試すことをおすすめします。"
+        )
 
         total_q = len(eval_questions)
         total_a = len(eval_answers)
@@ -315,6 +319,7 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
             format_func=lambda v: "すべての質問を使用" if v == "all" else "先頭 N 問のみ使用",
             index=0,
             key="bulk_eval_question_mode",
+            help="全件評価は精度が高いですが時間がかかります。まずは先頭N問のみでお試しすることをおすすめします。",
         )
 
         if question_mode == "head_n" and max_pairs > 0:
@@ -326,6 +331,7 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 value=default_n,
                 step=1,
                 key="bulk_eval_question_count",
+                help="大きい値にするほど評価時間が長くなります。",
             )
 
         # RAG回答生成に使用するLLMの選択
@@ -495,7 +501,28 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
             "answer_similarity 指標も計算する (重め)",
             value=True,
             key="bulk_include_answer_similarity",
+            help="オンにすると質問ごとの生成回答と正解の類似度を追加で計算します。精度向上に役立ちますが計算コストが高くなります。",
         )
+
+        # 現在の設定から、おおよそのジョブ数を算出してユーザーに提示
+        estimated_jobs = 0
+        if selected_embeddings and selected_chunk_methods:
+            for method in selected_chunk_methods:
+                if method == "semantic":
+                    # semantic はサイズ・オーバーラップを持たない1組み合わせ扱い
+                    estimated_jobs += len(selected_embeddings)
+                else:
+                    estimated_jobs += len(selected_embeddings) * max(len(chunk_sizes), 1) * max(
+                        len(chunk_overlaps), 1
+                    )
+
+        if estimated_jobs > 0:
+            st.caption(f"現在の設定での評価ジョブ数（概算）: {estimated_jobs} 件")
+            if estimated_jobs > 20:
+                st.warning(
+                    "ジョブ数が多めです。必要に応じてEmbeddingモデルやチャンク候補の数を減らすと、"
+                    "評価時間を短縮できます。"
+                )
 
         st.markdown("---")
         st.subheader("一括評価の実行")
@@ -586,15 +613,32 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 if not jobs:
                     st.error("有効な評価ジョブが生成できませんでした。設定を見直してください。")
                     return
+                # ジョブ数が多すぎる場合は、実行前に明示的な確認を求める
+                job_count = len(jobs)
+                large_threshold = 20
+                pending_key = "bulk_eval_large_jobs_pending"
 
-                # ジョブ数が多すぎる場合は警告
-                if len(jobs) > 20:
-                    st.warning(
-                        f"評価ジョブが {len(jobs)} 件あります。処理に時間がかかる可能性があります。"
-                    )
+                # 閾値以下に減った場合は保留フラグをクリア
+                if job_count <= large_threshold:
+                    st.session_state.pop(pending_key, None)
+                else:
+                    prev_pending = st.session_state.get(pending_key)
+                    if prev_pending != job_count:
+                        st.session_state[pending_key] = job_count
+                        st.warning(
+                            f"評価ジョブが {job_count} 件あります。処理に時間がかかる可能性があります。\n"
+                            "設定内容を確認し、問題なければもう一度『この設定で一括評価を実行』ボタンを押してください。"
+                        )
+                        st.info(
+                            "※ 同じ設定でボタンを2回押した場合のみ、大量ジョブの一括評価を実行します。"
+                        )
+                        return
+                    else:
+                        # 同じ件数で2回目のクリックが行われた場合は確認済みとしてフラグをクリア
+                        st.session_state.pop(pending_key, None)
 
                 payload: Any
-                if len(jobs) == 1:
+                if job_count == 1:
                     payload = jobs[0]
                 else:
                     payload = jobs

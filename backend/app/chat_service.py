@@ -21,7 +21,7 @@ from .chunk_utils import (
     semantic_chunk_text,
 )
 from .llm_ragas_utils import _extract_answer_text
-from .settings import DB_URL
+from .settings import DB_URL, REQUEST_ID_CTX
 
 
 logger = logging.getLogger(__name__)
@@ -83,6 +83,12 @@ def _persist_chat_log_and_contexts(
     """chat_logs および chat_contexts への永続化を行うヘルパー。"""
 
     try:
+        # ContextVar から現在の request_id を取得（存在しない場合は None）
+        try:
+            request_id = REQUEST_ID_CTX.get()
+        except LookupError:  # pragma: no cover - 安全側
+            request_id = None
+
         with engine.begin() as conn:
             result = conn.execute(
                 text(
@@ -93,7 +99,8 @@ def _persist_chat_log_and_contexts(
                         assistant_message,
                         llm_model_used,
                         embedding_model,
-                        scope
+                        scope,
+                        request_id
                     )
                     VALUES (
                         :pdf_file_id,
@@ -101,7 +108,8 @@ def _persist_chat_log_and_contexts(
                         :assistant_message,
                         :llm_model_used,
                         :embedding_model,
-                        :scope
+                        :scope,
+                        :request_id
                     )
                     RETURNING id
                     """
@@ -113,6 +121,7 @@ def _persist_chat_log_and_contexts(
                     "llm_model_used": resolved_llm,
                     "embedding_model": request.embedding_model,
                     "scope": scope,
+                    "request_id": request_id,
                 },
             )
             chat_log_id = result.scalar()

@@ -652,6 +652,11 @@ def render_pdf_upload_sidebar(
                                     unsafe_allow_html=True,
                                 )
 
+                                # バックエンドからの進捗メッセージとジョブIDを表示
+                                if job_progress:
+                                    st.info(f"現在の進捗: {job_progress}")
+                                st.caption(f"ジョブID: {upload_job_id}")
+
                                 if not job_cancel_requested:
                                     col_cancel, col_spacer = st.columns([1, 1])
                                     with col_cancel:
@@ -848,4 +853,28 @@ def render_pdf_upload_sidebar(
                                     "last_qa_generation_success"
                                 ] = "質問・回答の自動生成が完了しました。履歴タブから確認・編集が可能です。"
                                 st.rerun()
+
+                # チャットボットタブ / 一括評価タブへのショートカット
+                col_chat_shortcut, col_bulk_shortcut = st.columns(2)
+                with col_chat_shortcut:
+                    if st.button(
+                        "チャットボットタブでこのPDFを使う",
+                        key="use_pdf_in_chat_tab",
+                    ):
+                        # チャットボットタブの単一PDFスコープ用に file_id を引き継ぐ
+                        st.session_state["rag_pdf_file_id"] = file_id_value
+                        st.session_state["rag_scope"] = "single"
+                        st.success(
+                            "チャットボットタブでこのPDFが選択されるようになりました。上部の『チャットボット』タブを開いてください。"
+                        )
+                with col_bulk_shortcut:
+                    if st.button(
+                        "RAGAS一括評価タブでこのPDFを選択",
+                        key="use_pdf_in_bulk_tab",
+                    ):
+                        # 一括評価タブの評価対象PDFとして file_id を引き継ぐ
+                        st.session_state["file_id"] = file_id_value
+                        st.success(
+                            "RAGAS一括評価タブでこのPDFがデフォルト選択されます。上部の『RAGAS一括評価』タブを開いてください。"
+                        )
         # has_uploaded_file の場合の処理ここまで

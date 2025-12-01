@@ -663,6 +663,30 @@ with tab_history:
                                     st.error(f"質問生成APIエラー: {format_http_error(resp_qa)}")
                             except Exception as e:
                                 st.error(f"質問生成API呼び出し中にエラーが発生しました: {e}")
+                # チャットボットタブ / 一括評価タブへのショートカット
+                col_chat_shortcut, col_bulk_shortcut = st.columns([1, 1])
+                with col_chat_shortcut:
+                    if st.button(
+                        "このPDFでチャットボットを開く",
+                        key=f"history_open_chat_from_pdf_{selected_pdf['id']}",
+                    ):
+                        # チャットボットタブの単一PDFスコープ用に選択
+                        st.session_state["rag_pdf_file_id"] = selected_pdf["id"]
+                        st.session_state["rag_scope"] = "single"
+                        st.session_state["file_id"] = selected_pdf["id"]
+                        st.info(
+                            "チャットボットタブでこのPDFが選択されるようになりました。上部の『チャットボット』タブを開いてください。"
+                        )
+                with col_bulk_shortcut:
+                    if st.button(
+                        "このPDFを一括評価タブで選択",
+                        key=f"history_open_bulk_from_pdf_{selected_pdf['id']}",
+                    ):
+                        # 一括評価タブの評価対象PDFとして file_id を引き継ぐ
+                        st.session_state["file_id"] = selected_pdf["id"]
+                        st.info(
+                            "RAGAS一括評価タブでこのPDFがデフォルト選択されます。上部の『RAGAS一括評価』タブを開いてください。"
+                        )
 
                 # 生成QA一覧
                 st.markdown("### 生成QA一覧")

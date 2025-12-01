@@ -242,6 +242,7 @@ def render_chatbot_tab(
                                 assistant_msg = row.get("assistant_message", "")
                                 model_used = row.get("llm_model_used")
                                 ctx_list = row.get("contexts") or []
+                                req_id = row.get("request_id")
                                 st.session_state.chat_messages.append(
                                     {
                                         "role": "user",
@@ -257,6 +258,7 @@ def render_chatbot_tab(
                                         "model": model_used,
                                         "timestamp": ts,
                                         "contexts": ctx_list,
+                                        "request_id": req_id,
                                     }
                                 )
                 except Exception as e:  # noqa: BLE001
@@ -300,6 +302,8 @@ def render_chatbot_tab(
         messages_to_display = parsed_messages
         selected_chat_date: Optional[date] = None
         filter_applied = False
+        keyword: str = ""
+        selected_model: Optional[str] = None
 
         if parsed_messages:
             date_candidates = sorted(
@@ -317,12 +321,51 @@ def render_chatbot_tab(
                     format_func=lambda v: "すべて" if v is None else v.isoformat(),
                     key="chat_history_date_selectbox",
                 )
-                filter_applied = selected_chat_date is not None
-                if filter_applied:
+                if selected_chat_date is not None:
+                    filter_applied = True
                     messages_to_display = [
                         entry
-                        for entry in parsed_messages
+                        for entry in messages_to_display
                         if entry["date"] == selected_chat_date
+                    ]
+
+            # キーワードフィルタ（ユーザー発話・アシスタント応答の両方を対象）
+            keyword = st.text_input(
+                "キーワードで絞り込み",
+                value="",
+                key="chat_history_keyword_filter",
+                placeholder="メッセージ内容に含まれる文字列で検索します",
+            ).strip()
+            if keyword:
+                kw_lower = keyword.lower()
+                filter_applied = True
+                messages_to_display = [
+                    entry
+                    for entry in messages_to_display
+                    if kw_lower in str(entry["message"].get("content", "")).lower()
+                ]
+
+            # モデル名でのフィルタ（アシスタントメッセージの model フィールド）
+            model_candidates = sorted(
+                {
+                    str(msg.get("model"))
+                    for msg in (e["message"] for e in parsed_messages)
+                    if msg.get("model")
+                }
+            )
+            if model_candidates:
+                selected_model = st.selectbox(
+                    "モデルで絞り込み",
+                    options=[None] + model_candidates,
+                    format_func=lambda v: "すべて" if v is None else str(v),
+                    key="chat_history_model_filter",
+                )
+                if selected_model is not None:
+                    filter_applied = True
+                    messages_to_display = [
+                        entry
+                        for entry in messages_to_display
+                        if entry["message"].get("model") == selected_model
                     ]
             st.caption(f"チャット履歴件数: {len(parsed_messages)}")
         else:
@@ -362,7 +405,7 @@ def render_chatbot_tab(
                                         key=f"chat_hist_context_{timestamp_label}_{i}",
                                     )
         elif filter_applied:
-            st.info("選択された日付のチャット履歴はありません。")
+            st.info("選択された条件に一致するチャット履歴はありません。")
 
         if parsed_messages:
             st.divider()
@@ -395,6 +438,8 @@ def render_chatbot_tab(
                             "時刻": time_str,
                             "役割": role_label,
                             "内容": msg.get("content", ""),
+                            "モデル": msg.get("model") or "",
+                            "Request ID": msg.get("request_id") or "",
                         }
                     )
                 daily_df = (
@@ -409,7 +454,13 @@ def render_chatbot_tab(
                     st.dataframe(daily_df, use_container_width=True)
         
         # チャット入力
-        if prompt := st.chat_input("メッセージを入力..."):
+        can_send_message = not (scope == "single" and not selected_pdf_id)
+        if not can_send_message:
+            st.info(
+                "検索対象が『単一PDFのみ』の場合は、上の『対象PDF』からPDFを1つ選択してからメッセージを送信してください。"
+            )
+
+        if can_send_message and (prompt := st.chat_input("メッセージを入力...")):
             user_timestamp = datetime.now(tz_jst).isoformat()
             st.session_state.chat_messages.append(
                 {
@@ -431,13 +482,16 @@ def render_chatbot_tab(
             response_text = ""
             # llm_modelは常にst.session_state["chat_model"]を利用
             chat_model = st.session_state.get("chat_model")
+            request_id: Optional[str] = None
             if not chat_model:
                 response_text = (
                     "エラー: チャットボットモデルが未選択です。設定タブでモデルを選択してください。"
                 )
+                model_used: Optional[str] = None
+                contexts: list[str] | None = None
             else:
                 # --- RAGバックエンドAPIを呼び出して実際の応答を取得 ---
-                contexts: list[str] | None = None
+                contexts = None
                 try:
                     current_scope = st.session_state.get("rag_scope", "single")
                     current_pdf_id = (
@@ -460,7 +514,8 @@ def render_chatbot_tab(
                         response = http_post(
                             f"{BACKEND_URL}/query/", json=query_payload
                         )
-                    model_used: Optional[str] = None
+                    request_id = response.headers.get("X-Request-ID")
+                    model_used = None
                     if response.status_code == 200:
                         data = response.json()
                         response_text = data.get("answer", "（応答がありません）")
@@ -475,6 +530,7 @@ def render_chatbot_tab(
                     response_text = f"リクエストエラー: {str(e)}"
                     model_used = None
                     contexts = None
+
             # --- バックエンドAPIの応答のみを表示・履歴追加 ---
             with st.chat_message("assistant"):
                 response_timestamp = datetime.now(tz_jst).isoformat()
@@ -488,6 +544,12 @@ def render_chatbot_tab(
                     st.markdown(
                         f'<span style="font-size:0.75rem; color:#888;" '
                         f'title="回答生成に使用したモデル">🛈 {html.escape(model_used)}</span>',
+                        unsafe_allow_html=True,
+                    )
+                if request_id:
+                    st.markdown(
+                        f'<span style="font-size:0.7rem; color:#aaa;" '
+                        f'title="この応答に対応するバックエンドのリクエストID">Request ID: {html.escape(request_id)}</span>',
                         unsafe_allow_html=True,
                     )
                 if contexts:
@@ -509,6 +571,7 @@ def render_chatbot_tab(
                         "content": response_text,
                         "model": model_used,
                         "timestamp": response_timestamp,
+                        "request_id": request_id,
                     }
                 )
 

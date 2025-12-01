@@ -358,8 +358,13 @@ def init_db():
                         llm_model_used TEXT,
                         embedding_model TEXT,
                         scope TEXT,
+                        request_id TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
+                """))
+                conn.execute(text("""
+                    ALTER TABLE chat_logs
+                    ADD COLUMN IF NOT EXISTS request_id TEXT
                 """))
 
                 conn.execute(text("""
@@ -978,13 +983,11 @@ MODEL_NAME = "BAAI/bge-small-en-v1.5"
 LOCAL_MODEL_PATH = Path("/app/models/BAAI_bge-small-en-v1.5")
 
 # セキュリティ注意: 本番環境ではAPIキーの表示は避けてください
-logging.basicConfig(level=logging.INFO)
 _openai_key = os.getenv('OPENAI_API_KEY')
 logger.info("[起動時] OPENAI_API_KEY: 設定あり" if _openai_key else "[起動時] OPENAI_API_KEY: 未設定")
 
 
-# データベース接続設定
-DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/rag_db")
+# データベース接続設定（settings.DB_URL を既に利用しているため、PGVECTOR 用の環境変数設定のみ維持）
 os.environ["PGVECTOR_CONNECTION_STRING"] = DB_URL
 # --- コレクション名をモデルごとに動的生成する関数 ---
 def get_collection_name(model_name: str) -> str:

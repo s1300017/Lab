@@ -336,6 +336,7 @@ def history_chat_logs(pdf_file_id: str | None = None, limit: int = 200) -> JSONR
                             llm_model_used,
                             embedding_model,
                             scope,
+                            request_id,
                             created_at
                         FROM chat_logs
                         WHERE pdf_file_id = :fid
@@ -357,6 +358,7 @@ def history_chat_logs(pdf_file_id: str | None = None, limit: int = 200) -> JSONR
                             llm_model_used,
                             embedding_model,
                             scope,
+                            request_id,
                             created_at
                         FROM chat_logs
                         ORDER BY created_at DESC, id DESC

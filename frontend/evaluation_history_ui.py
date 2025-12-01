@@ -162,7 +162,11 @@ def _plot_overlap_comparison_for_history(results_df: pd.DataFrame, key_prefix: s
 
 
 def _render_bulk_style_charts(results_df: pd.DataFrame, key_prefix: str = "") -> None:
-    """一括評価タブと同じ構成のグラフ群を描画する."""
+    """一括評価タブと同じ構成のグラフ群を描画する.
+
+    ユーザーが「簡易ビュー」と「詳細ビュー」を切り替えられるようにし、
+    簡易ビューでは全体像を素早く把握するための最低限のグラフのみを表示する。
+    """
     if results_df.empty:
         st.info("評価結果が空のため、グラフは表示できません。")
         return
@@ -196,6 +200,36 @@ def _render_bulk_style_charts(results_df: pd.DataFrame, key_prefix: str = "") ->
 
     df["label"] = df.apply(_create_label, axis=1)
 
+    # ビューモードの選択（簡易 / 詳細）
+    view_mode = st.radio(
+        "グラフ表示モード",
+        ["簡易ビュー", "詳細ビュー"],
+        index=0,
+        key=f"{key_prefix}view_mode_radio",
+        horizontal=True,
+    )
+
+    # --- 簡易ビュー: overall_score のチャンク戦略別バーのみ ---
+    if view_mode == "簡易ビュー":
+        if "chunk_strategy" in df.columns and "overall_score" in df.columns:
+            st.write("### チャンク戦略別 平均総合スコア（簡易ビュー）")
+            bar_df = (
+                df.groupby("chunk_strategy")["overall_score"].mean().sort_values(ascending=False).reset_index()
+            )
+            fig = px.bar(
+                bar_df,
+                x="chunk_strategy",
+                y="overall_score",
+                title="チャンク戦略別 平均総合スコア",
+                labels={"chunk_strategy": "チャンク戦略", "overall_score": "平均総合スコア"},
+            )
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}chunk_strategy_bar_simple")
+        else:
+            st.info("簡易ビューを表示するための列（chunk_strategy / overall_score）が不足しています。")
+        return
+
+    # --- 詳細ビュー: 既存のすべてのグラフを表示 ---
     st.write("### オーバーラップ比較")
     _plot_overlap_comparison_for_history(df, key_prefix)
 
@@ -380,6 +414,48 @@ def show_evaluation_history(backend_url: str):
                 if selected_date is not None:
                     filtered_df = filtered_df[filtered_df['created_date'] == selected_date]
 
+                # PDF ID での絞り込み
+                if 'pdf_file_id' in filtered_df.columns:
+                    pdf_id_values = (
+                        filtered_df['pdf_file_id']
+                        .dropna()
+                        .astype(str)
+                        .unique()
+                        .tolist()
+                    )
+                    if pdf_id_values:
+                        selected_pdf_id = st.selectbox(
+                            "PDF ID で絞り込み",
+                            options=[None] + sorted(pdf_id_values),
+                            format_func=lambda v: "すべて" if v is None else str(v),
+                            key="history_pdf_id_filter_selectbox",
+                        )
+                        if selected_pdf_id is not None:
+                            filtered_df = filtered_df[
+                                filtered_df['pdf_file_id'].astype(str) == str(selected_pdf_id)
+                            ]
+
+                # ステータスでの絞り込み
+                if 'status' in filtered_df.columns:
+                    status_values = (
+                        filtered_df['status']
+                        .dropna()
+                        .astype(str)
+                        .unique()
+                        .tolist()
+                    )
+                    if status_values:
+                        selected_status = st.selectbox(
+                            "ステータスで絞り込み",
+                            options=[None] + sorted(status_values),
+                            format_func=lambda v: "すべて" if v is None else str(v),
+                            key="history_status_filter_selectbox",
+                        )
+                        if selected_status is not None:
+                            filtered_df = filtered_df[
+                                filtered_df['status'].astype(str) == str(selected_status)
+                            ]
+
                 if filtered_df.empty:
                     st.info("選択された条件に一致する実験履歴がありません。")
                     return
@@ -394,6 +470,7 @@ def show_evaluation_history(backend_url: str):
                     'id',
                     'experiment_name',
                     'file_name',
+                    'pdf_file_id',
                     'status',
                     'total_combinations',
                     'completed_combinations'
@@ -410,6 +487,7 @@ def show_evaluation_history(backend_url: str):
                         "id": "実験ID",
                         "experiment_name": "実験名",
                         "file_name": "ファイル名",
+                        "pdf_file_id": "PDFファイルID",
                         "status": "ステータス",
                         "total_combinations": "総組み合わせ数",
                         "completed_combinations": "完了数"
@@ -438,6 +516,34 @@ def show_evaluation_history(backend_url: str):
                     selected_exp_name_series = detail_df_source.loc[detail_df_source['id'] == selected_exp_id, 'experiment_name']
                     selected_exp_name = selected_exp_name_series.iloc[0] if not selected_exp_name_series.empty else "unknown"
                     key_safe_exp_name = str(selected_exp_name).replace(" ", "_") if selected_exp_name else "unknown"
+
+                    # この実験に紐づくPDF ID を取得し、他タブへのショートカットを提供
+                    pdf_id_series = detail_df_source.loc[detail_df_source['id'] == selected_exp_id, 'pdf_file_id']
+                    selected_pdf_id = pdf_id_series.iloc[0] if not pdf_id_series.empty else None
+                    if selected_pdf_id is not None:
+                        st.caption(f"この実験のPDF ID: {selected_pdf_id}")
+                        col_chat_shortcut, col_bulk_shortcut = st.columns(2)
+                        with col_chat_shortcut:
+                            if st.button(
+                                "このPDFでチャットボットを開く",
+                                key=f"history_open_chat_for_exp_{selected_exp_id}",
+                            ):
+                                # チャットボットタブの単一PDFスコープ用に選択
+                                st.session_state["rag_pdf_file_id"] = str(selected_pdf_id)
+                                st.session_state["rag_scope"] = "single"
+                                st.info(
+                                    "チャットボットタブでこのPDFが選択されるようになりました。上部の『チャットボット』タブを開いてください。"
+                                )
+                        with col_bulk_shortcut:
+                            if st.button(
+                                "このPDFを一括評価タブで選択",
+                                key=f"history_open_bulk_for_exp_{selected_exp_id}",
+                            ):
+                                # 一括評価タブの評価対象PDFとして選択
+                                st.session_state["file_id"] = str(selected_pdf_id)
+                                st.info(
+                                    "RAGAS一括評価タブでこのPDFがデフォルト選択されます。上部の『RAGAS一括評価』タブを開いてください。"
+                                )
 
                     # 実験結果を取得
                     try:
