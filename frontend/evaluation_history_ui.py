@@ -367,7 +367,7 @@ def show_evaluation_history(backend_url: str):
     st.header("📊 評価履歴・実験管理")
     
     # タブで機能を分割
-    tab1, tab2, tab3 = st.tabs(["実験一覧", "詳細分析", "統計情報"])
+    tab1, tab2, tab3 = st.tabs(["実験一覧", "評価ダッシュボード", "統計情報"])
     
     # 履歴APIから実験一覧を取得
     experiments = []
@@ -575,7 +575,13 @@ def show_evaluation_history(backend_url: str):
                             if results:
                                 result_df = pd.DataFrame(results)
 
+                                # experiment_results テーブル由来の ID 情報を明示的に表示する
+                                if 'experiment_id' not in result_df.columns:
+                                    result_df['experiment_id'] = selected_exp_id
+
                                 result_columns = [
+                                    'id',  # experiment_results.id
+                                    'experiment_id',
                                     'embedding_model',
                                     'chunk_strategy',
                                     'chunk_size',
@@ -593,6 +599,106 @@ def show_evaluation_history(backend_url: str):
                                 available_result_columns = [
                                     col for col in result_columns if col in result_df.columns
                                 ]
+
+                                # --- CSVエクスポート用のフィルタ＆ダウンロード ---
+                                with st.expander("この実験の結果をCSVダウンロード", expanded=False):
+                                    export_df = result_df.copy()
+                                    col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+
+                                    # Embeddingモデルでフィルタ
+                                    if 'embedding_model' in export_df.columns:
+                                        with col_f1:
+                                            emb_choices = (
+                                                export_df['embedding_model']
+                                                .dropna()
+                                                .astype(str)
+                                                .unique()
+                                                .tolist()
+                                            )
+                                            emb_choices = sorted(emb_choices)
+                                            selected_embs = st.multiselect(
+                                                "Embeddingモデル",
+                                                emb_choices,
+                                                default=emb_choices,
+                                                key=f"csv_emb_{selected_exp_id}",
+                                            )
+                                            if selected_embs:
+                                                export_df = export_df[export_df['embedding_model'].astype(str).isin(selected_embs)]
+
+                                    # チャンク戦略でフィルタ
+                                    if 'chunk_strategy' in export_df.columns:
+                                        with col_f2:
+                                            strat_choices = (
+                                                export_df['chunk_strategy']
+                                                .dropna()
+                                                .astype(str)
+                                                .unique()
+                                                .tolist()
+                                            )
+                                            strat_choices = sorted(strat_choices)
+                                            selected_strats = st.multiselect(
+                                                "チャンク戦略",
+                                                strat_choices,
+                                                default=strat_choices,
+                                                key=f"csv_chunk_strategy_{selected_exp_id}",
+                                            )
+                                            if selected_strats:
+                                                export_df = export_df[export_df['chunk_strategy'].astype(str).isin(selected_strats)]
+
+                                    # チャンクサイズでフィルタ
+                                    if 'chunk_size' in export_df.columns:
+                                        with col_f3:
+                                            size_choices = (
+                                                export_df['chunk_size']
+                                                .dropna()
+                                                .unique()
+                                                .tolist()
+                                            )
+                                            try:
+                                                size_choices = sorted({int(v) for v in size_choices})
+                                            except Exception:
+                                                size_choices = sorted(size_choices)
+                                            selected_sizes = st.multiselect(
+                                                "チャンクサイズ",
+                                                size_choices,
+                                                default=size_choices,
+                                                key=f"csv_chunk_size_{selected_exp_id}",
+                                            )
+                                            if selected_sizes:
+                                                export_df = export_df[export_df['chunk_size'].isin(selected_sizes)]
+
+                                    # オーバーラップでフィルタ
+                                    if 'chunk_overlap' in export_df.columns:
+                                        with col_f4:
+                                            ov_choices = (
+                                                export_df['chunk_overlap']
+                                                .dropna()
+                                                .unique()
+                                                .tolist()
+                                            )
+                                            try:
+                                                ov_choices = sorted({int(v) for v in ov_choices})
+                                            except Exception:
+                                                ov_choices = sorted(ov_choices)
+                                            selected_ovs = st.multiselect(
+                                                "オーバーラップ",
+                                                ov_choices,
+                                                default=ov_choices,
+                                                key=f"csv_chunk_overlap_{selected_exp_id}",
+                                            )
+                                            if selected_ovs:
+                                                export_df = export_df[export_df['chunk_overlap'].isin(selected_ovs)]
+
+                                    st.caption(f"CSV対象レコード数: {len(export_df)} 件")
+                                    if available_result_columns and not export_df.empty:
+                                        csv_bytes = export_df[available_result_columns].to_csv(index=False).encode("utf-8-sig")
+                                        st.download_button(
+                                            "この条件でCSVダウンロード",
+                                            data=csv_bytes,
+                                            file_name=f"experiment_{selected_exp_id}_results.csv",
+                                            mime="text/csv",
+                                            key=f"csv_download_{selected_exp_id}",
+                                        )
 
                                 if available_result_columns:
                                     st.write("**評価結果一覧**")
@@ -779,7 +885,7 @@ def show_evaluation_history(backend_url: str):
                 st.info("実験履歴がありません。")
     
     with tab2:
-        st.subheader("詳細分析")
+        st.subheader("評価ダッシュボード")
         
         # 全実験の結果を統合分析
         try:
@@ -789,9 +895,85 @@ def show_evaluation_history(backend_url: str):
                 experiments = data.get("items", data.get("experiments", []))
                 
                 if experiments:
-                    # 全実験の結果を取得
+                    # --- ダッシュボード用フィルタ（期間 / PDF ID / 実験名） ---
+                    exp_df = pd.DataFrame(experiments)
+
+                    # 作成日時から日付列を生成
+                    if "created_at" in exp_df.columns:
+                        try:
+                            exp_df["created_at"] = pd.to_datetime(exp_df["created_at"], errors="coerce")
+                            exp_df["created_date"] = exp_df["created_at"].dt.date
+                        except Exception:
+                            exp_df["created_date"] = pd.NaT
+                    else:
+                        exp_df["created_date"] = pd.NaT
+
+                    col_f1, col_f2, col_f3 = st.columns(3)
+
+                    # 期間フィルタ（From〜To）
+                    with col_f1:
+                        min_date = exp_df["created_date"].dropna().min()
+                        max_date = exp_df["created_date"].dropna().max()
+                        if pd.notna(min_date) and pd.notna(max_date):
+                            from_date = st.date_input(
+                                "作成日 From",
+                                value=min_date,
+                                key="dash_date_from",
+                            )
+                            to_date = st.date_input(
+                                "作成日 To",
+                                value=max_date,
+                                key="dash_date_to",
+                            )
+                            if from_date:
+                                exp_df = exp_df[exp_df["created_date"] >= from_date]
+                            if to_date:
+                                exp_df = exp_df[exp_df["created_date"] <= to_date]
+
+                    # PDF ID フィルタ
+                    with col_f2:
+                        if "pdf_file_id" in exp_df.columns:
+                            pdf_ids = (
+                                exp_df["pdf_file_id"]
+                                .dropna()
+                                .astype(str)
+                                .unique()
+                                .tolist()
+                            )
+                            pdf_ids = sorted(pdf_ids)
+                            selected_pdf = st.selectbox(
+                                "PDF ID",
+                                options=[None] + pdf_ids,
+                                format_func=lambda v: "すべて" if v is None else str(v),
+                                key="dash_pdf_id_filter",
+                            )
+                            if selected_pdf is not None:
+                                exp_df = exp_df[exp_df["pdf_file_id"].astype(str) == str(selected_pdf)]
+
+                    # 実験名フィルタ（部分一致）
+                    with col_f3:
+                        name_keyword = st.text_input(
+                            "実験名に含まれる文字列",
+                            value="",
+                            key="dash_exp_name_filter",
+                            help="部分一致でフィルタします（大文字小文字は区別しません）",
+                        ).strip()
+                        if name_keyword:
+                            exp_df = exp_df[
+                                exp_df.get("experiment_name", "")
+                                .astype(str)
+                                .str.contains(name_keyword, case=False, na=False)
+                            ]
+
+                    if exp_df.empty:
+                        st.info("選択された条件に一致する実験がありません。フィルタ条件を見直してください。")
+                        return
+
+                    filtered_experiments = exp_df.to_dict("records")
+
+                    # 全実験の結果を取得（フィルタ後の実験のみ）
                     all_results = []
-                    for exp in experiments:
+                    for exp in filtered_experiments:
                         try:
                             result_response = http_get(f"{backend_url}/history/experiments/{exp['id']}/results")
                             if result_response.status_code == 200:
@@ -811,6 +993,85 @@ def show_evaluation_history(backend_url: str):
                         else:
                             suffix_source = tuple(range(len(all_df)))
                         analysis_suffix = f"{len(all_df)}_{abs(hash(suffix_source))}"
+
+                        # --- ダッシュボード用のサマリー指標 ---
+                        total_experiments = len(filtered_experiments)
+                        total_results = len(all_df)
+
+                        col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
+                        with col_kpi1:
+                            st.metric("総実験数", total_experiments)
+                        with col_kpi2:
+                            st.metric("総評価結果数", total_results)
+
+                        best_model_label = "-"
+                        best_strategy_label = "-"
+                        if 'embedding_model' in all_df.columns and 'overall_score' in all_df.columns:
+                            try:
+                                model_avg = (
+                                    all_df.groupby('embedding_model')['overall_score']
+                                    .mean()
+                                    .sort_values(ascending=False)
+                                )
+                                if not model_avg.empty:
+                                    best_model_label = f"{model_avg.index[0]} ({model_avg.iloc[0]:.3f})"
+                            except Exception:
+                                best_model_label = "-"
+
+                        if 'chunk_strategy' in all_df.columns and 'overall_score' in all_df.columns:
+                            try:
+                                strategy_avg = (
+                                    all_df.groupby('chunk_strategy')['overall_score']
+                                    .mean()
+                                    .sort_values(ascending=False)
+                                )
+                                if not strategy_avg.empty:
+                                    best_strategy_label = f"{strategy_avg.index[0]} ({strategy_avg.iloc[0]:.3f})"
+                            except Exception:
+                                best_strategy_label = "-"
+
+                        with col_kpi3:
+                            st.metric("ベストEmbeddingモデル", best_model_label)
+                        with col_kpi4:
+                            st.metric("ベストチャンク戦略", best_strategy_label)
+                        
+                        # Embeddingモデル上位3件（平均総合スコア）
+                        if "embedding_model" in all_df.columns and "overall_score" in all_df.columns:
+                            try:
+                                top_model_df = (
+                                    all_df.groupby("embedding_model")["overall_score"]
+                                    .agg(["mean", "count"])
+                                    .reset_index()
+                                    .sort_values("mean", ascending=False)
+                                    .head(3)
+                                )
+                                top_model_df.rename(
+                                    columns={"embedding_model": "Embeddingモデル", "mean": "平均スコア", "count": "件数"},
+                                    inplace=True,
+                                )
+                                st.write("**Embeddingモデル 上位3件（平均総合スコア）**")
+                                st.dataframe(top_model_df, use_container_width=True)
+                            except Exception:
+                                pass
+
+                        # チャンク戦略上位3件（平均総合スコア）
+                        if "chunk_strategy" in all_df.columns and "overall_score" in all_df.columns:
+                            try:
+                                top_strategy_df = (
+                                    all_df.groupby("chunk_strategy")["overall_score"]
+                                    .agg(["mean", "count"])
+                                    .reset_index()
+                                    .sort_values("mean", ascending=False)
+                                    .head(3)
+                                )
+                                top_strategy_df.rename(
+                                    columns={"chunk_strategy": "チャンク戦略", "mean": "平均スコア", "count": "件数"},
+                                    inplace=True,
+                                )
+                                st.write("**チャンク戦略 上位3件（平均総合スコア）**")
+                                st.dataframe(top_strategy_df, use_container_width=True)
+                            except Exception:
+                                pass
                         
                         # モデル別性能比較
                         if 'embedding_model' in all_df.columns and 'overall_score' in all_df.columns:

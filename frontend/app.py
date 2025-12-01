@@ -285,6 +285,11 @@ if health is not None:
             msg += f" / error={error}"
         st.error(msg)
 
+# グローバルなモデル選択状態を簡易表示（全タブ共通で参照される設定）
+current_llm = st.session_state.get("llm_model", "gpt-oss")
+current_emb = st.session_state.get("embedding_model", "huggingface_bge_small")
+st.caption(f"現在の共通モデル設定: LLM = `{current_llm}`, Embedding = `{current_emb}`")
+
 
 def clear_database():
     try:
@@ -567,10 +572,17 @@ with tab_history:
 
     # ユーティリティ: GETリクエスト（簡易ラッパー）
     def history_api_get(url: str, timeout: float | None = None):
-        import requests
+        """履歴系API向けの簡易GETラッパー（http_client経由）。"""
         try:
-            resp = requests.get(url, timeout=timeout)
-            return resp.status_code, (resp.json() if resp.headers.get('content-type','').startswith('application/json') else resp.text)
+            kwargs = {}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            resp = http_get(url, **kwargs)
+            return resp.status_code, (
+                resp.json()
+                if resp.headers.get('content-type','').startswith('application/json')
+                else resp.text
+            )
         except Exception as e:
             return 599, {"error": str(e)}
 

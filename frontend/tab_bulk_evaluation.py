@@ -9,29 +9,16 @@ import streamlit as st
 from http_client import http_get, http_post, format_http_error
 from evaluation_history_ui import _render_bulk_style_charts, apply_bulk_chunk_settings_from_history
 from graph_utils import create_zip_with_graphs
+from model_utils import fetch_embedding_models as _fetch_embedding_models_common, fetch_llm_models as _fetch_llm_models_common
 
 
 def _fetch_embedding_models(BACKEND_URL: str) -> List[Dict[str, str]]:
     """バックエンドの /list_models からEmbeddingモデル一覧を取得するヘルパー。"""
-    try:
-        resp = http_get(f"{BACKEND_URL}/list_models")
-        resp.raise_for_status()
-        data = resp.json() if resp.headers.get("Content-Type", "").startswith("application/json") else {}
-        return data.get("Embedding", []) or []
-    except Exception as e:  # noqa: BLE001
-        st.warning(f"Embeddingモデル一覧の取得に失敗しました: {e}")
-        return []
+    return _fetch_embedding_models_common(BACKEND_URL.rstrip("/"))
 
 
 def _fetch_llm_models(BACKEND_URL: str) -> List[Dict[str, str]]:
-    try:
-        resp = http_get(f"{BACKEND_URL}/list_models")
-        resp.raise_for_status()
-        data = resp.json() if resp.headers.get("Content-Type", "").startswith("application/json") else {}
-        return data.get("LLM", []) or []
-    except Exception as e:  # noqa: BLE001
-        st.warning(f"LLMモデル一覧の取得に失敗しました: {e}")
-        return []
+    return _fetch_llm_models_common(BACKEND_URL.rstrip("/"))
 
 
 def _persist_model_selection(BACKEND_URL: str, llm_model: str, embedding_model: str) -> None:
@@ -309,6 +296,30 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
             " まずは少ない質問・少ない組み合わせで試すことをおすすめします。"
         )
 
+        # よく使う設定をワンクリックで適用できるプリセット
+        col_preset_light, col_preset_full = st.columns(2)
+        with col_preset_light:
+            if st.button("🔧 軽量プリセットを適用", key="bulk_preset_light"):
+                # 少数の質問・1つのEmbedding・1パターンのチャンク設定で素早く傾向を確認したい場合の推奨設定
+                st.session_state["bulk_chunk_methods"] = ["recursive"]
+                st.session_state["bulk_chunk_sizes_select"] = [1000]
+                st.session_state["bulk_chunk_overlaps_select"] = [0]
+                st.session_state["bulk_eval_question_mode"] = "head_n"
+                # 質問数が取得できていれば5件、なければデフォルト10件
+                questions_available = max_pairs if max_pairs > 0 else 10
+                st.session_state["bulk_eval_question_count"] = min(5, questions_available)
+                st.session_state["bulk_include_answer_similarity"] = False
+                st.success("軽量プリセットを適用しました。下の設定内容を確認してください。")
+        with col_preset_full:
+            if st.button("📊 本番向けプリセットを適用", key="bulk_preset_full"):
+                # 本番比較向け: 複数チャンク戦略・サイズ／オーバーラップ＋全件評価
+                st.session_state["bulk_chunk_methods"] = ["recursive", "sentence"]
+                st.session_state["bulk_chunk_sizes_select"] = [512, 1000]
+                st.session_state["bulk_chunk_overlaps_select"] = [0, 200]
+                st.session_state["bulk_eval_question_mode"] = "all"
+                st.session_state["bulk_include_answer_similarity"] = True
+                st.success("本番向けプリセットを適用しました。下の設定内容を確認してください。")
+
         total_q = len(eval_questions)
         total_a = len(eval_answers)
         max_pairs = min(total_q, total_a) if total_q and total_a else 0
@@ -518,6 +529,20 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
 
         if estimated_jobs > 0:
             st.caption(f"現在の設定での評価ジョブ数（概算）: {estimated_jobs} 件")
+
+            # ごく大まかな処理時間の目安を表示（1ジョブあたり 10〜30 秒程度と仮定）
+            approx_min_sec = estimated_jobs * 10
+            approx_max_sec = estimated_jobs * 30
+            if approx_max_sec < 60:
+                time_hint = f"約 {approx_min_sec}〜{approx_max_sec} 秒程度"
+            else:
+                min_min = approx_min_sec // 60
+                min_max = max(approx_max_sec // 60, min_min + 1)
+                time_hint = f"約 {min_min}〜{min_max} 分程度"
+            st.caption(
+                f"処理時間の目安: {time_hint}（モデルや環境により前後します。まずは軽量プリセットでお試しください。）"
+            )
+
             if estimated_jobs > 20:
                 st.warning(
                     "ジョブ数が多めです。必要に応じてEmbeddingモデルやチャンク候補の数を減らすと、"
@@ -643,60 +668,101 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 else:
                     payload = jobs
 
-                with st.spinner("一括評価を実行中です…（数分かかる場合があります）"):
+                # 一括評価はバックエンドのジョブAPI経由で非同期実行する
+                with st.spinner("一括評価ジョブを起動中です…"):
                     try:
-                        resp = http_post(f"{BACKEND_URL}/bulk_evaluate/", json=payload)
+                        resp = http_post(f"{BACKEND_URL}/bulk_job/start", json=payload)
                     except Exception as e:  # noqa: BLE001
-                        st.error(f"一括評価API呼び出し時にエラーが発生しました: {e}")
+                        st.error(f"一括評価ジョブ起動時にエラーが発生しました: {e}")
                     else:
                         if resp.status_code != 200:
                             st.error(
-                                f"一括評価APIエラー: {format_http_error(resp)}"
+                                f"一括評価ジョブ起動エラー: {format_http_error(resp)}"
                             )
                         else:
-                            data = resp.json()
-                            flat_results: List[Dict[str, Any]] = []
-                            if isinstance(data, list):
-                                for item in data:
-                                    if isinstance(item, list):
-                                        flat_results.extend(
-                                            x for x in item if isinstance(x, dict)
-                                        )
-                                    elif isinstance(item, dict):
-                                        flat_results.append(item)
-                            elif isinstance(data, dict):
-                                flat_results.append(data)
-
-                            # エントリを分類: error を含むものはエラー結果として扱い、それ以外を有効結果とする
-                            valid_results: List[Dict[str, Any]] = [
-                                r
-                                for r in flat_results
-                                if isinstance(r, dict) and not r.get("error")
-                            ]
-                            error_results: List[Dict[str, Any]] = [
-                                r
-                                for r in flat_results
-                                if isinstance(r, dict) and r.get("error")
-                            ]
-
-                            if not valid_results:
-                                # すべてエラーだった場合は成功扱いにせず、代表的なエラーを表示して終了
-                                st.error(
-                                    "一括評価がすべてエラーで終了しました。設定とバックエンドログを確認してください。"
-                                )
-                                if error_results:
-                                    with st.expander("エラー詳細", expanded=False):
-                                        st.json(error_results[:3])
+                            data = resp.json() if resp.headers.get("Content-Type", "").startswith("application/json") else {}
+                            job_id = data.get("job_id")
+                            if not job_id:
+                                st.error("一括評価ジョブIDの取得に失敗しました。")
                             else:
-                                st.session_state.bulk_evaluation_results = valid_results
-                                msg = (
-                                    f"一括評価が完了しました。有効な設定: {len(valid_results)} 件"
-                                )
-                                if error_results:
-                                    msg += f"（エラー: {len(error_results)} 件は除外）"
-                                st.success(msg)
-                                # 一括評価完了後に画面を即時更新して結果セクションを表示
-                                st.rerun()
+                                st.session_state["bulk_eval_job_id"] = job_id
+                                st.session_state["bulk_eval_job_status"] = "pending"
+                                st.session_state["bulk_eval_job_progress"] = "ジョブを受け付けました。"
+                                st.session_state["bulk_eval_job_error"] = None
+                                st.info(f"一括評価ジョブを起動しました。ジョブID: {job_id}")
+
+        # --- ジョブステータスの確認 ---
+        bulk_job_id = st.session_state.get("bulk_eval_job_id")
+        if bulk_job_id:
+            try:
+                resp_status = http_get(f"{BACKEND_URL}/bulk_job/status/{bulk_job_id}")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"一括評価ジョブ状態取得中にエラーが発生しました: {e}")
+            else:
+                if resp_status.status_code != 200:
+                    st.error(
+                        f"一括評価ジョブ状態取得エラー: {format_http_error(resp_status)}"
+                    )
+                else:
+                    data_status = resp_status.json() if resp_status.headers.get("Content-Type", "").startswith("application/json") else {}
+                    status = str(data_status.get("status", "unknown"))
+                    progress_msg = data_status.get("progress") or ""
+                    err_msg = data_status.get("error") or ""
+                    st.session_state["bulk_eval_job_status"] = status
+                    st.session_state["bulk_eval_job_progress"] = progress_msg
+                    st.session_state["bulk_eval_job_error"] = err_msg or None
+
+                    st.info(f"一括評価ジョブ状態: {status}（ID: {bulk_job_id}）")
+                    if progress_msg:
+                        st.caption(f"進捗: {progress_msg}")
+
+                    result_obj = data_status.get("result")
+                    if status in {"completed", "COMPLETED"} and result_obj is not None:
+                        # 既存ロジックと同様に結果をフラット化
+                        flat_results: List[Dict[str, Any]] = []
+                        data = result_obj
+                        if isinstance(data, list):
+                            for item in data:
+                                if isinstance(item, list):
+                                    flat_results.extend(
+                                        x for x in item if isinstance(x, dict)
+                                    )
+                                elif isinstance(item, dict):
+                                    flat_results.append(item)
+                        elif isinstance(data, dict):
+                            flat_results.append(data)
+
+                        valid_results: List[Dict[str, Any]] = [
+                            r
+                            for r in flat_results
+                            if isinstance(r, dict) and not r.get("error")
+                        ]
+                        error_results: List[Dict[str, Any]] = [
+                            r
+                            for r in flat_results
+                            if isinstance(r, dict) and r.get("error")
+                        ]
+
+                        if not valid_results:
+                            st.error(
+                                "一括評価がすべてエラーで終了しました。設定とバックエンドログを確認してください。"
+                            )
+                            if error_results:
+                                with st.expander("エラー詳細", expanded=False):
+                                    st.json(error_results[:3])
+                        else:
+                            st.session_state.bulk_evaluation_results = valid_results
+                            msg = (
+                                f"一括評価が完了しました。有効な設定: {len(valid_results)} 件"
+                            )
+                            if error_results:
+                                msg += f"（エラー: {len(error_results)} 件は除外）"
+                            st.success(msg)
+                            # ジョブIDをクリアして再実行できるようにする
+                            st.session_state.pop("bulk_eval_job_id", None)
+
+                    elif status in {"error", "ERROR"} and err_msg:
+                        st.error(f"一括評価ジョブがエラーで終了しました: {err_msg}")
 
         # --- 結果の表示（セッションに保存されたものを使用） ---
         results: List[Dict[str, Any]] = (

@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, List, Optional
 import streamlit as st
 
 from http_client import http_get, http_post, format_http_error
+from model_utils import fetch_embedding_models as _fetch_embedding_models_common
 
 
 def _fetch_history_pdfs(BACKEND_URL: str) -> List[Dict[str, Any]]:
@@ -46,14 +47,7 @@ def _load_sample_text(BACKEND_URL: str, pdf_id: str, max_chars: int = 5000) -> s
 
 def _fetch_embedding_models(BACKEND_URL: str) -> List[Dict[str, str]]:
     """バックエンドの /list_models からEmbeddingモデル一覧を取得するヘルパー。"""
-    try:
-        resp = http_get(f"{BACKEND_URL}/list_models")
-        resp.raise_for_status()
-        data = resp.json() if resp.headers.get("Content-Type", "").startswith("application/json") else {}
-        return data.get("Embedding", []) or []
-    except Exception as e:  # noqa: BLE001
-        st.warning(f"Embeddingモデル一覧の取得に失敗しました: {e}")
-        return []
+    return _fetch_embedding_models_common(BACKEND_URL.rstrip("/"))
 
 
 def _persist_model_selection(BACKEND_URL: str, llm_model: str, embedding_model: str) -> None:

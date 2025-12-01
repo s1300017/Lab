@@ -190,12 +190,14 @@ try:
     from .config_api import router as config_router
     from .chat_api import router as chat_router
     from .upload_api import router as upload_router
+    from .evaluation_job_api import router as evaluation_job_router
 
     app.include_router(admin_router)
     app.include_router(history_router)
     app.include_router(config_router)
     app.include_router(chat_router)
     app.include_router(upload_router)
+    app.include_router(evaluation_job_router)
 except Exception as e:  # noqa: BLE001
     logger.warning("[%s] [WARN] ルーター読み込みに失敗しました: %s", jst_now_str(), e)
 
@@ -299,6 +301,20 @@ def init_db():
                         error TEXT,
                         result_json TEXT,
                         file_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """))
+
+                # RAGAS一括評価ジョブ状態管理テーブル（evaluation_jobs）を作成
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS evaluation_jobs (
+                        job_id TEXT PRIMARY KEY,
+                        status TEXT NOT NULL,
+                        progress TEXT,
+                        cancel_requested BOOLEAN DEFAULT FALSE,
+                        error TEXT,
+                        result_json TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );

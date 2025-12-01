@@ -9,22 +9,17 @@ from pytz import timezone
 import streamlit as st
 
 from http_client import http_get, http_post, format_http_error
+from model_utils import fetch_model_lists
 
 
 def _fetch_models(BACKEND_URL: str) -> tuple[list[dict], list[dict]]:
-    """バックエンドの /list_models からLLM/Embeddingモデル一覧を取得する。"""
-    try:
-        resp = http_get(f"{BACKEND_URL}/list_models")
-        resp.raise_for_status()
-        data = (
-            resp.json()
-            if resp.headers.get("Content-Type", "").startswith("application/json")
-            else {}
-        )
-        return data.get("LLM", []) or [], data.get("Embedding", []) or []
-    except Exception as e:  # noqa: BLE001
-        st.warning(f"モデル一覧の取得に失敗しました: {e}")
-        return [], []
+    """バックエンドの /list_models からLLM/Embeddingモデル一覧を取得する。
+
+    共通ヘルパー fetch_model_lists を経由して取得し、結果をタブ内で利用しやすい
+    (LLM, Embedding) タプルとして返す。
+    """
+    llm_models, embedding_models = fetch_model_lists(BACKEND_URL.rstrip("/"))
+    return llm_models, embedding_models
 
 
 def _persist_model_selection(BACKEND_URL: str, llm_model: str, embedding_model: str) -> None:
@@ -131,6 +126,12 @@ def render_chatbot_tab(
         scope = "single" if scope_label == "単一PDFのみ" else "all"
         st.session_state["rag_scope"] = scope
 
+        # 現在のRAG対象スコープを簡易表示
+        if scope == "all":
+            st.caption("現在のRAG対象: すべてのPDF")
+        else:
+            st.caption("現在のRAG対象: 単一PDF（下の『対象PDF』から選択）")
+
         selected_pdf_id = st.session_state.get("rag_pdf_file_id") or st.session_state.get(
             "file_id"
         )
@@ -171,6 +172,8 @@ def render_chatbot_tab(
                 selected_item = history_pdf_mapping.get(sel_label)
                 selected_pdf_id = selected_item.get("id") if selected_item else None
                 st.session_state["rag_pdf_file_id"] = selected_pdf_id
+                if selected_pdf_id is not None:
+                    st.caption(f"現在のRAG対象PDF ID: {selected_pdf_id}")
 
                 # 履歴から抽出テキスト・QAを復元（他タブも有効化）
                 if st.button(

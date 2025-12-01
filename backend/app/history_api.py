@@ -60,6 +60,56 @@ def history_pdf_files() -> JSONResponse:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@router.get("/history/jobs/errors")
+def history_failed_jobs(limit: int = 50) -> JSONResponse:
+    """最近の失敗ジョブ（upload_jobs / evaluation_jobs）を返す。
+
+    - 各テーブルから status = 'error' の行を updated_at 降順で最大 limit 件取得
+    - それぞれ upload_jobs / evaluation_jobs 配列として返却
+    """
+
+    try:
+        with engine.begin() as conn:
+            upload_rows = conn.execute(
+                text(
+                    """
+                    SELECT job_id, status, progress, error, file_id, created_at, updated_at
+                    FROM upload_jobs
+                    WHERE status = 'error'
+                    ORDER BY updated_at DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": limit},
+            ).fetchall()
+            eval_rows = conn.execute(
+                text(
+                    """
+                    SELECT job_id, status, progress, error, created_at, updated_at
+                    FROM evaluation_jobs
+                    WHERE status = 'error'
+                    ORDER BY updated_at DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": limit},
+            ).fetchall()
+
+            upload_items = [dict(r._mapping) for r in upload_rows]
+            eval_items = [dict(r._mapping) for r in eval_rows]
+
+            return JSONResponse(
+                content=jsonable_encoder(
+                    {
+                        "upload_jobs": upload_items,
+                        "evaluation_jobs": eval_items,
+                    }
+                )
+            )
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @router.post("/history/import-experiment")
 def import_experiment(payload: dict) -> JSONResponse:
     """既存の一括評価結果を履歴DB（experiments / experiment_results）に保存するAPI。"""

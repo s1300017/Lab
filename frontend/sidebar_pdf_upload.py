@@ -11,6 +11,7 @@ import streamlit.components.v1 as components
 from streamlit_js_eval import streamlit_js_eval
 
 from http_client import http_get, http_post, format_http_error
+from model_utils import fetch_model_lists
 
 
 def render_pdf_upload_sidebar(
@@ -42,20 +43,11 @@ def render_pdf_upload_sidebar(
 
         # モデル・エンベディングモデルリストをAPI経由で取得
         def fetch_models():
-            try:
-                resp = http_get(f"{BACKEND_URL}/list_models")
-                resp.raise_for_status()
-                data = resp.json()
-                # カテゴライズされたモデルを別々のリストで返す
-                llm_models = data.get("LLM", [])
-                embedding_models = data.get("Embedding", [])
-                return {
-                    "llm": llm_models,
-                    "embedding": embedding_models,
-                }
-            except Exception as e:
-                st.error(f"モデルリスト取得エラー: {e}")
-                return {"llm": [], "embedding": []}
+            llm_models, embedding_models = fetch_model_lists(BACKEND_URL.rstrip("/"))
+            return {
+                "llm": llm_models,
+                "embedding": embedding_models,
+            }
 
         # グローバルにモデルリストを保存
         if "models" not in st.session_state:

@@ -5,8 +5,9 @@ from typing import Any, Callable
 
 import pandas as pd
 import streamlit as st
+import plotly.express as px
 
-from http_client import http_post, http_delete
+from http_client import http_get, http_post, http_delete
 from evaluation_history_ui import show_evaluation_history, _render_bulk_style_charts
 
 
@@ -150,10 +151,16 @@ def render_history_tab(
 
         # ユーティリティ: GETリクエスト（簡易ラッパー）
         def history_api_get(url: str, timeout: float | None = None):
-            import requests
+            """履歴系API向けの簡易GETラッパー。
 
+            フロントエンド共通の http_client.http_get を利用し、JSONレスポンスを優先的に返す。
+            エラー時は 599 とエラーメッセージを含む辞書を返す。
+            """
             try:
-                resp = requests.get(url, timeout=timeout)
+                kwargs = {}
+                if timeout is not None:
+                    kwargs["timeout"] = timeout
+                resp = http_get(url, **kwargs)
                 return resp.status_code, (
                     resp.json()
                     if resp.headers.get("content-type", "").startswith(
@@ -750,6 +757,238 @@ def render_history_tab(
                                 f"チャット履歴取得エラー: {code_all} {data_all}"
                             )
 
+        # --- チャットログダッシュボード ---
+        st.markdown("---")
+        st.subheader("チャットログダッシュボード")
+        st.caption("チャットログを集計し、期間やPDF IDでフィルタして傾向を可視化します。")
+
+        try:
+            with st.spinner("チャットログを集計中..."):
+                code_dash, data_dash = history_api_get(
+                    f"{BACKEND_URL}/history/chat-logs?limit=1000"
+                )
+            if code_dash == 200 and isinstance(data_dash, dict):
+                log_items_all = data_dash.get("items", []) or []
+                if not log_items_all:
+                    st.info("チャットログがまだありません。")
+                else:
+                    df = pd.DataFrame(log_items_all)
+
+                    # 日付列を生成
+                    if "created_at" in df.columns:
+                        try:
+                            created_ts = pd.to_datetime(
+                                df["created_at"], errors="coerce"
+                            )
+                            df["date"] = created_ts.dt.date
+                        except Exception:
+                            df["date"] = pd.NaT
+                    else:
+                        df["date"] = pd.NaT
+
+                    col_f1, col_f2 = st.columns(2)
+
+                    # 日付範囲フィルタ
+                    with col_f1:
+                        if df["date"].notna().any():
+                            min_date = df["date"].dropna().min()
+                            max_date = df["date"].dropna().max()
+                            from_date = st.date_input(
+                                "日付 From",
+                                value=min_date,
+                                key="chat_dash_date_from",
+                            )
+                            to_date = st.date_input(
+                                "日付 To",
+                                value=max_date,
+                                key="chat_dash_date_to",
+                            )
+                            if from_date:
+                                df = df[df["date"] >= from_date]
+                            if to_date:
+                                df = df[df["date"] <= to_date]
+
+                    # PDF ID フィルタ
+                    with col_f2:
+                        if "pdf_file_id" in df.columns:
+                            pdf_ids = (
+                                df["pdf_file_id"]
+                                .dropna()
+                                .astype(str)
+                                .unique()
+                                .tolist()
+                            )
+                            pdf_ids = sorted(pdf_ids)
+                            if pdf_ids:
+                                selected_pdf = st.selectbox(
+                                    "PDF IDで絞り込み",
+                                    options=[None] + pdf_ids,
+                                    format_func=lambda v: "すべて" if v is None else str(v),
+                                    key="chat_dash_pdf_filter",
+                                )
+                                if selected_pdf is not None:
+                                    df = df[
+                                        df["pdf_file_id"].astype(str)
+                                        == str(selected_pdf)
+                                    ]
+
+                    if df.empty:
+                        st.info(
+                            "選択された条件に一致するチャットログがありません。フィルタ条件を見直してください。"
+                        )
+                    else:
+                        total_msgs = len(df)
+                        unique_pdfs = (
+                            df["pdf_file_id"].dropna().nunique()
+                            if "pdf_file_id" in df.columns
+                            else 0
+                        )
+                        unique_days = df["date"].dropna().nunique()
+
+                        col_k1, col_k2, col_k3 = st.columns(3)
+                        with col_k1:
+                            st.metric("メッセージ数", total_msgs)
+                        with col_k2:
+                            st.metric("PDF数", unique_pdfs)
+                        with col_k3:
+                            st.metric("日数", unique_days)
+
+                        # 日別メッセージ数
+                        if df["date"].notna().any():
+                            st.write("**日別メッセージ数**")
+                            daily = (
+                                df.groupby("date").size().reset_index(name="count")
+                            )
+                            daily = daily.sort_values("date")
+                            daily = daily.set_index("date")
+                            st.bar_chart(daily["count"])
+
+                        # PDF別メッセージ数 上位5件
+                        if "pdf_file_id" in df.columns:
+                            st.write("**PDF別メッセージ数 上位5件**")
+                            pdf_counts = (
+                                df["pdf_file_id"]
+                                .astype(str)
+                                .value_counts()
+                                .head(5)
+                                .reset_index()
+                            )
+                            pdf_counts.columns = ["pdf_file_id", "count"]
+                            st.dataframe(pdf_counts, use_container_width=True)
+
+                        # LLMモデル別メッセージ数
+                        if "llm_model_used" in df.columns:
+                            st.write("**LLMモデル別メッセージ数**")
+                            model_counts = (
+                                df["llm_model_used"]
+                                .fillna("(不明)")
+                                .astype(str)
+                                .value_counts()
+                                .reset_index()
+                            )
+                            model_counts.columns = ["llm_model_used", "count"]
+                            st.dataframe(model_counts, use_container_width=True)
+
+                        # scope 別メッセージ数
+                        if "scope" in df.columns:
+                            st.write("**scope 別メッセージ数**")
+                            scope_counts = (
+                                df["scope"]
+                                .fillna("(不明)")
+                                .astype(str)
+                                .value_counts()
+                                .reset_index()
+                            )
+                            scope_counts.columns = ["scope", "count"]
+                            col_sc1, col_sc2 = st.columns([1, 1])
+                            with col_sc1:
+                                st.dataframe(scope_counts, use_container_width=True)
+                            with col_sc2:
+                                try:
+                                    fig_scope = px.bar(
+                                        scope_counts,
+                                        x="scope",
+                                        y="count",
+                                        title="scope 別メッセージ数",
+                                    )
+                                    st.plotly_chart(fig_scope, use_container_width=True)
+                                except Exception:
+                                    pass
+
+                        # モデル×PDF のヒートマップ（メッセージ数）
+                        if "pdf_file_id" in df.columns and "llm_model_used" in df.columns:
+                            st.write("**モデル×PDF のメッセージ数ヒートマップ**")
+                            cross_df = (
+                                df.assign(
+                                    pdf_file_id_str=df["pdf_file_id"].astype(str),
+                                    llm_model_str=df["llm_model_used"].fillna("(不明)").astype(str),
+                                )
+                                .groupby(["pdf_file_id_str", "llm_model_str"])
+                                .size()
+                                .reset_index(name="count")
+                            )
+                            if not cross_df.empty:
+                                try:
+                                    fig_heat = px.density_heatmap(
+                                        cross_df,
+                                        x="llm_model_str",
+                                        y="pdf_file_id_str",
+                                        z="count",
+                                        color_continuous_scale="Blues",
+                                        labels={
+                                            "llm_model_str": "LLMモデル",
+                                            "pdf_file_id_str": "PDF ID",
+                                            "count": "メッセージ数",
+                                        },
+                                        title="LLMモデル×PDF のメッセージ数ヒートマップ",
+                                    )
+                                    fig_heat.update_layout(height=400)
+                                    st.plotly_chart(fig_heat, use_container_width=True)
+                                except Exception:
+                                    st.dataframe(cross_df, use_container_width=True)
+
+                        # プロンプト・応答長の統計
+                        st.write("**プロンプト・応答長の統計**")
+                        df_lengths = df.copy()
+                        df_lengths["prompt_len"] = df_lengths.get("user_message", "").astype(str).str.len()
+                        df_lengths["answer_len"] = df_lengths.get("assistant_message", "").astype(str).str.len()
+
+                        len_stats = df_lengths[["prompt_len", "answer_len"]].agg(
+                            ["mean", "median", "max"]
+                        )
+                        len_stats = len_stats.round(1)
+                        st.dataframe(len_stats, use_container_width=True)
+
+                        col_len1, col_len2 = st.columns(2)
+                        with col_len1:
+                            try:
+                                fig_prompt = px.histogram(
+                                    df_lengths,
+                                    x="prompt_len",
+                                    nbins=30,
+                                    title="プロンプト長の分布",
+                                    labels={"prompt_len": "文字数"},
+                                )
+                                st.plotly_chart(fig_prompt, use_container_width=True)
+                            except Exception:
+                                pass
+                        with col_len2:
+                            try:
+                                fig_answer = px.histogram(
+                                    df_lengths,
+                                    x="answer_len",
+                                    nbins=30,
+                                    title="応答長の分布",
+                                    labels={"answer_len": "文字数"},
+                                )
+                                st.plotly_chart(fig_answer, use_container_width=True)
+                            except Exception:
+                                pass
+            else:
+                st.error(f"チャットログ取得エラー: {code_dash} {data_dash}")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"チャットログダッシュボードの集計中にエラーが発生しました: {e}")
+
         st.markdown("---")
         st.subheader("一括評価結果一覧")
         st.caption("実行済みの実測ごとの評価メトリクスと詳細を参照できます。")
@@ -758,3 +997,64 @@ def render_history_tab(
                 show_evaluation_history(BACKEND_URL.rstrip("/"))
         except Exception as e:  # noqa: BLE001
             st.error(f"評価履歴の表示に失敗しました: {e}")
+
+        st.markdown("---")
+        st.subheader("最近の失敗ジョブ")
+        st.caption("upload_jobs / evaluation_jobs のうち、直近でエラーになったジョブを一覧表示します。")
+
+        try:
+            with st.spinner("失敗ジョブ一覧を取得中..."):
+                code_jobs, data_jobs = history_api_get(f"{BACKEND_URL}/history/jobs/errors?limit=50")
+            if code_jobs == 200 and isinstance(data_jobs, dict):
+                upload_jobs = data_jobs.get("upload_jobs", []) or []
+                eval_jobs = data_jobs.get("evaluation_jobs", []) or []
+
+                if not upload_jobs and not eval_jobs:
+                    st.info("現在、失敗状態のジョブは記録されていません。")
+                else:
+                    col_u, col_e = st.columns(2)
+
+                    with col_u:
+                        st.markdown("#### PDFアップロードジョブの失敗履歴")
+                        if upload_jobs:
+                            u_rows = []
+                            for it in upload_jobs:
+                                u_rows.append(
+                                    {
+                                        "job_id": it.get("job_id"),
+                                        "file_id": it.get("file_id"),
+                                        "status": it.get("status"),
+                                        "updated_at": it.get("updated_at"),
+                                        "error": it.get("error"),
+                                        "progress": it.get("progress"),
+                                    }
+                                )
+                            u_df = pd.DataFrame(u_rows)
+                            if not u_df.empty:
+                                st.dataframe(u_df, use_container_width=True)
+                        else:
+                            st.caption("失敗したアップロードジョブはありません。")
+
+                    with col_e:
+                        st.markdown("#### 一括評価ジョブの失敗履歴")
+                        if eval_jobs:
+                            e_rows = []
+                            for it in eval_jobs:
+                                e_rows.append(
+                                    {
+                                        "job_id": it.get("job_id"),
+                                        "status": it.get("status"),
+                                        "updated_at": it.get("updated_at"),
+                                        "error": it.get("error"),
+                                        "progress": it.get("progress"),
+                                    }
+                                )
+                            e_df = pd.DataFrame(e_rows)
+                            if not e_df.empty:
+                                st.dataframe(e_df, use_container_width=True)
+                        else:
+                            st.caption("失敗した一括評価ジョブはありません。")
+            else:
+                st.error(f"失敗ジョブ取得エラー: {code_jobs} {data_jobs}")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"失敗ジョブ一覧取得中にエラーが発生しました: {e}")

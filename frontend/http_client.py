@@ -55,6 +55,7 @@ def format_http_error(resp: requests.Response) -> str:
 
     - Content-Type が JSON の場合は detail / error フィールドを優先して利用
     - それ以外の場合は resp.text をそのまま利用
+    - 代表的なステータスに対して簡易的な対処ヒントを付与
     """
     status = getattr(resp, "status_code", None)
     text = ""
@@ -66,6 +67,23 @@ def format_http_error(resp: requests.Response) -> str:
             text = resp.text
     except Exception:
         text = getattr(resp, "text", "")
+
     if status is None:
         return text or "不明なエラーが発生しました。"
-    return f"{status} {text}" if text else str(status)
+
+    base = f"{status} {text}" if text else str(status)
+
+    # 代表的なHTTPステータスやエラーメッセージに応じて、ユーザー向けの対処ヒントを付与
+    hints: list[str] = []
+    if status in {502, 503, 504}:
+        hints.append("バックエンドサーバーやモデルプロセスが起動中か、ネットワーク状態を確認してください。")
+    if status == 404:
+        hints.append("エンドポイントURLまたは対象リソース（PDF ID / 実験ID など）が正しいか確認してください。")
+    lowered = (text or "").lower()
+    if "connection refused" in lowered or "connectionerror" in lowered:
+        hints.append("BACKEND_URL の設定とバックエンドの起動状態（ポート番号含む）を確認してください。")
+    if not hints:
+        hints.append("詳細な原因はバックエンド側のログを確認してください。")
+
+    hint_str = " / ".join(hints)
+    return f"{base}（対処の目安: {hint_str}）"
