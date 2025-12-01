@@ -114,11 +114,24 @@ def render_pdf_upload_sidebar(
 
         default_pdf_llm_idx = find_gpt_oss_index(llm_models)
 
+        # 前回選択されたPDF用LLMモデルがあれば、それを優先して初期インデックスに用いる
+        prev_question_model = st.session_state.get("question_llm_model")
+        if prev_question_model in llm_models:
+            question_default_idx = llm_models.index(prev_question_model)
+        else:
+            question_default_idx = default_pdf_llm_idx
+
+        prev_answer_model = st.session_state.get("answer_llm_model")
+        if prev_answer_model in llm_models:
+            answer_default_idx = llm_models.index(prev_answer_model)
+        else:
+            answer_default_idx = default_pdf_llm_idx
+
         with col1:
             question_llm_model = st.selectbox(
                 "質問生成用LLMモデル（PDF用）",
                 llm_models,
-                index=default_pdf_llm_idx,
+                index=question_default_idx,
                 help="PDFから質問を自動生成するためのLLMモデルを選択。",
                 disabled=upload_processing_flag,
             )
@@ -127,10 +140,14 @@ def render_pdf_upload_sidebar(
             answer_llm_model = st.selectbox(
                 "回答生成用LLMモデル（PDF用）",
                 llm_models,
-                index=default_pdf_llm_idx,
+                index=answer_default_idx,
                 help="質問に対する回答を自動で生成するためのLLMモデルを選択。",
                 disabled=upload_processing_flag,
             )
+
+        # 選択されたモデルをセッションに保存して、次回以降の初期値として利用する
+        st.session_state["question_llm_model"] = question_llm_model
+        st.session_state["answer_llm_model"] = answer_llm_model
 
         # --- クレンジング設定とアップローダー（常時表示） ---
         st.subheader("1. PDFアップロードとOCR設定")
