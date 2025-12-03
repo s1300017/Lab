@@ -109,6 +109,18 @@ async def lifespan(app: FastAPI):
             )
             init_db()
             logger.debug("[%s] [DEBUG] データベース初期化に成功しました", jst_now_str())
+
+            # 一括評価ジョブの中途半端な状態を起動時にクリーンアップ
+            try:
+                from . import evaluation_job_service
+
+                evaluation_job_service.cleanup_stale_bulk_jobs_on_startup()
+            except Exception as ce:  # noqa: BLE001
+                logger.error(
+                    "[%s][ERROR] 起動時クリーンアップ処理中にエラーが発生しました: %s",
+                    jst_now_str(),
+                    ce,
+                )
             break
         except Exception as e:
             logger.error(

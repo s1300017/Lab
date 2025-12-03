@@ -464,6 +464,50 @@ def show_evaluation_history(backend_url: str):
                 if 'created_at' in display_df.columns:
                     display_df['created_at'] = display_df['created_at'].dt.strftime('%Y-%m-%d %H:%M')
 
+                # parameters から LLM モデル名を抽出し、実験ごとの使用LLMを表示できるようにする
+                if 'parameters' in display_df.columns:
+                    def _parse_params(val: Any) -> dict:
+                        if isinstance(val, dict):
+                            return val
+                        if isinstance(val, str):
+                            try:
+                                return json.loads(val)
+                            except Exception:  # noqa: BLE001
+                                return {}
+                        return {}
+
+                    params_series = display_df['parameters'].apply(_parse_params)
+                    display_df['llm_model'] = params_series.apply(lambda d: d.get('llm_model'))
+
+                # チャンクサイズ / オーバーラップは experiment_results 側の集約値から範囲表現を生成
+                def _format_range(min_val: Any, max_val: Any) -> str | None:
+                    try:
+                        import pandas as pd  # ローカル import で循環参照を避ける
+                    except Exception:  # noqa: BLE001
+                        pd = None  # type: ignore
+
+                    if min_val is None and max_val is None:
+                        return None
+                    if pd is not None:
+                        if (min_val is not None and pd.isna(min_val)) and (max_val is not None and pd.isna(max_val)):
+                            return None
+                    if min_val == max_val or max_val is None:
+                        return str(min_val)
+                    if min_val is None:
+                        return str(max_val)
+                    return f"{min_val}〜{max_val}"
+
+                if 'min_chunk_size' in display_df.columns and 'max_chunk_size' in display_df.columns:
+                    display_df['chunk_size_range'] = display_df.apply(
+                        lambda r: _format_range(r.get('min_chunk_size'), r.get('max_chunk_size')),
+                        axis=1,
+                    )
+                if 'min_chunk_overlap' in display_df.columns and 'max_chunk_overlap' in display_df.columns:
+                    display_df['chunk_overlap_range'] = display_df.apply(
+                        lambda r: _format_range(r.get('min_chunk_overlap'), r.get('max_chunk_overlap')),
+                        axis=1,
+                    )
+
                 display_columns = [
                     'created_date',
                     'created_at',
@@ -473,7 +517,12 @@ def show_evaluation_history(backend_url: str):
                     'pdf_file_id',
                     'status',
                     'total_combinations',
-                    'completed_combinations'
+                    'completed_combinations',
+                    'llm_model',
+                    'embedding_models',
+                    'chunk_methods',
+                    'chunk_size_range',
+                    'chunk_overlap_range',
                 ]
                 available_columns = [col for col in display_columns if col in display_df.columns]
 
@@ -490,7 +539,12 @@ def show_evaluation_history(backend_url: str):
                         "pdf_file_id": "PDFファイルID",
                         "status": "ステータス",
                         "total_combinations": "総組み合わせ数",
-                        "completed_combinations": "完了数"
+                        "completed_combinations": "完了数",
+                        "llm_model": "LLMモデル",
+                        "embedding_models": "Embeddingモデル",
+                        "chunk_methods": "チャンク方式",
+                        "chunk_size_range": "チャンクサイズ",
+                        "chunk_overlap_range": "オーバーラップサイズ",
                     }
                 )
 
@@ -575,6 +629,20 @@ def show_evaluation_history(backend_url: str):
                             if results:
                                 result_df = pd.DataFrame(results)
 
+                                if 'details_dict' in result_df.columns:
+                                    def _extract_status(d: dict | None) -> str | None:
+                                        if isinstance(d, dict):
+                                            return d.get('status')
+                                        return None
+
+                                    def _extract_error(d: dict | None) -> str | None:
+                                        if isinstance(d, dict):
+                                            return d.get('error')
+                                        return None
+
+                                    result_df['status'] = result_df['details_dict'].apply(_extract_status)
+                                    result_df['error_message'] = result_df['details_dict'].apply(_extract_error)
+
                                 # experiment_results テーブル由来の ID 情報を明示的に表示する
                                 if 'experiment_id' not in result_df.columns:
                                     result_df['experiment_id'] = selected_exp_id
@@ -595,6 +663,8 @@ def show_evaluation_history(backend_url: str):
                                     'context_precision',
                                     'answer_correctness',
                                     'answer_similarity',
+                                    'status',
+                                    'error_message',
                                 ]
                                 available_result_columns = [
                                     col for col in result_columns if col in result_df.columns
@@ -716,17 +786,21 @@ def show_evaluation_history(backend_url: str):
                                     'answer_correctness',
                                     'answer_similarity',
                                 ]
-                                available_metrics = [col for col in metrics_cols if col in result_df.columns]
+                                metrics_source_df = result_df
+                                if 'status' in metrics_source_df.columns:
+                                    metrics_source_df = metrics_source_df[metrics_source_df['status'] != 'error']
+
+                                available_metrics = [col for col in metrics_cols if col in metrics_source_df.columns]
 
                                 if available_metrics:
                                     st.write("**評価指標**")
                                     st.dataframe(
-                                        result_df[['embedding_model', 'chunk_strategy'] + available_metrics],
+                                        metrics_source_df[['embedding_model', 'chunk_strategy'] + available_metrics],
                                         use_container_width=True
                                     )
 
                                     # グラフ用にメトリクスを整形（組み合わせごとに棒グラフ表示）
-                                    chart_df = result_df[['embedding_model', 'chunk_strategy'] + available_metrics].copy()
+                                    chart_df = metrics_source_df[['embedding_model', 'chunk_strategy'] + available_metrics].copy()
                                     chart_df['combination'] = chart_df.apply(
                                         lambda row: f"{row.get('embedding_model', 'unknown')} / {row.get('chunk_strategy', 'unknown')}",
                                         axis=1
@@ -755,15 +829,15 @@ def show_evaluation_history(backend_url: str):
 
                                     st.write("**一括評価スタイルのグラフ**")
                                     _render_bulk_style_charts(
-                                        result_df,
+                                        metrics_source_df,
                                         key_prefix=f"history_exp_{selected_exp_id}_{key_safe_exp_name}_"
                                     )
 
-                                    row_options = list(range(len(result_df)))
+                                    row_options = list(range(len(metrics_source_df)))
                                     if row_options:
                                         labels_for_rows = []
                                         for idx_row in row_options:
-                                            r = result_df.iloc[idx_row]
+                                            r = metrics_source_df.iloc[idx_row]
                                             label = (
                                                 f"{r.get('embedding_model', 'unknown')} / "
                                                 f"{r.get('chunk_strategy', r.get('chunk_method', 'unknown'))} / "
@@ -781,8 +855,31 @@ def show_evaluation_history(backend_url: str):
                                             "この設定を一括評価タブに反映",
                                             key=f"history_apply_to_bulk_tab_{selected_exp_id}",
                                         ):
-                                            apply_bulk_chunk_settings_from_history(result_df.iloc[selected_result_idx_for_apply])
+                                            apply_bulk_chunk_settings_from_history(metrics_source_df.iloc[selected_result_idx_for_apply])
                                             st.success("一括評価タブのEmbedding/チャンク設定に反映しました。『RAGAS一括評価』タブを開いて確認してください。")
+
+                                error_df = None
+                                if 'status' in result_df.columns:
+                                    error_df = result_df[result_df['status'] == 'error']
+
+                                if error_df is not None and not error_df.empty:
+                                    st.write("**エラーになった評価設定**")
+                                    error_columns = [
+                                        'id',
+                                        'embedding_model',
+                                        'chunk_strategy',
+                                        'chunk_size',
+                                        'chunk_overlap',
+                                        'error_message',
+                                    ]
+                                    available_error_columns = [
+                                        col for col in error_columns if col in error_df.columns
+                                    ]
+                                    if available_error_columns:
+                                        st.dataframe(
+                                            error_df[available_error_columns],
+                                            use_container_width=True,
+                                        )
 
                                 st.write("**質問別メトリクス**")
                                 results_with_metrics = [

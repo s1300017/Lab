@@ -80,6 +80,7 @@ services:
       # 必要に応じて評価時のLLM呼び出しタイムアウトも無制限化
       - EVAL_LLM_TIMEOUT_SECONDS=none
       - EVAL_MAX_PARALLEL_TASKS=8
+      - EVAL_MAX_QUESTIONS=${EVAL_MAX_QUESTIONS}
       - EVAL_TIMING_LOG=1
     depends_on:
       db:

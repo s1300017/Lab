@@ -11,7 +11,7 @@ import streamlit.components.v1 as components
 from streamlit_js_eval import streamlit_js_eval
 
 from http_client import http_get, http_post, format_http_error
-from model_utils import fetch_model_lists
+from model_utils import fetch_model_lists, fetch_history_pdfs
 
 
 def render_pdf_upload_sidebar(
@@ -300,58 +300,53 @@ def render_pdf_upload_sidebar(
                 and not st.session_state.get("upload_error_message")
             ):
                 try:
-                    resp_hist = http_get(f"{BACKEND_URL}/history/pdf-files")
-                    if resp_hist.status_code == 200 and resp_hist.headers.get(
-                        "Content-Type", ""
-                    ).startswith("application/json"):
-                        data_hist = resp_hist.json() or {}
-                        items = data_hist.get("items", []) or []
-                        current_name = st.session_state.get("uploaded_file_name")
-                        candidates = [
-                            it
-                            for it in items
-                            if (it.get("original_name") or it.get("file_name"))
-                            == current_name
-                        ]
-                        if candidates:
-                            def _uploaded_at_key(it: dict) -> str:
-                                val = it.get("uploaded_at")
-                                return str(val) if val is not None else ""
+                    items = fetch_history_pdfs(BACKEND_URL.rstrip("/")) or []
+                    current_name = st.session_state.get("uploaded_file_name")
+                    candidates = [
+                        it
+                        for it in items
+                        if (it.get("original_name") or it.get("file_name"))
+                        == current_name
+                    ]
+                    if candidates:
+                        def _uploaded_at_key(it: dict) -> str:
+                            val = it.get("uploaded_at")
+                            return str(val) if val is not None else ""
 
-                            candidates_sorted = sorted(
-                                candidates,
-                                key=_uploaded_at_key,
-                                reverse=True,
-                            )
-                            target = candidates_sorted[0]
-                            fid = target.get("id")
-                            if fid is not None:
-                                try:
-                                    resp_ext = http_get(
-                                        f"{BACKEND_URL}/get_extracted/{fid}"
+                        candidates_sorted = sorted(
+                            candidates,
+                            key=_uploaded_at_key,
+                            reverse=True,
+                        )
+                        target = candidates_sorted[0]
+                        fid = target.get("id")
+                        if fid is not None:
+                            try:
+                                resp_ext = http_get(
+                                    f"{BACKEND_URL}/get_extracted/{fid}"
+                                )
+                                if resp_ext.status_code == 200 and resp_ext.headers.get(
+                                    "Content-Type", ""
+                                ).startswith("application/json"):
+                                    data_x = resp_ext.json() or {}
+                                    st.session_state["file_id"] = fid
+                                    st.session_state.text = data_x.get("text", "")
+                                    st.session_state.qa_questions = data_x.get(
+                                        "questions", []
                                     )
-                                    if resp_ext.status_code == 200 and resp_ext.headers.get(
-                                        "Content-Type", ""
-                                    ).startswith("application/json"):
-                                        data_x = resp_ext.json() or {}
-                                        st.session_state["file_id"] = fid
-                                        st.session_state.text = data_x.get("text", "")
-                                        st.session_state.qa_questions = data_x.get(
-                                            "questions", []
-                                        )
-                                        st.session_state.qa_answers = data_x.get(
-                                            "answers", []
-                                        )
-                                        st.session_state.qa_meta = data_x.get(
-                                            "qa_meta", []
-                                        )
-                                        st.session_state.image_captions = data_x.get(
-                                            "image_captions", []
-                                        )
-                                        st.session_state["upload_processed_once"] = True
-                                        save_state_to_localstorage()
-                                except Exception:
-                                    pass
+                                    st.session_state.qa_answers = data_x.get(
+                                        "answers", []
+                                    )
+                                    st.session_state.qa_meta = data_x.get(
+                                        "qa_meta", []
+                                    )
+                                    st.session_state.image_captions = data_x.get(
+                                        "image_captions", []
+                                    )
+                                    st.session_state["upload_processed_once"] = True
+                                    save_state_to_localstorage()
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 

@@ -3,13 +3,19 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 import base64
+import time
+import re
 import pandas as pd
 import streamlit as st
 
 from http_client import http_get, http_post, format_http_error
 from evaluation_history_ui import _render_bulk_style_charts, apply_bulk_chunk_settings_from_history
 from graph_utils import create_zip_with_graphs
-from model_utils import fetch_embedding_models as _fetch_embedding_models_common, fetch_llm_models as _fetch_llm_models_common
+from model_utils import (
+    fetch_embedding_models as _fetch_embedding_models_common,
+    fetch_llm_models as _fetch_llm_models_common,
+    fetch_history_pdfs as _fetch_history_pdfs_common,
+)
 
 
 def _fetch_embedding_models(BACKEND_URL: str) -> List[Dict[str, str]]:
@@ -27,30 +33,33 @@ def _persist_model_selection(BACKEND_URL: str, llm_model: str, embedding_model: 
         "llm_model": llm_model,
         "embedding_model": embedding_model,
     }
+    key_llm = "_last_persisted_llm_model"
+    key_emb = "_last_persisted_embedding_model"
+
+    if (
+        st.session_state.get(key_llm) == llm_model
+        and st.session_state.get(key_emb) == embedding_model
+    ):
+        return
+
+    bulk_job_id = st.session_state.get("bulk_eval_job_id")
+    bulk_job_status = (st.session_state.get("bulk_eval_job_status") or "").lower()
+    bulk_job_active = bool(bulk_job_id) and bulk_job_status in ("pending", "running")
+    if bulk_job_active:
+        return
+
     try:
         http_post(f"{BACKEND_URL}/config/model_selection", json=payload)
     except Exception as e:  # noqa: BLE001
         st.warning(f"モデル選択の保存に失敗しました: {e}")
+    else:
+        st.session_state[key_llm] = llm_model
+        st.session_state[key_emb] = embedding_model
 
 
 def _fetch_history_pdfs(BACKEND_URL: str) -> List[Dict[str, Any]]:
-    """/history/pdf-files からPDF一覧を取得するヘルパー。"""
-    try:
-        resp = http_get(f"{BACKEND_URL}/history/pdf-files")
-        if resp.status_code != 200:
-            st.warning(
-                f"PDF履歴の取得に失敗しました: {resp.status_code} {resp.text}"
-            )
-            return []
-        data = (
-            resp.json()
-            if resp.headers.get("Content-Type", "").startswith("application/json")
-            else {}
-        )
-        return data.get("items", []) or []
-    except Exception as e:  # noqa: BLE001
-        st.warning(f"PDF履歴の取得中にエラーが発生しました: {e}")
-        return []
+    """/history/pdf-files からPDF一覧を取得するヘルパー（共通キャッシュ利用）。"""
+    return _fetch_history_pdfs_common(BACKEND_URL.rstrip("/"))
 
 
 def _load_qa_from_history(
@@ -134,6 +143,156 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
             "評価用LLMはバックエンド側で GPT-OSS 固定です。"
         )
 
+        # すでに一括評価ジョブが動いている場合は、まずステータスのみを確認して表示する
+        bulk_job_id = st.session_state.get("bulk_eval_job_id")
+        if bulk_job_id:
+            try:
+                resp_status = http_get(f"{BACKEND_URL}/bulk_job/status/{bulk_job_id}")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"一括評価ジョブ状態取得中にエラーが発生しました: {e}")
+                return
+            else:
+                if resp_status.status_code != 200:
+                    st.error(
+                        f"一括評価ジョブ状態取得エラー: {format_http_error(resp_status)}"
+                    )
+                    return
+
+                data_status = (
+                    resp_status.json()
+                    if resp_status.headers.get("Content-Type", "").startswith(
+                        "application/json"
+                    )
+                    else {}
+                )
+                status = str(data_status.get("status", "unknown"))
+                progress_msg = data_status.get("progress") or ""
+                err_msg = data_status.get("error") or ""
+                st.session_state["bulk_eval_job_status"] = status
+                st.session_state["bulk_eval_job_progress"] = progress_msg
+                st.session_state["bulk_eval_job_error"] = err_msg or None
+
+                # 進捗バーと簡易アニメーション付きステータス表示
+                status_lower = status.lower()
+
+                done_count: int | None = None
+                total_count: int | None = None
+                if progress_msg:
+                    try:
+                        m = re.search(r"(\d+)\s*/\s*(\d+)", progress_msg)
+                        if m:
+                            done_val = int(m.group(1))
+                            total_val = int(m.group(2))
+                            if total_val > 0 and 0 <= done_val <= total_val:
+                                done_count = done_val
+                                total_count = total_val
+                    except Exception:  # noqa: BLE001
+                        done_count = None
+                        total_count = None
+
+                if total_count is not None and total_count > 0 and done_count is not None:
+                    progress_ratio = max(0.0, min(1.0, done_count / total_count))
+                else:
+                    if status_lower in {"pending"}:
+                        progress_ratio = 0.1
+                    elif status_lower in {"running"}:
+                        progress_ratio = 0.6
+                    elif status_lower in {"completed"}:
+                        progress_ratio = 1.0
+                    elif status_lower in {"error"}:
+                        progress_ratio = 0.0
+                    else:
+                        progress_ratio = 0.0
+
+                tick_key = "bulk_eval_progress_tick"
+                tick = int(st.session_state.get(tick_key, 0) or 0)
+                st.session_state[tick_key] = tick + 1
+                spinner_frames = ["-", "\\", "|", "/"]
+                spinner = spinner_frames[tick % len(spinner_frames)]
+
+                st.progress(progress_ratio)
+                if total_count is not None and done_count is not None and total_count > 0:
+                    st.caption(f"進捗: {done_count} / {total_count} 件完了")
+                st.info(
+                    f"[{spinner}] 一括評価ジョブ状態: {status}（ID: {bulk_job_id}）"
+                )
+                if progress_msg:
+                    st.caption(f"進捗メッセージ: {progress_msg}")
+                else:
+                    if status_lower in {"pending"}:
+                        st.caption(
+                            "ジョブはキューに登録されています。しばらくお待ちください。"
+                        )
+                    elif status_lower in {"running"}:
+                        st.caption("一括評価を実行中です。しばらくお待ちください。")
+
+                if "bulk_eval_auto_refresh" not in st.session_state:
+                    st.session_state["bulk_eval_auto_refresh"] = True
+                auto_refresh = st.checkbox(
+                    "2秒ごとに自動で進捗を更新する",
+                    key="bulk_eval_auto_refresh",
+                )
+
+                # pending / running 中は他の重いHTTP呼び出しを避け、状態だけをポーリングする
+                if status_lower in {"pending", "running"}:
+                    if auto_refresh:
+                        time.sleep(2.0)
+                        st.rerun()
+                    else:
+                        if st.button("進捗を手動更新", key="bulk_eval_manual_refresh"):
+                            st.rerun()
+                    return
+
+                # completed / error の場合はこのまま下の通常UIに進み、結果表示などを行う
+                result_obj = data_status.get("result")
+                if status in {"completed", "COMPLETED"} and result_obj is not None:
+                    # 結果をフラット化してセッションに保存（既存ロジックと同様）
+                    flat_results: List[Dict[str, Any]] = []
+                    data = result_obj
+                    if isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, list):
+                                flat_results.extend(
+                                    x for x in item if isinstance(x, dict)
+                                )
+                            elif isinstance(item, dict):
+                                flat_results.append(item)
+                    elif isinstance(data, dict):
+                        flat_results.append(data)
+
+                    valid_results: List[Dict[str, Any]] = [
+                        r
+                        for r in flat_results
+                        if isinstance(r, dict) and not r.get("error")
+                    ]
+                    error_results: List[Dict[str, Any]] = [
+                        r
+                        for r in flat_results
+                        if isinstance(r, dict) and r.get("error")
+                    ]
+
+                    if not valid_results:
+                        st.error(
+                            "一括評価がすべてエラーで終了しました。設定とバックエンドログを確認してください。"
+                        )
+                        if error_results:
+                            with st.expander("エラー詳細", expanded=False):
+                                st.json(error_results[:3])
+                    else:
+                        st.session_state.bulk_evaluation_results = valid_results
+                        msg = (
+                            f"一括評価が完了しました。有効な設定: {len(valid_results)} 件"
+                        )
+                        if error_results:
+                            msg += f"（エラー: {len(error_results)} 件は除外）"
+                        st.success(msg)
+                    # ジョブIDをクリアして再実行できるようにする
+                    st.session_state.pop("bulk_eval_job_id", None)
+                elif status_lower in {"error"} and err_msg:
+                    st.error(f"一括評価ジョブがエラーで終了しました: {err_msg}")
+                    # エラー時もここで一旦ジョブIDをクリアしておく
+                    st.session_state.pop("bulk_eval_job_id", None)
+
         # --- 評価対象PDFの選択（履歴から） ---
         st.markdown("### 評価対象PDFの選択")
         history_pdfs = _fetch_history_pdfs(BACKEND_URL.rstrip("/"))
@@ -203,6 +362,12 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 eval_questions = eval_questions or questions_fallback
                 eval_answers = eval_answers or answers_fallback
 
+        # 質問・回答ペア数（max_pairs）はこの時点で一度計算しておき、
+        # 後続のプリセットボタンやスライダー設定で利用する。
+        total_q = len(eval_questions)
+        total_a = len(eval_answers)
+        max_pairs = min(total_q, total_a) if total_q and total_a else 0
+
         if not eval_text or not eval_questions or not eval_answers:
             st.info(
                 "評価に使用するテキストまたはQAセットが見つかりません。\n"
@@ -269,9 +434,12 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                     result_labels: List[str] = []
                     for idx_r in result_indices:
                         r = history_results_for_pdf[idx_r]
+                        res_id = r.get("id")
+                        emb_name = r.get("embedding_model", "unknown")
+                        chunk_name = r.get("chunk_strategy", r.get("chunk_method", "unknown"))
                         label = (
-                            f"{r.get('embedding_model', 'unknown')} / "
-                            f"{r.get('chunk_strategy', r.get('chunk_method', 'unknown'))} / "
+                            f"ID:{res_id} {emb_name} / "
+                            f"{chunk_name} / "
                             f"size={r.get('chunk_size', '-')}, overlap={r.get('chunk_overlap', '-')}"
                         )
                         result_labels.append(label)
@@ -294,6 +462,10 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
         st.caption(
             "※ 質問数や組み合わせ（Embedding×チャンク設定）が多いほど処理時間が長くなります。"
             " まずは少ない質問・少ない組み合わせで試すことをおすすめします。"
+        )
+        st.caption(
+            "※ RAGAS は1つの質問に対して複数の評価指標を同時に計算するため、バックエンドの進捗表示では"
+            "『質問数×指標数』件分の処理としてカウントされます（例: 質問5件・指標5種類 → 25件）。"
         )
 
         # よく使う設定をワンクリックで適用できるプリセット
@@ -469,6 +641,13 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                     "recursive: 再帰的文字分割 / sentence: 文単位 / paragraph: 段落単位 / fixed: 固定長"
                 ),
             )
+
+        methods_require_size = {"recursive", "fixed"}
+        uses_size_overlap = any(m in methods_require_size for m in selected_chunk_methods)
+        only_non_size_methods = bool(selected_chunk_methods) and all(
+            m not in methods_require_size for m in selected_chunk_methods
+        )
+
         # よく使うチャンクサイズ候補
         default_size_candidates = [256, 512, 768, 1000, 1500, 2000]
         with col_size:
@@ -477,7 +656,8 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 options=default_size_candidates,
                 default=[1000],
                 key="bulk_chunk_sizes_select",
-                help="評価したいチャンクサイズを複数選択できます。",
+                help="recursive / fixed にのみ適用されます。",
+                disabled=not uses_size_overlap,
             )
         # よく使うオーバーラップ候補
         default_overlap_candidates = [0, 100, 200, 300, 400]
@@ -487,14 +667,24 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 options=default_overlap_candidates,
                 default=[0, 200],
                 key="bulk_chunk_overlaps_select",
-                help="評価したいオーバーラップサイズを複数選択できます。",
+                help="recursive / fixed にのみ適用されます。",
+                disabled=not uses_size_overlap,
             )
 
-        # どちらかが空の場合はデフォルト値を補完
-        if not chunk_sizes:
-            chunk_sizes = [1000]
-        if not chunk_overlaps:
-            chunk_overlaps = [200]
+        if uses_size_overlap:
+            if not chunk_sizes:
+                chunk_sizes = [1000]
+            if not chunk_overlaps:
+                chunk_overlaps = [200]
+
+        if only_non_size_methods:
+            st.info(
+                "選択されているチャンク方式（semantic / sentence / paragraph）では、チャンクサイズとオーバーラップは使用されません。"
+            )
+        elif "semantic" in selected_chunk_methods and uses_size_overlap:
+            st.caption(
+                "semantic にはチャンクサイズ・オーバーラップは適用されません（recursive / fixed のみに適用）。"
+            )
 
         similarity_threshold = 0.7
         if "semantic" in selected_chunk_methods:
@@ -510,9 +700,24 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
 
         include_answer_similarity = st.checkbox(
             "answer_similarity 指標も計算する (重め)",
-            value=True,
+            value=False,
             key="bulk_include_answer_similarity",
             help="オンにすると質問ごとの生成回答と正解の類似度を追加で計算します。精度向上に役立ちますが計算コストが高くなります。",
+        )
+
+        job_limit = int(
+            st.number_input(
+                "一括評価で許可する最大ジョブ数の上限",
+                min_value=1,
+                max_value=100,
+                value=int(st.session_state.get("bulk_eval_job_limit", 10) or 10),
+                step=1,
+                key="bulk_eval_job_limit",
+                help=(
+                    "一度に実行する評価ジョブ数の上限です。ジョブ数が多いほど処理時間が長くなり固まりやすくなります。"
+                    "例: 10 件程度までに抑えることを推奨します。"
+                ),
+            )
         )
 
         # 現在の設定から、おおよそのジョブ数を算出してユーザーに提示
@@ -522,13 +727,19 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 if method == "semantic":
                     # semantic はサイズ・オーバーラップを持たない1組み合わせ扱い
                     estimated_jobs += len(selected_embeddings)
-                else:
+                elif method in ("sentence", "paragraph"):
+                    estimated_jobs += len(selected_embeddings)
+                elif method in ("recursive", "fixed"):
                     estimated_jobs += len(selected_embeddings) * max(len(chunk_sizes), 1) * max(
                         len(chunk_overlaps), 1
                     )
+                else:
+                    estimated_jobs += len(selected_embeddings)
 
         if estimated_jobs > 0:
-            st.caption(f"現在の設定での評価ジョブ数（概算）: {estimated_jobs} 件")
+            st.caption(
+                f"現在の設定での評価ジョブ数（概算）: {estimated_jobs} 件（上限: {job_limit} 件）"
+            )
 
             # ごく大まかな処理時間の目安を表示（1ジョブあたり 10〜30 秒程度と仮定）
             approx_min_sec = estimated_jobs * 10
@@ -543,16 +754,22 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 f"処理時間の目安: {time_hint}（モデルや環境により前後します。まずは軽量プリセットでお試しください。）"
             )
 
-            if estimated_jobs > 20:
+            if estimated_jobs > job_limit:
                 st.warning(
-                    "ジョブ数が多めです。必要に応じてEmbeddingモデルやチャンク候補の数を減らすと、"
-                    "評価時間を短縮できます。"
+                    "現在の設定では評価ジョブ数が上限を超えています。このままでは実行できません。"
+                    "Embeddingモデルやチャンク設定を減らすか、上記の『一括評価で許可する最大ジョブ数の上限』を引き上げてください。"
                 )
 
         st.markdown("---")
         st.subheader("一括評価の実行")
 
+        # 既存ジョブがある場合は古い確認状態をクリア
+        if st.session_state.get("bulk_eval_job_id"):
+            st.session_state.pop("bulk_eval_confirm_payload", None)
+            st.session_state.pop("bulk_eval_confirm_summary", None)
+
         if st.button("この設定で一括評価を実行", key="run_bulk_evaluate"):
+            # まずは現在の設定からジョブとサマリー情報だけを生成し、実際の実行は確認後に行う
             if not eval_text or not eval_questions or not eval_answers:
                 st.error(
                     "評価対象のテキストまたはQ&Aが見つかりません。PDFアップロードとQA自動生成、"
@@ -616,6 +833,20 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                             if selected_llm_model:
                                 job["llm_model"] = selected_llm_model
                             jobs.append(job)
+                        elif method in ("sentence", "paragraph"):
+                            job = {
+                                "embedding_model": emb,
+                                "chunk_methods": [method],
+                                "text": eval_text,
+                                "questions": questions_eval,
+                                "answers": answers_eval,
+                                "include_answer_similarity": include_answer_similarity,
+                            }
+                            if file_id:
+                                job["file_id"] = file_id
+                            if selected_llm_model:
+                                job["llm_model"] = selected_llm_model
+                            jobs.append(job)
                         else:
                             for size in chunk_sizes:
                                 for ov in chunk_overlaps:
@@ -638,29 +869,15 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 if not jobs:
                     st.error("有効な評価ジョブが生成できませんでした。設定を見直してください。")
                     return
-                # ジョブ数が多すぎる場合は、実行前に明示的な確認を求める
+                # ジョブ数が多すぎる場合は、設定された上限に基づいて実行をブロック
                 job_count = len(jobs)
-                large_threshold = 20
-                pending_key = "bulk_eval_large_jobs_pending"
-
-                # 閾値以下に減った場合は保留フラグをクリア
-                if job_count <= large_threshold:
-                    st.session_state.pop(pending_key, None)
-                else:
-                    prev_pending = st.session_state.get(pending_key)
-                    if prev_pending != job_count:
-                        st.session_state[pending_key] = job_count
-                        st.warning(
-                            f"評価ジョブが {job_count} 件あります。処理に時間がかかる可能性があります。\n"
-                            "設定内容を確認し、問題なければもう一度『この設定で一括評価を実行』ボタンを押してください。"
-                        )
-                        st.info(
-                            "※ 同じ設定でボタンを2回押した場合のみ、大量ジョブの一括評価を実行します。"
-                        )
-                        return
-                    else:
-                        # 同じ件数で2回目のクリックが行われた場合は確認済みとしてフラグをクリア
-                        st.session_state.pop(pending_key, None)
+                job_limit = int(st.session_state.get("bulk_eval_job_limit", 10) or 10)
+                if job_count > job_limit:
+                    st.error(
+                        f"評価ジョブが {job_count} 件あります。現在の上限 {job_limit} 件を超えているため実行できません。"
+                        "チャンク設定やEmbeddingモデルの数を減らすか、『一括評価で許可する最大ジョブ数の上限』を引き上げてください。"
+                    )
+                    return
 
                 payload: Any
                 if job_count == 1:
@@ -668,101 +885,103 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 else:
                     payload = jobs
 
-                # 一括評価はバックエンドのジョブAPI経由で非同期実行する
-                with st.spinner("一括評価ジョブを起動中です…"):
-                    try:
-                        resp = http_post(f"{BACKEND_URL}/bulk_job/start", json=payload)
-                    except Exception as e:  # noqa: BLE001
-                        st.error(f"一括評価ジョブ起動時にエラーが発生しました: {e}")
-                    else:
-                        if resp.status_code != 200:
-                            st.error(
-                                f"一括評価ジョブ起動エラー: {format_http_error(resp)}"
-                            )
+                # 実行前確認用にサマリー情報をセッションに保存しておき、別ボタンで実際のジョブ起動を行う
+                llm_for_summary = selected_llm_model or st.session_state.get("llm_model", "gpt-oss")
+                summary = {
+                    "pdf_file_id": selected_pdf_id or file_id,
+                    "question_mode": question_mode,
+                    "use_n": use_n,
+                    "total_pairs": max_pairs,
+                    "llm_model": llm_for_summary,
+                    "embedding_models": list(selected_embeddings),
+                    "chunk_methods": list(selected_chunk_methods),
+                    "chunk_sizes": list(chunk_sizes),
+                    "chunk_overlaps": list(chunk_overlaps),
+                    "include_answer_similarity": bool(include_answer_similarity),
+                    "similarity_threshold": float(similarity_threshold) if "semantic" in selected_chunk_methods else None,
+                    "estimated_jobs": job_count,
+                }
+                st.session_state["bulk_eval_confirm_payload"] = payload
+                st.session_state["bulk_eval_confirm_summary"] = summary
+
+        # 実行前の確認セクション（簡易モーダル的なUI）
+        confirm_payload: Any = st.session_state.get("bulk_eval_confirm_payload")
+        confirm_summary: Dict[str, Any] | None = st.session_state.get("bulk_eval_confirm_summary")
+        if confirm_payload is not None and isinstance(confirm_summary, dict):
+            st.markdown("#### 実行前の設定確認")
+            st.info("以下の設定で一括評価を実行します。内容を確認し、問題なければ『はい、この設定で実行』を押してください。")
+
+            # 設定内容の一覧表示
+            lines: List[str] = []
+            pdf_label = confirm_summary.get("pdf_file_id") or "-"
+            lines.append(f"- 対象PDF ID: **{pdf_label}**")
+            q_mode_label = "すべての質問" if confirm_summary.get("question_mode") == "all" else "先頭N問のみ"
+            lines.append(
+                f"- 質問の使用範囲: **{q_mode_label}** / 使用質問数: **{confirm_summary.get('use_n')}** / 総ペア数: {confirm_summary.get('total_pairs')}"
+            )
+            lines.append(f"- 使用LLMモデル: **{confirm_summary.get('llm_model')}**")
+            emb_list = confirm_summary.get("embedding_models") or []
+            lines.append(f"- 使用Embeddingモデル: **{', '.join(map(str, emb_list)) or '-'}**")
+            methods_list = confirm_summary.get("chunk_methods") or []
+            lines.append(f"- チャンク方式: **{', '.join(map(str, methods_list)) or '-'}**")
+            size_list = confirm_summary.get("chunk_sizes") or []
+            overlap_list = confirm_summary.get("chunk_overlaps") or []
+            if size_list:
+                lines.append(f"- チャンクサイズ候補: {', '.join(map(str, size_list))}")
+            if overlap_list:
+                lines.append(f"- オーバーラップ候補: {', '.join(map(str, overlap_list))}")
+            if "semantic" in (confirm_summary.get("chunk_methods") or []):
+                sim_th = confirm_summary.get("similarity_threshold")
+                if sim_th is not None:
+                    lines.append(f"- semantic 類似度しきい値: {sim_th}")
+            inc_sim = bool(confirm_summary.get("include_answer_similarity"))
+            lines.append(f"- answer_similarity の計算: {'有効' if inc_sim else '無効'}")
+            est_jobs = confirm_summary.get("estimated_jobs")
+            if est_jobs is not None:
+                lines.append(f"- 推定ジョブ数: **{est_jobs} 件**")
+
+            st.markdown("\n".join(lines))
+
+            col_ok, col_cancel = st.columns(2)
+            with col_ok:
+                if st.button("はい、この設定で実行", key="bulk_eval_confirm_yes"):
+                    # 一括評価はバックエンドのジョブAPI経由で非同期実行する
+                    with st.spinner("一括評価ジョブを起動中です…"):
+                        try:
+                            resp = http_post(f"{BACKEND_URL}/bulk_job/start", json=confirm_payload)
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"一括評価ジョブ起動時にエラーが発生しました: {e}")
                         else:
-                            data = resp.json() if resp.headers.get("Content-Type", "").startswith("application/json") else {}
-                            job_id = data.get("job_id")
-                            if not job_id:
-                                st.error("一括評価ジョブIDの取得に失敗しました。")
+                            if resp.status_code != 200:
+                                st.error(
+                                    f"一括評価ジョブ起動エラー: {format_http_error(resp)}"
+                                )
                             else:
-                                st.session_state["bulk_eval_job_id"] = job_id
-                                st.session_state["bulk_eval_job_status"] = "pending"
-                                st.session_state["bulk_eval_job_progress"] = "ジョブを受け付けました。"
-                                st.session_state["bulk_eval_job_error"] = None
-                                st.info(f"一括評価ジョブを起動しました。ジョブID: {job_id}")
+                                data = (
+                                    resp.json()
+                                    if resp.headers.get("Content-Type", "").startswith("application/json")
+                                    else {}
+                                )
+                                job_id = data.get("job_id")
+                                if not job_id:
+                                    st.error("一括評価ジョブIDの取得に失敗しました。")
+                                else:
+                                    # 確認用の一時状態はここでクリアする
+                                    st.session_state.pop("bulk_eval_confirm_payload", None)
+                                    st.session_state.pop("bulk_eval_confirm_summary", None)
+                                    st.session_state["bulk_eval_job_id"] = job_id
+                                    st.session_state["bulk_eval_job_status"] = "pending"
+                                    st.session_state["bulk_eval_job_progress"] = "ジョブを受け付けました。"
+                                    st.session_state["bulk_eval_job_error"] = None
+                                    st.info(f"一括評価ジョブを起動しました。ジョブID: {job_id}")
+                                    # ジョブ起動直後に進捗ポーリング用のステータス表示に切り替えるため、即座に再実行する
+                                    st.rerun()
 
-        # --- ジョブステータスの確認 ---
-        bulk_job_id = st.session_state.get("bulk_eval_job_id")
-        if bulk_job_id:
-            try:
-                resp_status = http_get(f"{BACKEND_URL}/bulk_job/status/{bulk_job_id}")
-            except Exception as e:  # noqa: BLE001
-                st.error(f"一括評価ジョブ状態取得中にエラーが発生しました: {e}")
-            else:
-                if resp_status.status_code != 200:
-                    st.error(
-                        f"一括評価ジョブ状態取得エラー: {format_http_error(resp_status)}"
-                    )
-                else:
-                    data_status = resp_status.json() if resp_status.headers.get("Content-Type", "").startswith("application/json") else {}
-                    status = str(data_status.get("status", "unknown"))
-                    progress_msg = data_status.get("progress") or ""
-                    err_msg = data_status.get("error") or ""
-                    st.session_state["bulk_eval_job_status"] = status
-                    st.session_state["bulk_eval_job_progress"] = progress_msg
-                    st.session_state["bulk_eval_job_error"] = err_msg or None
-
-                    st.info(f"一括評価ジョブ状態: {status}（ID: {bulk_job_id}）")
-                    if progress_msg:
-                        st.caption(f"進捗: {progress_msg}")
-
-                    result_obj = data_status.get("result")
-                    if status in {"completed", "COMPLETED"} and result_obj is not None:
-                        # 既存ロジックと同様に結果をフラット化
-                        flat_results: List[Dict[str, Any]] = []
-                        data = result_obj
-                        if isinstance(data, list):
-                            for item in data:
-                                if isinstance(item, list):
-                                    flat_results.extend(
-                                        x for x in item if isinstance(x, dict)
-                                    )
-                                elif isinstance(item, dict):
-                                    flat_results.append(item)
-                        elif isinstance(data, dict):
-                            flat_results.append(data)
-
-                        valid_results: List[Dict[str, Any]] = [
-                            r
-                            for r in flat_results
-                            if isinstance(r, dict) and not r.get("error")
-                        ]
-                        error_results: List[Dict[str, Any]] = [
-                            r
-                            for r in flat_results
-                            if isinstance(r, dict) and r.get("error")
-                        ]
-
-                        if not valid_results:
-                            st.error(
-                                "一括評価がすべてエラーで終了しました。設定とバックエンドログを確認してください。"
-                            )
-                            if error_results:
-                                with st.expander("エラー詳細", expanded=False):
-                                    st.json(error_results[:3])
-                        else:
-                            st.session_state.bulk_evaluation_results = valid_results
-                            msg = (
-                                f"一括評価が完了しました。有効な設定: {len(valid_results)} 件"
-                            )
-                            if error_results:
-                                msg += f"（エラー: {len(error_results)} 件は除外）"
-                            st.success(msg)
-                            # ジョブIDをクリアして再実行できるようにする
-                            st.session_state.pop("bulk_eval_job_id", None)
-
-                    elif status in {"error", "ERROR"} and err_msg:
-                        st.error(f"一括評価ジョブがエラーで終了しました: {err_msg}")
+            with col_cancel:
+                if st.button("キャンセル", key="bulk_eval_confirm_cancel"):
+                    st.session_state.pop("bulk_eval_confirm_payload", None)
+                    st.session_state.pop("bulk_eval_confirm_summary", None)
+                    st.info("一括評価の実行をキャンセルしました。")
 
         # --- 結果の表示（セッションに保存されたものを使用） ---
         results: List[Dict[str, Any]] = (

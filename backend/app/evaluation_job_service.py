@@ -47,6 +47,45 @@ _BULK_JOBS: Dict[str, BulkJobState] = {}
 _BULK_JOBS_LOCK = threading.Lock()
 
 
+def cleanup_stale_bulk_jobs_on_startup() -> None:
+    """サーバ再起動時に、中途半端な一括評価ジョブをERROR状態に遷移させる。
+
+    - コンテナ/プロセスの再起動後は、メモリ上のジョブワーカーは必ず失われているため、
+      DB上で status が pending / running のジョブはすべて「実行中断」とみなす。
+    - これらのジョブを一括で status=error に更新し、エラーメッセージを付与する。
+    """
+
+    from .main import jst_now_str  # 遅延インポート
+
+    sql = text(
+        """
+        UPDATE evaluation_jobs
+        SET
+            status = 'error',
+            error = COALESCE(error, 'サーバ再起動によりジョブが中断されました。'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status IN ('pending', 'running')
+        """
+    )
+
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(sql)
+            affected = result.rowcount if hasattr(result, "rowcount") else None
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            "[%s][ERROR] 起動時の一括評価ジョブクリーンアップ中にエラー: %s",
+            jst_now_str(),
+            e,
+        )
+    else:
+        logger.info(
+            "[%s][INFO] 起動時クリーンアップ: pending/running ジョブを error に更新しました (件数=%s)",
+            jst_now_str(),
+            affected,
+        )
+
+
 def _db_create_bulk_job(job_id: str, status: BulkJobStatus, progress: str) -> None:
     """evaluation_jobs にジョブを登録する。"""
     from .main import jst_now_str  # 遅延インポート
@@ -177,7 +216,7 @@ def start_bulk_job(*, payload: Any) -> dict:
         )
         try:
             # evaluation_service.bulk_evaluate は async 関数のため、このスレッド内でイベントループを作成して実行
-            result = asyncio.run(evaluation_service.bulk_evaluate(payload))
+            result = asyncio.run(evaluation_service.bulk_evaluate(payload, job_id=job_id))
             with _BULK_JOBS_LOCK:
                 current = _BULK_JOBS.get(job_id)
                 if not current:
@@ -189,7 +228,6 @@ def start_bulk_job(*, payload: Any) -> dict:
             _db_update_bulk_job(
                 job_id,
                 status=BulkJobStatus.COMPLETED,
-                progress="RAGAS一括評価が完了しました。",
                 error=None,
                 result=result,
             )

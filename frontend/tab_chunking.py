@@ -5,39 +5,53 @@ from typing import Any, Callable, Dict, List, Optional
 import streamlit as st
 
 from http_client import http_get, http_post, format_http_error
-from model_utils import fetch_embedding_models as _fetch_embedding_models_common
+from model_utils import (
+    fetch_embedding_models as _fetch_embedding_models_common,
+    fetch_history_pdfs as _fetch_history_pdfs_common,
+)
 
 
 def _fetch_history_pdfs(BACKEND_URL: str) -> List[Dict[str, Any]]:
-    """履歴APIからPDF一覧を取得するヘルパー。"""
-    try:
-        resp = http_get(f"{BACKEND_URL}/history/pdf-files")
-        if resp.status_code != 200:
-            st.warning(f"PDF履歴の取得に失敗しました: {resp.status_code} {resp.text}")
-            return []
-        data = (
-            resp.json()
-            if resp.headers.get("Content-Type", "").startswith("application/json")
-            else {}
-        )
-        return data.get("items", []) or []
-    except Exception as e:  # noqa: BLE001
-        st.warning(f"PDF履歴の取得中にエラーが発生しました: {e}")
-        return []
+    """履歴APIからPDF一覧を取得するヘルパー（共通キャッシュ利用）。"""
+    return _fetch_history_pdfs_common(BACKEND_URL.rstrip("/"))
 
 
 def _load_sample_text(BACKEND_URL: str, pdf_id: str, max_chars: int = 5000) -> str:
     """指定PDFの抽出テキストからプレビュー用の先頭数千文字を取得する。"""
-    text = ""
-    try:
-        resp = http_get(f"{BACKEND_URL}/get_extracted/{pdf_id}")
-        if resp.status_code == 200 and resp.headers.get("Content-Type", "").startswith(
-            "application/json"
-        ):
-            data = resp.json() or {}
-            text = data.get("text", "") or ""
-    except Exception as e:  # noqa: BLE001
-        st.warning(f"抽出テキスト取得中にエラーが発生しました: {e}")
+    cache_text_key = "_chunking_sample_text"
+    cache_pdf_key = "_chunking_sample_text_pdf_id"
+
+    cached_pdf_id = st.session_state.get(cache_pdf_key)
+    cached_text = st.session_state.get(cache_text_key) or ""
+
+    # 既に同じPDFのサンプルテキストを取得済みならキャッシュをそのまま利用する
+    if cached_pdf_id == pdf_id and cached_text:
+        text = cached_text
+    else:
+        text = ""
+
+        # 一括評価ジョブ実行中は新規の /get_extracted 呼び出しを抑制する
+        bulk_job_id = st.session_state.get("bulk_eval_job_id")
+        bulk_job_status = (st.session_state.get("bulk_eval_job_status") or "").lower()
+        bulk_job_active = bool(bulk_job_id) and bulk_job_status in ("pending", "running")
+
+        if bulk_job_active:
+            # キャッシュがあればそれだけ返し、無ければ空文字を返す
+            text = cached_text
+        else:
+            try:
+                resp = http_get(f"{BACKEND_URL}/get_extracted/{pdf_id}")
+                if resp.status_code == 200 and resp.headers.get("Content-Type", "").startswith(
+                    "application/json"
+                ):
+                    data = resp.json() or {}
+                    text = data.get("text", "") or ""
+            except Exception as e:  # noqa: BLE001
+                st.warning(f"抽出テキスト取得中にエラーが発生しました: {e}")
+
+            if text:
+                st.session_state[cache_text_key] = text
+                st.session_state[cache_pdf_key] = pdf_id
     if not text:
         return ""
     if len(text) > max_chars:
@@ -56,10 +70,28 @@ def _persist_model_selection(BACKEND_URL: str, llm_model: str, embedding_model: 
         "llm_model": llm_model,
         "embedding_model": embedding_model,
     }
+    key_llm = "_last_persisted_llm_model"
+    key_emb = "_last_persisted_embedding_model"
+
+    if (
+        st.session_state.get(key_llm) == llm_model
+        and st.session_state.get(key_emb) == embedding_model
+    ):
+        return
+
+    bulk_job_id = st.session_state.get("bulk_eval_job_id")
+    bulk_job_status = (st.session_state.get("bulk_eval_job_status") or "").lower()
+    bulk_job_active = bool(bulk_job_id) and bulk_job_status in ("pending", "running")
+    if bulk_job_active:
+        return
+
     try:
         http_post(f"{BACKEND_URL}/config/model_selection", json=payload)
     except Exception as e:  # noqa: BLE001
         st.warning(f"モデル選択の保存に失敗しました: {e}")
+    else:
+        st.session_state[key_llm] = llm_model
+        st.session_state[key_emb] = embedding_model
 
 
 def render_chunking_tab(

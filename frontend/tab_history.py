@@ -20,6 +20,12 @@ def render_history_tab(
     with tab_history:
         st.header("履歴")
         st.caption("アップロードしたPDF・生成QA・チャンク・一括評価結果を一覧・参照できます。")
+        bulk_job_id = st.session_state.get("bulk_eval_job_id")
+        bulk_job_status = (st.session_state.get("bulk_eval_job_status") or "").lower()
+        bulk_job_active = bool(bulk_job_id) and bulk_job_status in ("pending", "running", "")
+        if bulk_job_active:
+            st.info("現在 RAGAS一括評価ジョブを実行中のため、履歴APIへのアクセスを一時的に停止しています。ジョブ完了後に再度開いてください。")
+            return
 
         # --- 管理: DB全消去（バックアップ付き・危険操作） ---
         with st.expander("管理（危険）: DBと保存ファイルの全消去", expanded=False):

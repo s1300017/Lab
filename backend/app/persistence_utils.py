@@ -181,8 +181,21 @@ def persist_experiment_results(
             sanitized_params = {k: v for k, v in request_params.items() if k not in excluded_keys}
 
         parameters_json = json.dumps(sanitized_params, ensure_ascii=False) if sanitized_params else None
-        total = len(results)
-        completed = sum(1 for r in results if isinstance(r, dict) and "error" not in r)
+
+        flat_results: list[dict[str, Any]] = []
+        for item in results:
+            if isinstance(item, dict):
+                flat_results.append(item)
+            elif isinstance(item, list):
+                for sub in item:
+                    if isinstance(sub, dict):
+                        flat_results.append(sub)
+
+        if not flat_results:
+            return
+
+        total = len(flat_results)
+        completed = sum(1 for r in flat_results if "error" not in r)
         status = "completed" if completed == total else ("failed" if completed == 0 else "partial")
         experiment_name = request_params.get("experiment_name") if isinstance(request_params, dict) else None
         if not experiment_name:
@@ -216,29 +229,43 @@ def persist_experiment_results(
                 return
 
             result_rows: list[dict[str, Any]] = []
-            for res in results:
-                if not isinstance(res, dict) or "error" in res:
+            for res in flat_results:
+                if not isinstance(res, dict):
                     continue
+
+                is_error = "error" in res
                 metrics_list = res.get("metrics", [])
-                result_rows.append(
-                    {
-                        "experiment_id": experiment_id,
-                        "embedding_model": res.get("embedding_model"),
-                        "chunk_strategy": res.get("chunk_strategy") or res.get("chunk_method"),
-                        "chunk_size": res.get("chunk_size"),
-                        "chunk_overlap": res.get("chunk_overlap"),
-                        "num_chunks": res.get("num_chunks"),
-                        "avg_chunk_len": res.get("avg_chunk_len"),
-                        "overall_score": res.get("overall_score"),
-                        "faithfulness": res.get("faithfulness"),
-                        "answer_relevancy": res.get("answer_relevancy"),
-                        "context_recall": res.get("context_recall"),
-                        "context_precision": res.get("context_precision"),
-                        "answer_correctness": res.get("answer_correctness"),
-                        "answer_similarity": res.get("answer_similarity"),
-                        "details": json.dumps({"metrics": metrics_list}, ensure_ascii=False),
-                    }
-                )
+                details_payload: dict[str, Any] = {}
+                if isinstance(metrics_list, list) and metrics_list:
+                    details_payload["metrics"] = metrics_list
+
+                details_payload["status"] = "error" if is_error else "ok"
+                if is_error:
+                    if res.get("error") is not None:
+                        details_payload["error"] = res.get("error")
+                    if res.get("error_detail") is not None:
+                        details_payload["error_detail"] = res.get("error_detail")
+                    if res.get("input_data") is not None:
+                        details_payload["input_data"] = res.get("input_data")
+
+                row: dict[str, Any] = {
+                    "experiment_id": experiment_id,
+                    "embedding_model": res.get("embedding_model"),
+                    "chunk_strategy": res.get("chunk_strategy") or res.get("chunk_method"),
+                    "chunk_size": res.get("chunk_size"),
+                    "chunk_overlap": res.get("chunk_overlap"),
+                    "num_chunks": res.get("num_chunks"),
+                    "avg_chunk_len": res.get("avg_chunk_len"),
+                    "overall_score": None if is_error else res.get("overall_score"),
+                    "faithfulness": None if is_error else res.get("faithfulness"),
+                    "answer_relevancy": None if is_error else res.get("answer_relevancy"),
+                    "context_recall": None if is_error else res.get("context_recall"),
+                    "context_precision": None if is_error else res.get("context_precision"),
+                    "answer_correctness": None if is_error else res.get("answer_correctness"),
+                    "answer_similarity": None if is_error else res.get("answer_similarity"),
+                    "details": json.dumps(details_payload, ensure_ascii=False) if details_payload else None,
+                }
+                result_rows.append(row)
 
             if result_rows:
                 conn.execute(

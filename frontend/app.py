@@ -445,7 +445,10 @@ render_overview_tab(tab_overview)
 render_chunking_tab(tab1, BACKEND_URL, save_state_to_localstorage)
 # メインコンテンツ
 upload_processing = bool(st.session_state.get("upload_processing", False))
-if (not st.session_state.text) and (not upload_processing):
+bulk_job_id = st.session_state.get("bulk_eval_job_id")
+bulk_job_status = (st.session_state.get("bulk_eval_job_status") or "").lower()
+bulk_job_active = bool(bulk_job_id) and bulk_job_status in ("pending", "running", "")
+if (not st.session_state.text) and (not upload_processing) and (not bulk_job_active):
     # 歴史データの有無を確認し、全画面アクセス可否を案内（停止はしない）
     try:
         resp_pdf = http_get(f"{BACKEND_URL}/history/pdf-files")

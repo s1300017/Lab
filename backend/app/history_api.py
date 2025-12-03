@@ -457,11 +457,45 @@ def history_experiments() -> JSONResponse:
             rows = conn.execute(
                 text(
                     """
-                    SELECT id, pdf_file_id, experiment_name, parameters, status,
-                           total_combinations, completed_combinations,
-                           created_at, updated_at
-                    FROM experiments
-                    ORDER BY created_at DESC
+                    SELECT 
+                        e.id,
+                        e.pdf_file_id,
+                        e.experiment_name,
+                        e.parameters,
+                        e.status,
+                        e.total_combinations,
+                        e.completed_combinations,
+                        e.created_at,
+                        e.updated_at,
+                        agg.embedding_models,
+                        agg.chunk_methods,
+                        agg.min_chunk_size,
+                        agg.max_chunk_size,
+                        agg.min_chunk_overlap,
+                        agg.max_chunk_overlap
+                    FROM experiments e
+                    LEFT JOIN (
+                        SELECT
+                            experiment_id,
+                            string_agg(DISTINCT embedding_model, ',') AS embedding_models,
+                            string_agg(
+                                DISTINCT
+                                CASE
+                                    WHEN chunk_strategy IS NULL THEN NULL
+                                    WHEN position('-' in chunk_strategy) > 0 THEN split_part(chunk_strategy, '-', 1)
+                                    ELSE chunk_strategy
+                                END,
+                                ','
+                            ) AS chunk_methods,
+                            MIN(chunk_size) AS min_chunk_size,
+                            MAX(chunk_size) AS max_chunk_size,
+                            MIN(chunk_overlap) AS min_chunk_overlap,
+                            MAX(chunk_overlap) AS max_chunk_overlap
+                        FROM experiment_results
+                        GROUP BY experiment_id
+                    ) AS agg
+                        ON agg.experiment_id = e.id
+                    ORDER BY e.created_at DESC
                     """
                 )
             ).fetchall()

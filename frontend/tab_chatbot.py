@@ -9,7 +9,7 @@ from pytz import timezone
 import streamlit as st
 
 from http_client import http_get, http_post, format_http_error
-from model_utils import fetch_model_lists
+from model_utils import fetch_model_lists, fetch_history_pdfs
 
 
 def _fetch_models(BACKEND_URL: str) -> tuple[list[dict], list[dict]]:
@@ -28,11 +28,29 @@ def _persist_model_selection(BACKEND_URL: str, llm_model: str, embedding_model: 
         "llm_model": llm_model,
         "embedding_model": embedding_model,
     }
+    key_llm = "_last_persisted_llm_model"
+    key_emb = "_last_persisted_embedding_model"
+
+    if (
+        st.session_state.get(key_llm) == llm_model
+        and st.session_state.get(key_emb) == embedding_model
+    ):
+        return
+
+    bulk_job_id = st.session_state.get("bulk_eval_job_id")
+    bulk_job_status = (st.session_state.get("bulk_eval_job_status") or "").lower()
+    bulk_job_active = bool(bulk_job_id) and bulk_job_status in ("pending", "running")
+    if bulk_job_active:
+        return
+
     try:
         http_post(f"{BACKEND_URL}/config/model_selection", json=payload)
     except Exception as e:  # noqa: BLE001
         # 永続化に失敗しても致命的ではないため警告のみにとどめる
         st.warning(f"モデル選択の保存に失敗しました: {e}")
+    else:
+        st.session_state[key_llm] = llm_model
+        st.session_state[key_emb] = embedding_model
 
 
 def render_chatbot_tab(
@@ -140,26 +158,15 @@ def render_chatbot_tab(
             history_pdf_mapping: dict[str, dict] = {}
             history_pdf_labels: list[str] = []
             default_idx = 0
-            try:
-                resp_hist = http_get(f"{BACKEND_URL}/history/pdf-files")
-                if resp_hist.status_code == 200:
-                    data_hist = (
-                        resp_hist.json()
-                        if resp_hist.headers.get("Content-Type", "").startswith(
-                            "application/json"
-                        )
-                        else {}
-                    )
-                    if isinstance(data_hist, dict):
-                        history_pdf_items = data_hist.get("items", []) or []
-                        for idx, item in enumerate(history_pdf_items):
-                            label = f"{item.get('original_name', item.get('file_name', '不明なPDF'))} ({item.get('uploaded_at', '日時不明')})"
-                            history_pdf_labels.append(label)
-                            history_pdf_mapping[label] = item
-                            if item.get("id") == selected_pdf_id:
-                                default_idx = idx
-            except Exception as e:  # noqa: BLE001
-                st.warning(f"履歴PDFの取得に失敗しました: {e}")
+
+            history_pdf_items = fetch_history_pdfs(BACKEND_URL.rstrip("/"))
+            if history_pdf_items:
+                for idx, item in enumerate(history_pdf_items):
+                    label = f"{item.get('original_name', item.get('file_name', '不明なPDF'))} ({item.get('uploaded_at', '日時不明')})"
+                    history_pdf_labels.append(label)
+                    history_pdf_mapping[label] = item
+                    if item.get("id") == selected_pdf_id:
+                        default_idx = idx
 
             if history_pdf_labels:
                 sel_label = st.selectbox(

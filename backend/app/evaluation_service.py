@@ -48,7 +48,7 @@ from .persistence_utils import persist_experiment_results
 logger = logging.getLogger(__name__)
 
 
-async def bulk_evaluate(data: Any) -> Any:
+async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
     """RAGAS 一括評価ロジック本体。
 
     `main.bulk_evaluate` から切り出したもので、リクエスト JSON 本体 (`dict` または `list`)
@@ -94,12 +94,38 @@ async def bulk_evaluate(data: Any) -> Any:
                         return found
             return {}
 
+        def _update_job_progress_safe(message: str) -> None:
+            """evaluation_job_service.update_job_progress を安全に呼び出すヘルパー。
+
+            job_id が指定されていない場合や、進捗更新時に例外が出た場合は黙って無視する。
+            """
+
+            if not job_id:
+                return
+            try:
+                from . import evaluation_job_service as eval_job_service  # 遅延インポートで循環依存を回避
+
+                eval_job_service.update_job_progress(job_id, message)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[進捗] bulk_evaluate からのジョブ進捗更新に失敗しました",
+                )
+
         # 並列処理の最大数を制限するセマフォを作成
         cpu_count = os.cpu_count() or 4
         # CPUコア数に応じてデフォルト並列数を自動調整（最小2、最大8）
         default_parallel = max(2, min(8, max(1, cpu_count // 2)))
         MAX_PARALLEL_TASKS = int(os.getenv("EVAL_MAX_PARALLEL_TASKS", str(default_parallel)))
         semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
+
+        # 一括評価の「設定ごと」の並列数（外側ループ用）
+        # デフォルトは 1（従来どおり逐次実行）。環境変数で ON にした場合のみ並列化する。
+        try:
+            MAX_PARALLEL_CONFIGS = int(os.getenv("EVAL_MAX_PARALLEL_CONFIGS", "1"))
+        except ValueError:
+            MAX_PARALLEL_CONFIGS = 1
+        if MAX_PARALLEL_CONFIGS < 1:
+            MAX_PARALLEL_CONFIGS = 1
 
         # 計測ログの有効化（環境変数でON/OFF）
         TIMING_LOG = os.getenv("EVAL_TIMING_LOG", "1").lower() in {"1", "true", "yes"}
@@ -181,6 +207,31 @@ async def bulk_evaluate(data: Any) -> Any:
                     raise ValueError(
                         "questions/answersが指定されていません。PDFアップロード時の自動生成結果をそのまま送信してください。",
                     )
+
+                # 質問数が多すぎる場合は環境変数 EVAL_MAX_QUESTIONS で上限をかける
+                try:
+                    max_questions_env = os.getenv("EVAL_MAX_QUESTIONS")
+                    max_questions: int | None = None
+                    if max_questions_env is not None and str(max_questions_env).strip() != "":
+                        max_questions = int(str(max_questions_env).strip())
+                except Exception:  # noqa: BLE001
+                    max_questions = None
+
+                if (
+                    isinstance(questions, list)
+                    and isinstance(answers, list)
+                    and max_questions is not None
+                    and max_questions > 0
+                    and len(questions) > max_questions
+                ):
+                    logger.info(
+                        "[進捗] 質問数 %d 件のうち先頭 %d 件のみを評価対象とします (EVAL_MAX_QUESTIONS)",
+                        len(questions),
+                        max_questions,
+                    )
+                    questions = questions[:max_questions]
+                    answers = answers[:max_questions]
+
                 if not (sample_text and questions and answers):
                     raise ValueError(
                         "PDFアップロードとQA自動生成を先に実施してください（text, questions, answers必須）。",
@@ -709,6 +760,32 @@ async def bulk_evaluate(data: Any) -> Any:
                         metrics_avg = {k: 0.0 for k in metrics_keys}
                         try:
                             if eval_df is not None:
+                                # eval_dfの列情報と answer_similarity のサンプル値をデバッグ出力
+                                try:
+                                    cols = list(getattr(eval_df, "columns", []))
+                                    logger.info("[DEBUG] ragas eval_df columns: %s", cols)
+                                    if "answer_similarity" not in cols and "semantic_similarity" in cols:
+                                        try:
+                                            eval_df["answer_similarity"] = eval_df["semantic_similarity"]  # type: ignore[index]
+                                            cols = list(getattr(eval_df, "columns", []))
+                                            logger.info("[DEBUG] mapped semantic_similarity column to answer_similarity")
+                                        except Exception:  # noqa: BLE001
+                                            logger.info("[DEBUG] mapping semantic_similarity to answer_similarity failed")
+
+                                    if "answer_similarity" in cols:
+                                        try:
+                                            sample_vals = eval_df["answer_similarity"].tolist()  # type: ignore[index]
+                                            logger.info(
+                                                "[DEBUG] answer_similarity sample (first 5): %s",
+                                                sample_vals[:5],
+                                            )
+                                        except Exception:  # noqa: BLE001
+                                            logger.info(
+                                                "[DEBUG] answer_similarity column present but sampling failed",
+                                            )
+                                except Exception:  # noqa: BLE001
+                                    logger.info("[DEBUG] eval_df column inspection failed")
+
                                 try:
                                     rows = eval_df.to_dict(orient="records")  # type: ignore[arg-type]
                                 except Exception:  # noqa: BLE001
@@ -904,50 +981,94 @@ async def bulk_evaluate(data: Any) -> Any:
             extra={"component": "evaluation", "endpoint": "bulk_evaluate"},
         )
         if isinstance(data, list):
+            total = len(data)
             logger.info(
-                "[進捗] リストデータを処理します。データ数: %d",
-                len(data),
+                "[進捗] リストデータを処理します。データ数: %d, MAX_PARALLEL_CONFIGS=%d",
+                total,
+                MAX_PARALLEL_CONFIGS,
                 extra={"component": "evaluation", "endpoint": "bulk_evaluate"},
             )
-            results_all: list[Any] = []
-            for i, d in enumerate(data):
+
+            if total > 0:
+                _update_job_progress_safe(
+                    f"0/{total} 件完了（RAGAS一括評価を開始しました…）",
+                )
+
+            # 外側ループ（設定ごと）の並列実行。順序は元の data の順序を維持する。
+            results_all: list[Any] = [None] * total
+            outer_semaphore = asyncio.Semaphore(MAX_PARALLEL_CONFIGS)
+            completed = 0
+            completed_lock = asyncio.Lock()
+
+            async def _process_one(index: int, d: Any) -> None:
+                nonlocal completed
                 try:
-                    logger.info(
-                        "[進捗] データ %d/%d を処理中...",
-                        i + 1,
-                        len(data),
-                        extra={"component": "evaluation", "endpoint": "bulk_evaluate"},
-                    )
-                    one = d
-                    if not isinstance(one, dict):
-                        one = find_first_dict(one)
-                    res = await evaluate_one_bulk(one)
-                    results_all.append(res)
-                    logger.info(
-                        "[進捗] データ %d/%d の処理が完了しました",
-                        i + 1,
-                        len(data),
-                        extra={"component": "evaluation", "endpoint": "bulk_evaluate"},
-                    )
+                    async with outer_semaphore:
+                        logger.info(
+                            "[進捗] データ %d/%d を処理中...",
+                            index + 1,
+                            total,
+                            extra={
+                                "component": "evaluation",
+                                "endpoint": "bulk_evaluate",
+                            },
+                        )
+                        one = d
+                        if not isinstance(one, dict):
+                            one = find_first_dict(one)
+                        res = await evaluate_one_bulk(one)
+                        results_all[index] = res
+                        logger.info(
+                            "[進捗] データ %d/%d の処理が完了しました",
+                            index + 1,
+                            total,
+                            extra={
+                                "component": "evaluation",
+                                "endpoint": "bulk_evaluate",
+                            },
+                        )
                 except Exception as e:  # noqa: BLE001
                     import traceback
 
                     error_detail = traceback.format_exc()
                     logger.error(
                         "[エラー] データ %d/%d の処理中にエラーが発生: %s",
-                        i + 1,
-                        len(data),
+                        index + 1,
+                        total,
                         e,
-                        extra={"component": "evaluation", "endpoint": "bulk_evaluate"},
-                    )
-                    logger.debug(error_detail)
-                    results_all.append(
-                        {
-                            "error": str(e),
-                            "error_detail": error_detail,
-                            "input_data": d,
+                        extra={
+                            "component": "evaluation",
+                            "endpoint": "bulk_evaluate",
                         },
                     )
+                    logger.debug(error_detail)
+                    results_all[index] = {
+                        "error": str(e),
+                        "error_detail": error_detail,
+                        "input_data": d,
+                    }
+                finally:
+                    if total > 0:
+                        async with completed_lock:
+                            completed += 1
+                            done = completed
+                        _update_job_progress_safe(
+                            f"{done}/{total} 件完了（RAGAS一括評価を実行中…）",
+                        )
+
+            # すべてのタスクを起動し、MAX_PARALLEL_CONFIGS で同時実行数を制限
+            tasks = [
+                asyncio.create_task(_process_one(i, d)) for i, d in enumerate(data)
+            ]
+            await asyncio.gather(*tasks)
+
+            # None が残っている場合は安全側でエラー扱いにしておく
+            for i in range(total):
+                if results_all[i] is None:
+                    results_all[i] = {
+                        "error": "unknown error (no result)",
+                        "input_data": data[i],
+                    }
 
             logger.info(
                 "[進捗] すべてのデータ処理が完了しました。結果数: %d",
@@ -973,6 +1094,7 @@ async def bulk_evaluate(data: Any) -> Any:
             "[進捗] 処理が完了しました",
             extra={"component": "evaluation", "endpoint": "bulk_evaluate"},
         )
+        _update_job_progress_safe("1/1 件完了（RAGAS一括評価を実行中…）")
         persist_experiment_results(
             pdf_file_id=one_dict.get("file_id"),
             request_params=one_dict,
