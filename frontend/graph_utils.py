@@ -600,10 +600,12 @@ def create_zip_with_graphs(
                         sizemin=6,
                         sizeref=0.1,
                     ),
-                    hovertemplate="<b>%{hovertext}</b><br><br>"
-                    "チャンク数: <b>%{x}</b><br>"
-                    "平均サイズ: <b>%{y}文字</b><br>"
-                    "スコア: <b>%{marker.color:.2f}</b><extra></extra>",
+                    hovertemplate=(
+                        "<b>%{hovertext}</b><br><br>"
+                        "チャンク数: <b>%{x}</b><br>"
+                        "平均サイズ: <b>%{y}文字</b><br>"
+                        "スコア: <b>%{marker.color:.3f}</b><extra></extra>"
+                    ),
                     hoverlabel=dict(
                         font_size=14,
                         font_family=japanese_font,

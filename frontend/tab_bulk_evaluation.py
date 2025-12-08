@@ -226,24 +226,81 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                     elif status_lower in {"running"}:
                         st.caption("一括評価を実行中です。しばらくお待ちください。")
 
-                if "bulk_eval_auto_refresh" not in st.session_state:
-                    st.session_state["bulk_eval_auto_refresh"] = True
-                auto_refresh = st.checkbox(
-                    "2秒ごとに自動で進捗を更新する",
-                    key="bulk_eval_auto_refresh",
-                )
-
                 # pending / running 中は他の重いHTTP呼び出しを避け、状態だけをポーリングする
                 if status_lower in {"pending", "running"}:
-                    if auto_refresh:
-                        time.sleep(2.0)
-                        st.rerun()
-                    else:
+                    if "bulk_eval_auto_refresh" not in st.session_state:
+                        st.session_state["bulk_eval_auto_refresh"] = True
+
+                    confirm_open = bool(
+                        st.session_state.get("bulk_eval_cancel_confirm_open")
+                    )
+
+                    col_auto, col_manual, col_cancel = st.columns(3)
+                    with col_auto:
+                        auto_refresh = st.checkbox(
+                            "2秒ごとに自動で進捗を更新する",
+                            key="bulk_eval_auto_refresh",
+                        )
+                    with col_manual:
                         if st.button("進捗を手動更新", key="bulk_eval_manual_refresh"):
                             st.rerun()
+                    with col_cancel:
+                        if not confirm_open:
+                            if st.button(
+                                "この一括評価をキャンセル", key="bulk_eval_cancel"
+                            ):
+                                st.session_state["bulk_eval_cancel_confirm_open"] = True
+                                confirm_open = True
+
+                    # 協調キャンセルの説明と確認UI
+                    if confirm_open:
+                        st.warning(
+                            "このキャンセルは\"協調キャンセル\"です。現在実行中の評価セットが安全に終了した後、残りの設定・残りのジョブを停止します。"\
+                            " いま走っている処理自体を途中で強制終了することはできません。"
+                        )
+                        col_yes, col_no = st.columns(2)
+                        with col_yes:
+                            if st.button(
+                                "はい、キャンセルします", key="bulk_eval_cancel_yes"
+                            ):
+                                try:
+                                    resp_cancel = http_post(
+                                        f"{BACKEND_URL}/bulk_job/cancel/{bulk_job_id}",
+                                        json={},
+                                    )
+                                except Exception as e:  # noqa: BLE001
+                                    st.error(
+                                        f"キャンセル要求送信中にエラーが発生しました: {e}"
+                                    )
+                                else:
+                                    if resp_cancel.status_code != 200:
+                                        st.error(
+                                            "キャンセル要求エラー: "
+                                            f"{format_http_error(resp_cancel)}"
+                                        )
+                                    else:
+                                        st.info(
+                                            "キャンセル要求を送信しました。現在の評価セット終了後に停止されます。数秒後に状態が反映されます。"
+                                        )
+                                        st.session_state[
+                                            "bulk_eval_cancel_confirm_open"
+                                        ] = False
+                                        time.sleep(0.5)
+                                        st.rerun()
+                        with col_no:
+                            if st.button(
+                                "いいえ、キャンセルしません", key="bulk_eval_cancel_no"
+                            ):
+                                st.session_state["bulk_eval_cancel_confirm_open"] = False
+                                st.info("キャンセルは実行されませんでした。")
+
+                    # 確認ダイアログが開いている間は自動更新を止める
+                    if auto_refresh and not confirm_open:
+                        time.sleep(2.0)
+                        st.rerun()
                     return
 
-                # completed / error の場合はこのまま下の通常UIに進み、結果表示などを行う
+                # completed / error / cancelled の場合はこのまま下の通常UIに進み、結果表示などを行う
                 result_obj = data_status.get("result")
                 if status in {"completed", "COMPLETED"} and result_obj is not None:
                     # 結果をフラット化してセッションに保存（既存ロジックと同様）
@@ -291,6 +348,9 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 elif status_lower in {"error"} and err_msg:
                     st.error(f"一括評価ジョブがエラーで終了しました: {err_msg}")
                     # エラー時もここで一旦ジョブIDをクリアしておく
+                    st.session_state.pop("bulk_eval_job_id", None)
+                elif status_lower in {"cancelled"}:
+                    st.info("一括評価ジョブはユーザーによりキャンセルされました。")
                     st.session_state.pop("bulk_eval_job_id", None)
 
         # --- 評価対象PDFの選択（履歴から） ---
@@ -517,37 +577,90 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 help="大きい値にするほど評価時間が長くなります。",
             )
 
-        # RAG回答生成に使用するLLMの選択
+        # RAG回答生成および評価に使用するLLMの選択
         llm_models = _fetch_llm_models(BACKEND_URL.rstrip("/"))
-        selected_llm_model: str | None = None
+        selected_llm_models: List[str] = []
+        selected_eval_llm: str | None = None
+        force_llm_generation = st.session_state.get("bulk_force_llm_generation", False)
         if llm_models:
             provider_labels = {"huggingface": "HuggingFace", "ollama": "Ollama", "openai": "OpenAI"}
-            llm_names = [m.get("name", "") for m in llm_models]
-            llm_labels: List[str] = []
+            llm_names = [m.get("name", "") for m in llm_models if m.get("name")]
+            llm_labels = {}
             for m in llm_models:
+                name = m.get("name")
+                if not name:
+                    continue
                 t = m.get("type") or "unknown"
                 prefix = provider_labels.get(t, t)
-                base_label = m.get("display_name") or m.get("name") or "unknown"
-                llm_labels.append(f"[{prefix}] {base_label}")
-            default_llm_name = st.session_state.get("llm_model") or "gpt-oss"
-            if default_llm_name in llm_names:
-                default_llm_index = llm_names.index(default_llm_name)
+                base_label = m.get("display_name") or name
+                llm_labels[name] = f"[{prefix}] {base_label}"
+            default_llm_name = st.session_state.get("llm_model", "")
+            default_llm_choices: list[str] = []
+            prev_selected_llms = [
+                name for name in st.session_state.get("bulk_selected_llm_models", []) if name in llm_names
+            ]
+            if prev_selected_llms:
+                default_llm_choices = prev_selected_llms
+            elif default_llm_name in llm_names:
+                default_llm_choices = [default_llm_name]
+            elif llm_names:
+                default_llm_choices = [llm_names[0]]
+
+            # Streamlitのマルチセレクト値を保持するため、ウィジェット作成前にstateを初期化
+            if "bulk_llm_model_select" not in st.session_state:
+                st.session_state["bulk_llm_model_select"] = list(default_llm_choices)
             else:
-                default_llm_index = 0
-            selected_llm_index = st.selectbox(
-                "RAG回答生成に使用するLLM",
-                options=list(range(len(llm_names))),
-                format_func=lambda i: llm_labels[i],
-                index=default_llm_index,
+                current_selection = [
+                    name for name in st.session_state.get("bulk_llm_model_select", []) if name in llm_names
+                ]
+                if not current_selection and default_llm_choices:
+                    current_selection = list(default_llm_choices)
+                st.session_state["bulk_llm_model_select"] = current_selection
+
+            selected_llm_models = st.multiselect(
+                "RAG回答生成に使用するLLM（複数選択可）",
+                options=llm_names,
+                format_func=lambda name: llm_labels.get(name, name),
                 key="bulk_llm_model_select",
+                help="選択したLLMすべてでRAG回答生成を行い、埋め込み・チャンク設定と組み合わせて評価します。",
             )
-            if 0 <= selected_llm_index < len(llm_names):
-                selected_llm_model = llm_names[selected_llm_index]
-                # グローバルなLLMモデルとして反映
-                st.session_state.llm_model = selected_llm_model
+            if selected_llm_models:
+                st.session_state["bulk_selected_llm_models"] = selected_llm_models
+                # グローバルなLLMモデルとして反映（先頭を代表として利用）
+                st.session_state.llm_model = selected_llm_models[0]
                 # chat_modelが未設定なら同期
                 if not st.session_state.get("chat_model"):
-                    st.session_state.chat_model = selected_llm_model
+                    st.session_state.chat_model = selected_llm_models[0]
+
+            default_eval_llm = (
+                st.session_state.get("bulk_selected_evaluation_llm")
+                or st.session_state.get("llm_model")
+                or (selected_llm_models[0] if selected_llm_models else (llm_names[0] if llm_names else ""))
+            )
+            if default_eval_llm not in llm_names and llm_names:
+                default_eval_llm = llm_names[0]
+            if "bulk_eval_llm_select" not in st.session_state or st.session_state["bulk_eval_llm_select"] not in llm_names:
+                st.session_state["bulk_eval_llm_select"] = default_eval_llm
+            eval_select_idx = llm_names.index(st.session_state["bulk_eval_llm_select"]) if llm_names else 0
+            selected_eval_llm = None
+            if llm_names:
+                selected_eval_llm = st.selectbox(
+                    "RAGAS評価LLM（採点者）",
+                    options=llm_names,
+                    format_func=lambda name: llm_labels.get(name, name),
+                    index=eval_select_idx,
+                    key="bulk_eval_llm_select",
+                    help="RAGASの採点で使用するLLMです。評価結果に一貫性を持たせたい場合は固定してください。",
+                )
+                if selected_eval_llm:
+                    st.session_state["bulk_selected_evaluation_llm"] = selected_eval_llm
+
+            force_llm_generation = st.checkbox(
+                "LLMごとに回答を再生成する（既存回答を使い回さない）",
+                value=force_llm_generation,
+                key="bulk_force_llm_generation",
+                help="オンにすると、LLMごとに回答を再生成して評価します。処理時間は長くなりますが、LLM間の違いを比較できます。",
+            )
 
         # Embeddingモデルの選択（複数選択）
         embedding_models = _fetch_embedding_models(BACKEND_URL.rstrip("/"))
@@ -608,7 +721,9 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 primary_emb = selected_embeddings[0]
                 st.session_state.embedding_model = primary_emb
                 # LLMモデルが決まっていればDBにも保存
-                base_llm_for_persist = selected_llm_model or st.session_state.get("llm_model", "gpt-oss")
+                base_llm_for_persist = (
+                    selected_llm_models[0] if selected_llm_models else st.session_state.get("llm_model", "gpt-oss")
+                )
                 if base_llm_for_persist:
                     _persist_model_selection(BACKEND_URL.rstrip("/"), base_llm_for_persist, primary_emb)
         else:
@@ -722,19 +837,22 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
 
         # 現在の設定から、おおよそのジョブ数を算出してユーザーに提示
         estimated_jobs = 0
-        if selected_embeddings and selected_chunk_methods:
+        if selected_llm_models and selected_embeddings and selected_chunk_methods:
+            num_llm = len(selected_llm_models)
+            num_embeddings = len(selected_embeddings)
+            num_sizes = max(len(chunk_sizes), 1)
+            num_overlaps = max(len(chunk_overlaps), 1)
+
             for method in selected_chunk_methods:
                 if method == "semantic":
                     # semantic はサイズ・オーバーラップを持たない1組み合わせ扱い
-                    estimated_jobs += len(selected_embeddings)
+                    estimated_jobs += num_llm * num_embeddings
                 elif method in ("sentence", "paragraph"):
-                    estimated_jobs += len(selected_embeddings)
+                    estimated_jobs += num_llm * num_embeddings
                 elif method in ("recursive", "fixed"):
-                    estimated_jobs += len(selected_embeddings) * max(len(chunk_sizes), 1) * max(
-                        len(chunk_overlaps), 1
-                    )
+                    estimated_jobs += num_llm * num_embeddings * num_sizes * num_overlaps
                 else:
-                    estimated_jobs += len(selected_embeddings)
+                    estimated_jobs += num_llm * num_embeddings
 
         if estimated_jobs > 0:
             st.caption(
@@ -806,6 +924,9 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 if not selected_embeddings:
                     st.error("少なくとも1つの埋め込みモデルを選択してください。")
                     return
+                if not selected_llm_models:
+                    st.error("少なくとも1つのLLMモデルを選択してください。")
+                    return
                 if not selected_chunk_methods:
                     st.error("少なくとも1つのチャンク方式を選択してください。")
                     return
@@ -814,57 +935,64 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 jobs: List[Dict[str, Any]] = []
                 file_id = st.session_state.get("file_id")
 
-                for emb in selected_embeddings:
-                    for method in selected_chunk_methods:
-                        if method == "semantic":
-                            job: Dict[str, Any] = {
-                                "embedding_model": emb,
-                                "chunk_methods": [method],
-                                "text": eval_text,
-                                "questions": questions_eval,
-                                "answers": answers_eval,
-                                "include_answer_similarity": include_answer_similarity,
-                                "semantic_params": {
-                                    "similarity_threshold": float(similarity_threshold)
-                                },
-                            }
-                            if file_id:
-                                job["file_id"] = file_id
-                            if selected_llm_model:
-                                job["llm_model"] = selected_llm_model
-                            jobs.append(job)
-                        elif method in ("sentence", "paragraph"):
-                            job = {
-                                "embedding_model": emb,
-                                "chunk_methods": [method],
-                                "text": eval_text,
-                                "questions": questions_eval,
-                                "answers": answers_eval,
-                                "include_answer_similarity": include_answer_similarity,
-                            }
-                            if file_id:
-                                job["file_id"] = file_id
-                            if selected_llm_model:
-                                job["llm_model"] = selected_llm_model
-                            jobs.append(job)
-                        else:
-                            for size in chunk_sizes:
-                                for ov in chunk_overlaps:
-                                    job = {
-                                        "embedding_model": emb,
-                                        "chunk_methods": [method],
-                                        "chunk_sizes": [int(size)],
-                                        "chunk_overlaps": [int(ov)],
-                                        "text": eval_text,
-                                        "questions": questions_eval,
-                                        "answers": answers_eval,
-                                        "include_answer_similarity": include_answer_similarity,
-                                    }
-                                    if file_id:
-                                        job["file_id"] = file_id
-                                    if selected_llm_model:
-                                        job["llm_model"] = selected_llm_model
-                                    jobs.append(job)
+                eval_llm_for_job = selected_eval_llm or (
+                    selected_llm_models[0] if selected_llm_models else None
+                )
+                for llm_model in selected_llm_models:
+                    for emb in selected_embeddings:
+                        for method in selected_chunk_methods:
+                            if method == "semantic":
+                                job: Dict[str, Any] = {
+                                    "llm_model": llm_model,
+                                    "evaluation_llm_model": eval_llm_for_job,
+                                    "embedding_model": emb,
+                                    "chunk_methods": [method],
+                                    "text": eval_text,
+                                    "questions": questions_eval,
+                                    "answers": answers_eval,
+                                    "include_answer_similarity": include_answer_similarity,
+                                    "force_llm_generation": force_llm_generation,
+                                    "semantic_params": {
+                                        "similarity_threshold": float(similarity_threshold)
+                                    },
+                                }
+                                if file_id:
+                                    job["file_id"] = file_id
+                                jobs.append(job)
+                            elif method in ("sentence", "paragraph"):
+                                job = {
+                                    "llm_model": llm_model,
+                                    "evaluation_llm_model": eval_llm_for_job,
+                                    "embedding_model": emb,
+                                    "chunk_methods": [method],
+                                    "text": eval_text,
+                                    "questions": questions_eval,
+                                    "answers": answers_eval,
+                                    "include_answer_similarity": include_answer_similarity,
+                                    "force_llm_generation": force_llm_generation,
+                                }
+                                if file_id:
+                                    job["file_id"] = file_id
+                                jobs.append(job)
+                            else:
+                                for size in chunk_sizes:
+                                    for ov in chunk_overlaps:
+                                        job = {
+                                            "llm_model": llm_model,
+                                            "evaluation_llm_model": eval_llm_for_job,
+                                            "embedding_model": emb,
+                                            "chunk_methods": [method],
+                                            "chunk_sizes": [int(size)],
+                                            "chunk_overlaps": [int(ov)],
+                                            "text": eval_text,
+                                            "questions": questions_eval,
+                                            "answers": answers_eval,
+                                            "include_answer_similarity": include_answer_similarity,
+                                            "force_llm_generation": force_llm_generation,
+                                        }
+                                        if file_id:
+                                            job["file_id"] = file_id
+                                        jobs.append(job)
 
                 if not jobs:
                     st.error("有効な評価ジョブが生成できませんでした。設定を見直してください。")
@@ -886,13 +1014,15 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                     payload = jobs
 
                 # 実行前確認用にサマリー情報をセッションに保存しておき、別ボタンで実際のジョブ起動を行う
-                llm_for_summary = selected_llm_model or st.session_state.get("llm_model", "gpt-oss")
+                summary_llm_models = selected_llm_models or [st.session_state.get("llm_model", "gpt-oss")]
                 summary = {
                     "pdf_file_id": selected_pdf_id or file_id,
                     "question_mode": question_mode,
                     "use_n": use_n,
                     "total_pairs": max_pairs,
-                    "llm_model": llm_for_summary,
+                    "llm_models": summary_llm_models,
+                    "evaluation_llm_model": selected_eval_llm or summary_llm_models[0],
+                    "force_llm_generation": bool(force_llm_generation),
                     "embedding_models": list(selected_embeddings),
                     "chunk_methods": list(selected_chunk_methods),
                     "chunk_sizes": list(chunk_sizes),
@@ -919,7 +1049,8 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
             lines.append(
                 f"- 質問の使用範囲: **{q_mode_label}** / 使用質問数: **{confirm_summary.get('use_n')}** / 総ペア数: {confirm_summary.get('total_pairs')}"
             )
-            lines.append(f"- 使用LLMモデル: **{confirm_summary.get('llm_model')}**")
+            llm_list = confirm_summary.get("llm_models") or []
+            lines.append(f"- 使用LLMモデル: **{', '.join(map(str, llm_list)) or '-'}**")
             emb_list = confirm_summary.get("embedding_models") or []
             lines.append(f"- 使用Embeddingモデル: **{', '.join(map(str, emb_list)) or '-'}**")
             methods_list = confirm_summary.get("chunk_methods") or []

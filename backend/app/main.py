@@ -352,6 +352,9 @@ def init_db():
                         status TEXT,
                         total_combinations INTEGER,
                         completed_combinations INTEGER,
+                        total_elapsed_seconds DOUBLE PRECISION,
+                        avg_job_duration_seconds DOUBLE PRECISION,
+                        duration_summary JSONB,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
@@ -361,6 +364,8 @@ def init_db():
                         id SERIAL PRIMARY KEY,
                         experiment_id INTEGER REFERENCES experiments(id) ON DELETE CASCADE,
                         embedding_model TEXT,
+                        llm_model TEXT,
+                        evaluation_llm_model TEXT,
                         chunk_strategy TEXT,
                         chunk_size INTEGER,
                         chunk_overlap INTEGER,
@@ -373,9 +378,34 @@ def init_db():
                         context_precision FLOAT,
                         answer_correctness FLOAT,
                         answer_similarity FLOAT,
+                        duration_seconds DOUBLE PRECISION,
                         details TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
+                """))
+                conn.execute(text("""
+                    ALTER TABLE experiment_results
+                    ADD COLUMN IF NOT EXISTS llm_model TEXT
+                """))
+                conn.execute(text("""
+                    ALTER TABLE experiment_results
+                    ADD COLUMN IF NOT EXISTS evaluation_llm_model TEXT
+                """))
+                conn.execute(text("""
+                    ALTER TABLE experiment_results
+                    ADD COLUMN IF NOT EXISTS duration_seconds DOUBLE PRECISION
+                """))
+                conn.execute(text("""
+                    ALTER TABLE experiments
+                    ADD COLUMN IF NOT EXISTS total_elapsed_seconds DOUBLE PRECISION
+                """))
+                conn.execute(text("""
+                    ALTER TABLE experiments
+                    ADD COLUMN IF NOT EXISTS avg_job_duration_seconds DOUBLE PRECISION
+                """))
+                conn.execute(text("""
+                    ALTER TABLE experiments
+                    ADD COLUMN IF NOT EXISTS duration_summary JSONB
                 """))
                 conn.execute(text("""
                     CREATE TABLE IF NOT EXISTS chat_logs (
@@ -1051,20 +1081,51 @@ def build_collection_name_for_pdf(embedding_model: str, scope: str, pdf_file_id:
 
 # --- Model Selection ---
 
-LLM_MODEL_CONFIG = {
-    # Ollama系（ローカル／Cloud 含む）
-    "gpt-oss": {"provider": "ollama", "model": "gpt-oss:20b"},
-    "gpt-oss-20b-cloud": {"provider": "ollama", "model": "gpt-oss:20b-cloud"},
-    "gpt-oss-120b-cloud": {"provider": "ollama", "model": "gpt-oss:120b-cloud"},
-    "llama3": {"provider": "ollama", "model": "llama3"},
-    "mistral": {"provider": "ollama", "model": "mistral"},
-    "gemma2": {"provider": "ollama", "model": "gemma2"},
-    "phi3": {"provider": "ollama", "model": "phi3"},
-    # OpenAI系
-    "gpt-4o": {"provider": "openai", "model": "gpt-4o"},
-    "gpt-4o-mini": {"provider": "openai", "model": "gpt-4o-mini"},
-    "gpt-3.5-turbo": {"provider": "openai", "model": "gpt-3.5-turbo"},
-}
+
+def _build_llm_model_config_from_yaml() -> dict[str, dict[str, str]]:
+    """models.yaml から LLM の provider / 実モデル名を解決してマッピングを構築する。"""
+
+    config: dict[str, dict[str, str]] = {}
+    models: list[dict[str, Any]] = []
+
+    try:
+        # admin_api のヘルパーを利用して models.yaml を読み込む
+        from .admin_api import load_models_yaml
+
+        models_dict = load_models_yaml()
+        models = models_dict.get("models", []) or []
+    except Exception as e:  # noqa: BLE001
+        logger.error("[ERROR] models.yaml から LLM_MODEL_CONFIG を構築できませんでした: %s", e)
+        models = []
+
+    for m in models:
+        # LLM カテゴリのみを対象にする
+        if m.get("category") != "LLM":
+            continue
+
+        name = m.get("name")
+        provider = m.get("type")
+        backend_model = m.get("backend_model") or name
+        if not name or not provider or not backend_model:
+            continue
+
+        key = str(name).strip()
+        config[key] = {
+            "provider": str(provider).strip(),
+            "model": str(backend_model).strip(),
+        }
+
+    # デフォルトLLMが存在しない場合は GPT-OSS を最低限登録しておく
+    if DEFAULT_LLM_NAME not in config:
+        config.setdefault(
+            DEFAULT_LLM_NAME,
+            {"provider": "ollama", "model": "gpt-oss:20b"},
+        )
+
+    return config
+
+
+LLM_MODEL_CONFIG = _build_llm_model_config_from_yaml()
 
 
 def _resolve_llm_entry(model_name: str):
@@ -1117,17 +1178,32 @@ def get_llm_generation(
     raise ValueError(f"未知のLLMプロバイダ: {provider}")
 
 
-def get_llm_eval():
-    """RAGAS評価専用にGPT-OSSを返す。"""
-    return RAGASCompatibleOllamaLLM(
-        model=LLM_MODEL_CONFIG[DEFAULT_LLM_NAME]["model"],
-        base_url=get_ollama_base_url()
-    )
+def get_llm_eval(model_name: str | None = None):
+    """RAGAS評価用に指定モデル（未指定なら DEFAULT_LLM_NAME）を返す。"""
+    target_name = model_name or DEFAULT_LLM_NAME
+    resolved_name, entry = _resolve_llm_entry(target_name)
+    provider = entry["provider"]
+    if provider == "ollama":
+        return RAGASCompatibleOllamaLLM(
+            model=entry["model"],
+            base_url=get_ollama_base_url(),
+        )
+    if provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OpenAIモデルを評価に利用するにはOPENAI_API_KEYを設定してください。")
+        return ChatOpenAI(
+            model=entry["model"],
+            openai_api_key=api_key,
+            temperature=0.0,
+            max_tokens=512,
+        )
+    raise ValueError(f"評価用LLMで未対応のプロバイダ: {provider}")
 
 
 # 後方互換のためのエイリアス（従来の呼び出しは評価用として扱う）
-def get_llm(model_name: str):
-    return get_llm_eval()
+def get_llm(model_name: str | None = None):
+    return get_llm_eval(model_name)
 
 
 def init_generation_llm(
@@ -1228,6 +1304,7 @@ def get_embeddings(model_name: str):
     ollama_embedding_models = {
         "nomic-embed-text": "nomic-embed-text",
         "mxbai-embed-large": "mxbai-embed-large",
+        "mxbai-embed-large:335m": "mxbai-embed-large:335m",
         "all-minilm": "all-minilm",
         # 日本語/多言語対応のモデル（Ollama）
         # 事前に `ollama pull bge-m3` / `ollama pull qwen3-embedding` / `ollama pull snowflake-arctic-embed2` / `ollama pull jina-embeddings-v3` を実行しておくこと

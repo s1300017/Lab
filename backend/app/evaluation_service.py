@@ -1,14 +1,20 @@
 from __future__ import annotations
 
-from typing import Any
-
 import asyncio
-import os
-import re
-import time
-import math
-import copy as _copy
+import json
 import logging
+import math
+import os
+import random
+import re
+import statistics
+import time
+import traceback
+from collections import defaultdict
+from copy import deepcopy
+from datetime import datetime
+from hashlib import sha256
+from typing import Any, Iterable, Mapping, Sequence
 
 from datasets import Dataset
 from ragas import evaluate, RunConfig
@@ -48,6 +54,122 @@ from .persistence_utils import persist_experiment_results
 logger = logging.getLogger(__name__)
 
 
+def _unique_preserve_order(seq: Iterable[Any]) -> list[Any]:
+    seen: set[Any] = set()
+    ordered: list[Any] = []
+    for item in seq:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _summarize_bulk_request(request_items: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """複数ジョブの設定から実験全体の概要を構築する。"""
+    valid_items = [item for item in request_items if isinstance(item, dict)]
+    if not valid_items:
+        return {}
+
+    first = valid_items[0]
+    summary: dict[str, Any] = {}
+
+    for key in ("experiment_name", "file_id", "pdf_file_id", "question_mode", "use_n"):
+        if first.get(key) is not None:
+            summary[key] = first.get(key)
+
+    llm_models = _unique_preserve_order(
+        item.get("llm_model")
+        for item in valid_items
+        if item.get("llm_model")
+    )
+    if llm_models:
+        summary["llm_models"] = llm_models
+        summary["llm_model"] = llm_models[0]
+
+    embedding_models = _unique_preserve_order(
+        item.get("embedding_model")
+        for item in valid_items
+        if item.get("embedding_model")
+    )
+    if embedding_models:
+        summary["embedding_models"] = embedding_models
+
+    chunk_methods = []
+    for item in valid_items:
+        methods = item.get("chunk_methods")
+        if isinstance(methods, list):
+            chunk_methods.extend(methods)
+        elif item.get("chunk_method"):
+            chunk_methods.append(item.get("chunk_method"))
+    chunk_methods = _unique_preserve_order(
+        method for method in chunk_methods if method
+    )
+    if chunk_methods:
+        summary["chunk_methods"] = chunk_methods
+
+    chunk_sizes = []
+    for item in valid_items:
+        sizes = item.get("chunk_sizes")
+        if isinstance(sizes, list):
+            chunk_sizes.extend(sizes)
+        elif item.get("chunk_size") is not None:
+            chunk_sizes.append(item.get("chunk_size"))
+    chunk_sizes = _unique_preserve_order(
+        int(size) for size in chunk_sizes if size is not None
+    )
+    if chunk_sizes:
+        summary["chunk_sizes"] = chunk_sizes
+
+    chunk_overlaps = []
+    for item in valid_items:
+        overlaps = item.get("chunk_overlaps")
+        if isinstance(overlaps, list):
+            chunk_overlaps.extend(overlaps)
+        elif item.get("chunk_overlap") is not None:
+            chunk_overlaps.append(item.get("chunk_overlap"))
+    chunk_overlaps = _unique_preserve_order(
+        int(ov) for ov in chunk_overlaps if ov is not None
+    )
+    if chunk_overlaps:
+        summary["chunk_overlaps"] = chunk_overlaps
+
+    include_answer_similarity_values = [
+        item.get("include_answer_similarity")
+        for item in valid_items
+        if item.get("include_answer_similarity") is not None
+    ]
+    if include_answer_similarity_values:
+        summary["include_answer_similarity"] = bool(include_answer_similarity_values[-1])
+
+    similarity_thresholds = [
+        item.get("semantic_params", {}).get("similarity_threshold")
+        for item in valid_items
+        if isinstance(item.get("semantic_params"), dict)
+    ]
+    if similarity_thresholds:
+        summary["similarity_threshold"] = similarity_thresholds[-1]
+
+    evaluation_llm_models = _unique_preserve_order(
+        item.get("evaluation_llm_model")
+        for item in valid_items
+        if item.get("evaluation_llm_model")
+    )
+    if evaluation_llm_models:
+        summary["evaluation_llm_models"] = evaluation_llm_models
+        summary["evaluation_llm_model"] = evaluation_llm_models[0]
+
+    force_flags = [
+        bool(item.get("force_llm_generation"))
+        for item in valid_items
+        if "force_llm_generation" in item
+    ]
+    summary["force_llm_generation"] = any(force_flags) if force_flags else False
+
+    summary["total_jobs"] = len(valid_items)
+    return summary
+
+
 async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
     """RAGAS 一括評価ロジック本体。
 
@@ -59,7 +181,7 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
 
     DEFAULT_LLM_NAME = main_module.DEFAULT_LLM_NAME
     get_embeddings = main_module.get_embeddings
-    get_llm = main_module.get_llm
+    get_llm_eval = main_module.get_llm_eval
     init_generation_llm = main_module.init_generation_llm
     get_collection_name = main_module.get_collection_name
     SUPPORTED_EMBEDDING_MODELS = main_module.SUPPORTED_EMBEDDING_MODELS
@@ -147,9 +269,28 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
             except Exception:  # noqa: BLE001
                 pass
 
+        def _check_cancel() -> None:
+            """evaluation_jobs の cancel_requested フラグを確認し、キャンセル要求があれば例外を送出する。"""
+
+            if not job_id:
+                return
+            try:
+                from . import evaluation_job_service as eval_job_service  # 遅延インポート
+            except Exception:  # noqa: BLE001
+                return
+
+            state = eval_job_service.get_bulk_job(job_id)
+            if state and getattr(state, "cancel_requested", False):
+                # 進捗メッセージも更新しておく
+                _update_job_progress_safe(
+                    "キャンセル要求を検知しました。現在の処理を安全に停止しています…",
+                )
+                raise eval_job_service.BulkJobCancelled("ユーザーによりキャンセルされました。")
+
         async def evaluate_one_bulk(one: dict) -> Any:
             try:
                 logger.info("[進捗] 評価データを処理中...")
+                _check_cancel()
                 # タイムアウト設定（環境変数で調整可能）
                 # 既定値: LLM呼び出し=45秒, 評価全体は質問数に応じて自動調整
                 LLM_TIMEOUT = _parse_timeout_env("EVAL_LLM_TIMEOUT_SECONDS", 45)
@@ -160,11 +301,18 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                 chunk_sizes = one.get("chunk_sizes", [one.get("chunk_size", 1000)])
                 chunk_overlaps = one.get("chunk_overlaps", [one.get("chunk_overlap", 0)])
                 request_llm_model = one.get("llm_model", DEFAULT_LLM_NAME)
+                evaluation_llm_model = one.get("evaluation_llm_model")
+                force_llm_generation = bool(one.get("force_llm_generation"))
                 llm_instance_generation, resolved_llm_model = init_generation_llm(
                     request_llm_model,
                     purpose="/bulk_evaluate generation",
                 )
-                logger.info("[設定] 生成LLM=%s（評価用LLMはGPT-OSS固定）", resolved_llm_model)
+                logger.info(
+                    "[設定] 生成LLM=%s / 評価LLM=%s / 再生成フラグ=%s",
+                    resolved_llm_model,
+                    evaluation_llm_model or DEFAULT_LLM_NAME,
+                    force_llm_generation,
+                )
 
                 # セマンティックチャンキングが選択されている場合の情報メッセージ
                 if "semantic" in chunk_methods:
@@ -275,16 +423,20 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
 
                 # chunk_method/chunk_size/chunk_overlapごとに完全に独立して処理
                 for i, chunk_method in enumerate(chunk_methods):
+                    job_start_time = _tnow()
                     try:
+                        _check_cancel()
                         logger.info("[進捗] チャンク方法 '%s' の処理を開始...", chunk_method)
 
                         # セマンティックチャンキングの場合、チャンクサイズとオーバーラップは無視する
                         if chunk_method == "semantic":
                             if not embedding_model:
+                                duration_seconds = _tnow() - job_start_time
                                 results.append(
                                     {
                                         "error": "セマンティックチャンキングにはembedding_modelの指定が必須です",
                                         "chunk_method": chunk_method,
+                                        "duration_seconds": duration_seconds,
                                     },
                                 )
                                 continue
@@ -509,7 +661,11 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         pred_answers: list[str] = []
 
                         # PDFアップロード時の回答が揃っていれば使い回し（高速化）
-                        if answers and len(answers) == len(questions):
+                        if (
+                            answers
+                            and len(answers) == len(questions)
+                            and not force_llm_generation
+                        ):
                             logger.info(
                                 "[進捗] PDFアップロード時の回答を使用（%d個の回答）",
                                 len(answers),
@@ -518,6 +674,7 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
 
                             async def get_context_only(q: str) -> list[str]:
                                 async with semaphore:
+                                    _check_cancel()
                                     retrieved_docs = await asyncio.to_thread(
                                         retriever.get_relevant_documents,
                                         q,
@@ -538,6 +695,7 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
 
                             async def get_context_and_answer(q: str) -> tuple[list[str], str]:
                                 async with semaphore:  # セマフォで並列処理数を制限
+                                    _check_cancel()
                                     retrieved_docs = await asyncio.to_thread(
                                         retriever.get_relevant_documents,
                                         q,
@@ -601,6 +759,7 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                             logger.info("[進捗] RAG回答生成完了。評価処理を開始...")
 
                         # RAGAS等で自動評価
+                        _check_cancel()
                         logger.info("[進捗] 評価メトリクスの計算を開始...")
 
                         dataset_dict = {
@@ -613,7 +772,7 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         dataset_dict_with_ref["reference"] = answers
                         dataset = Dataset.from_dict(dataset_dict_with_ref)
 
-                        llm_instance_eval = get_llm("gpt-oss")
+                        llm_instance_eval = get_llm_eval(evaluation_llm_model)
                         ragas_llm = RAGASLLMAsyncAdapter(llm_instance_eval)
 
                         metric_defs = [
@@ -630,7 +789,7 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                                 continue
                             selected_metric_defs.append((name, metric))
                         metrics_local = [
-                            _copy.deepcopy(m) for _, m in selected_metric_defs
+                            deepcopy(m) for _, m in selected_metric_defs
                         ]
                         for m in metrics_local:
                             if hasattr(m, "llm"):
@@ -904,6 +1063,7 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         )
                         response_dict: dict[str, Any] = {
                             "embedding_model": embedding_model,
+                            "llm_model": resolved_llm_model,
                             "chunk_size": (
                                 chunk_size_val if chunk_method != "semantic" else None
                             ),
@@ -918,6 +1078,9 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                             "num_chunks": num_chunks,
                             "avg_chunk_len": avg_chunk_len,
                             "metrics": metrics_per_qa,
+                            "force_llm_generation": force_llm_generation,
+                            "evaluation_llm_model": evaluation_llm_model
+                            or DEFAULT_LLM_NAME,
                         }
 
                         for metric_name, metric_value in metrics_avg.items():
@@ -933,20 +1096,25 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                             if k not in response_dict:
                                 response_dict[k] = 0.0
 
+                        duration_seconds = _tnow() - job_start_time
                         logger.info(
-                            "[進捗] チャンク方法 '%s' の処理が完了しました。スコア: %.4f",
+                            "[進捗] チャンク方法 '%s' の処理が完了しました。スコア: %.4f 所要時間: %.2fs",
                             chunk_method,
                             overall_score,
+                            duration_seconds,
                         )
+                        response_dict["duration_seconds"] = duration_seconds
                         results.append(response_dict)
                     except Exception as e:  # noqa: BLE001
                         import traceback
 
                         error_detail = traceback.format_exc()
+                        duration_seconds = _tnow() - job_start_time
                         logger.error(
-                            "[エラー] チャンク方法 '%s' の処理中にエラーが発生しました: %s",
+                            "[エラー] チャンク方法 '%s' の処理中にエラーが発生しました: %s (%.2fs)",
                             chunk_method,
                             e,
+                            duration_seconds,
                         )
                         logger.debug(error_detail)
                         results.append(
@@ -955,6 +1123,7 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                                 "chunk_method": chunk_method,
                                 "error_detail": error_detail,
                                 "input_data": one,
+                                "duration_seconds": duration_seconds,
                             },
                         )
 
@@ -964,6 +1133,15 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                 )
                 return results
             except Exception as e:  # noqa: BLE001
+                # ユーザーキャンセルは上位に伝播させる
+                try:
+                    from . import evaluation_job_service as eval_job_service  # 遅延インポート
+
+                    if isinstance(e, eval_job_service.BulkJobCancelled):
+                        raise
+                except Exception:  # noqa: BLE001
+                    pass
+
                 import traceback
 
                 error_detail = traceback.format_exc()
@@ -1016,8 +1194,12 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         one = d
                         if not isinstance(one, dict):
                             one = find_first_dict(one)
+                        # 設定ごとの処理開始前にもキャンセル要求を確認
+                        _check_cancel()
                         res = await evaluate_one_bulk(one)
                         results_all[index] = res
+                        # 評価処理が完了した直後にもキャンセル要求を確認
+                        _check_cancel()
                         logger.info(
                             "[進捗] データ %d/%d の処理が完了しました",
                             index + 1,
@@ -1028,6 +1210,15 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                             },
                         )
                 except Exception as e:  # noqa: BLE001
+                    # ユーザーキャンセルは上位に伝播させる
+                    try:
+                        from . import evaluation_job_service as eval_job_service  # 遅延インポート
+
+                        if isinstance(e, eval_job_service.BulkJobCancelled):
+                            raise
+                    except Exception:  # noqa: BLE001
+                        pass
+
                     import traceback
 
                     error_detail = traceback.format_exc()
@@ -1075,11 +1266,11 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                 len(results_all),
                 extra={"component": "evaluation", "endpoint": "bulk_evaluate"},
             )
-            # 1件目を代表として実験結果を保存（従来仕様を踏襲）
-            first = data[0] if data and isinstance(data[0], dict) else {}
+            # 実験全体の設定概要を保存
+            experiment_params = _summarize_bulk_request([d for d in data if isinstance(d, dict)])
             persist_experiment_results(
-                pdf_file_id=first.get("file_id"),
-                request_params=first,
+                pdf_file_id=experiment_params.get("file_id") or (data[0].get("file_id") if data and isinstance(data[0], dict) else None),
+                request_params=experiment_params or (data[0] if data and isinstance(data[0], dict) else {}),
                 results=results_all,
             )
             return results_all
@@ -1103,6 +1294,15 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
         return result
 
     except Exception as e:  # noqa: BLE001
+        # ユーザーキャンセルはワーカー側で専用ステータスとして扱うため、そのまま再送出する
+        try:
+            from . import evaluation_job_service as eval_job_service  # 遅延インポート
+
+            if isinstance(e, eval_job_service.BulkJobCancelled):
+                raise
+        except Exception:  # noqa: BLE001
+            pass
+
         # 異常時も辞書を直接返す
         import traceback
 

@@ -29,6 +29,11 @@ class BulkJobStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     ERROR = "error"
+    CANCELLED = "cancelled"
+
+
+class BulkJobCancelled(Exception):
+    """一括評価ジョブのユーザーキャンセルを表す内部例外。"""
 
 
 @dataclass
@@ -171,6 +176,90 @@ def get_bulk_job(job_id: str) -> Optional[BulkJobState]:
         return _BULK_JOBS.get(job_id)
 
 
+def request_cancel_bulk_job(job_id: str) -> dict[str, Any]:
+    """指定された一括評価ジョブにキャンセルフラグを立てる。"""
+    from .main import jst_now_str  # 遅延インポート
+
+    # まずメモリ上のジョブ状態を確認
+    with _BULK_JOBS_LOCK:
+        job = _BULK_JOBS.get(job_id)
+        if not job:
+            # メモリ上にジョブが無い場合は、DB上の状態のみ確認する
+            try:
+                with engine.connect() as conn:
+                    row = (
+                        conn.execute(
+                            text(
+                                """
+                                SELECT status
+                                FROM evaluation_jobs
+                                WHERE job_id = :job_id
+                                """
+                            ),
+                            {"job_id": job_id},
+                        )
+                        .mappings()
+                        .first()
+                    )
+                if not row:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="指定されたジョブIDは存在しません。",
+                    )
+                status_str = str(row["status"]).lower()
+                if status_str in {"completed", "error", "cancelled"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="このジョブは既に完了または終了しています。",
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    "[%s][ERROR] request_cancel_bulk_job DB確認中にエラー: %s",
+                    jst_now_str(),
+                    e,
+                    extra={"job_id": job_id},
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="ジョブキャンセル処理中にサーバエラーが発生しました。",
+                ) from e
+
+            # メモリ上にワーカーが存在しない（=すでに実行終了 or プロセス再起動）のため、実質キャンセル不可
+            raise HTTPException(
+                status_code=400,
+                detail="このジョブは現在実行中ではないためキャンセルできません。",
+            )
+
+        if job.status in {BulkJobStatus.COMPLETED, BulkJobStatus.ERROR}:
+            raise HTTPException(
+                status_code=400,
+                detail="このジョブは既に完了または終了しています。",
+            )
+
+        job.cancel_requested = True
+        job.updated_at = time.time()
+
+    _db_update_bulk_job(
+        job_id,
+        cancel_requested=True,
+        progress="キャンセル要求を受け付けました。安全な停止を待機しています…",
+    )
+
+    logger.info(
+        "[%s][INFO] bulk_job にキャンセル要求を登録しました: job_id=%s",
+        jst_now_str(),
+        job_id,
+        extra={"job_id": job_id, "component": "evaluation", "endpoint": "bulk_job"},
+    )
+    return {
+        "job_id": job_id,
+        "status": job.status.value,
+        "cancel_requested": True,
+    }
+
+
 def set_bulk_job(job: BulkJobState) -> None:
     with _BULK_JOBS_LOCK:
         _BULK_JOBS[job.job_id] = job
@@ -233,6 +322,26 @@ def start_bulk_job(*, payload: Any) -> dict:
             )
             logger.info(
                 "[%s][INFO] bulk_job 完了: job_id=%s",
+                jst_now_str(),
+                job_id,
+                extra={"job_id": job_id, "component": "evaluation", "endpoint": "bulk_job"},
+            )
+        except BulkJobCancelled:
+            # ユーザーによるキャンセル
+            with _BULK_JOBS_LOCK:
+                current = _BULK_JOBS.get(job_id)
+                if not current:
+                    return
+                current.status = BulkJobStatus.CANCELLED
+                current.error = "ユーザーによりキャンセルされました。"
+                current.updated_at = time.time()
+            _db_update_bulk_job(
+                job_id,
+                status=BulkJobStatus.CANCELLED,
+                error="ユーザーによりキャンセルされました。",
+            )
+            logger.info(
+                "[%s][INFO] bulk_job はユーザーによりキャンセルされました: job_id=%s",
                 jst_now_str(),
                 job_id,
                 extra={"job_id": job_id, "component": "evaluation", "endpoint": "bulk_job"},

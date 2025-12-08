@@ -2,23 +2,76 @@ models:
   - name: gpt-oss
     type: ollama
     category: "LLM"
+    backend_model: "gpt-oss:20b"
     display_name: "GPT-OSS 20B (Ollama)"
     description: "Ollamaで実行されるGPT-OSS 20Bモデル。オープンソースの大規模言語モデルで、高性能な推論が可能です。"
   - name: gpt-oss-20b-cloud
     type: ollama
     category: "LLM"
+    backend_model: "gpt-oss:20b-cloud"
     display_name: "GPT-OSS 20B Cloud (Ollama Cloud)"
     description: "Ollama Cloudで実行されるGPT-OSS 20Bモデル。大規模パラメータ版をクラウドGPUで利用します。利用前にホストで `ollama signin` と `ollama pull gpt-oss:20b-cloud` を実行してください。"
   - name: gpt-oss-120b-cloud
     type: ollama
     category: "LLM"
+    backend_model: "gpt-oss:120b-cloud"
     display_name: "GPT-OSS 120B Cloud (Ollama Cloud)"
     description: "Ollama Cloudで実行されるGPT-OSS 120Bモデル。より高性能な推論が可能です。利用前にホストで `ollama signin` と `ollama pull gpt-oss:120b-cloud` を実行してください。"
+  - name: mistral
+    type: ollama
+    category: "LLM"
+    display_name: "Mistral 7B (Ollama)"
+    description: "Ollamaで実行されるMistral 7Bモデル。日本語を含む多言語テキストの要約や質問応答など、汎用タスクに適した中規模モデルです。利用前にホストで `ollama pull mistral` を実行してください。"
   - name: llama3
     type: ollama
     category: "LLM"
     display_name: "Llama3 (Ollama)"
     description: "Ollamaで実行されるLlama3モデル。日本語対応が優秀な大規模言語モデルです。"
+  - name: llama3.1:8b-instruct
+    type: ollama
+    category: "LLM"
+    display_name: "Llama 3.1 8B Instruct (Ollama)"
+    description: "Ollamaで実行されるLlama 3.1 8B指示チューニングモデル。日本語を含む多言語に対応し、中規模ながら高品質な推論が可能です。"
+  - name: qwen2.5:7b-instruct
+    type: ollama
+    category: "LLM"
+    display_name: "Qwen2.5 7B Instruct (Ollama)"
+    description: "Ollamaで実行されるQwen2.5 7B指示チューニングモデル。アジア言語を含む多言語に強く、日本語の質問応答にも適しています。"
+  - name: gemma2:9b-instruct
+    type: ollama
+    category: "LLM"
+    display_name: "Gemma2 9B Instruct (Ollama)"
+    description: "Ollamaで実行されるGemma2 9Bモデル。日本語を含む多言語テキストに対して、推論精度と速度のバランスが良いモデルです。"
+  - name: phi3:mini-4k-instruct
+    type: ollama
+    category: "LLM"
+    display_name: "Phi-3 Mini 4K Instruct (Ollama)"
+    description: "Ollamaで実行される軽量なPhi-3 Mini 4K指示チューニングモデル。メモリ消費が小さく、日本語を含む簡単なタスクに適しています。"
+  - name: neural-chat:7b-v3.3
+    type: ollama
+    category: "LLM"
+    display_name: "Neural Chat 7B v3.3 (Ollama)"
+    description: "Ollamaで実行されるNeural Chat 7B v3.3会話特化モデル。日本語のカジュアルな対話や補助的な説明生成に向いています。"
+  - name: llm-jp-13b-v2:latest
+    type: ollama
+    category: "LLM"
+    display_name: "LLM-JP 13B v2 (Ollama)"
+    description: "日本語特化のLLM-JP 13B v2モデル。日本語テキストの要約や質問応答に適したローカル向け中〜大規模モデルです。利用前にホストで `ollama pull llm-jp-13b-v2:latest` を実行してください。"
+  - name: llama2:7b
+    type: ollama
+    category: "LLM"
+    display_name: "Llama2 7B (Ollama)"
+    description: "Ollamaで実行されるLlama2 7Bモデル。主に英語向けの軽量モデルですが、日本語もある程度扱えます。リソースが限られた環境でのテキスト生成や実験用に適しています。利用前にホストで `ollama pull llama2:7b` を実行してください。"
+  - name: deepseek-r1:8b
+    type: ollama
+    category: "LLM"
+    display_name: "DeepSeek R1 8B (Ollama)"
+    description: "Ollamaで実行されるDeepSeek R1 8Bモデル。思考過程を含む出力に強い推論特化モデルで、日本語を含む多言語タスクにも利用できます。利用前にホストで `ollama pull deepseek-r1:8b` を実行してください。"
+  - name: deepseek-r1:14b
+    type: ollama
+    category: "LLM"
+    display_name: "DeepSeek R1 14B (Ollama)"
+    description: "Ollamaで実行されるDeepSeek R1 14Bモデル。8B版よりも高精度な推論が可能な中〜大規模モデルで、日本語RAGや高度な推論タスク向けです。利用前にホストで `ollama pull deepseek-r1:14b` を実行してください。"
   - name: gpt-4o
     type: openai
     category: "LLM"
@@ -29,6 +82,90 @@ models:
     category: "LLM"
     display_name: "GPT-4o-mini (OpenAI)"
     description: "OpenAIのGPT-4o-miniモデル。高品質な応答を提供します。"
+  - name: qwen3-coder:480b-cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "qwen3-coder:480b-cloud"
+    display_name: "Qwen3-Coder 480B Cloud (Ollama Cloud)"
+    description: "Alibaba製の長文・コーディング特化LLM。クラウドGPUで動作するため、事前に `ollama signin` と `ollama pull qwen3-coder:480b-cloud` を実行してください。"
+  - name: qwen3-vl:235b-cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "qwen3-vl:235b-cloud"
+    display_name: "Qwen3-VL 235B Cloud (Ollama Cloud)"
+    description: "ビジョン・言語統合型の大規模モデル。画像+テキスト入力に対応します。クラウド利用前に `ollama pull qwen3-vl:235b-cloud` を行ってください。"
+  - name: qwen3-vl:235b-instruct-cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "qwen3-vl:235b-instruct-cloud"
+    display_name: "Qwen3-VL 235B Instruct Cloud (Ollama Cloud)"
+    description: "指示最適化版Qwen3-VL。マルチモーダル指示応答に向きます。`ollama pull qwen3-vl:235b-instruct-cloud` が必要です。"
+  - name: glm-4.6:cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "glm-4.6:cloud"
+    display_name: "GLM-4.6 Cloud (Ollama Cloud)"
+    description: "Agentic・推論・コーディング性能を高めたGLM-4.6。クラウドで 200K トークンまで扱えます。`ollama pull glm-4.6:cloud` を実行してください。"
+  - name: deepseek-v3.1:671b-cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "deepseek-v3.1:671b-cloud"
+    display_name: "DeepSeek V3.1 671B Cloud (Ollama Cloud)"
+    description: "DeepSeek-V3.1 Terminusのクラウド版。thinking / non-thinking モードを切替可能です。`ollama pull deepseek-v3.1:671b-cloud` で取得できます。"
+  - name: minimax-m2:cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "minimax-m2:cloud"
+    display_name: "MiniMax M2 Cloud (Ollama Cloud)"
+    description: "MiniMax社のエージェント・コーディング向けLLM。200Kコンテキスト対応。`ollama pull minimax-m2:cloud` を実行してください。"
+  - name: gemini-3-pro-preview:cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "gemini-3-pro-preview:latest"
+    display_name: "Gemini 3 Pro Preview Cloud (Ollama Cloud)"
+    description: "Google Gemini 3 Proのプレビュー版。多モーダル・高精度推論向け。`ollama pull gemini-3-pro-preview:cloud` を行ってください。"
+  - name: kimi-k2:cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "kimi-k2:cloud"
+    display_name: "Kimi K2 Cloud (Ollama Cloud)"
+    description: "Moonshot AIのMoEモデルKimi K2。マルチリンガルな指示応答に適しています。`ollama pull kimi-k2:cloud` が必要です。"
+  - name: kimi-k2-thinking:cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "kimi-k2-thinking:cloud"
+    display_name: "Kimi K2 Thinking Cloud (Ollama Cloud)"
+    description: "Kimi K2の思考最適化版。Chain-of-Thoughtが必要な場面に向きます。`ollama pull kimi-k2-thinking:cloud` を実行してください。"
+  - name: cogito-2.1:cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "cogito-2.1:cloud"
+    display_name: "Cogito 2.1 Cloud (Ollama Cloud)"
+    description: "Cogito v2.1 指示チューニングLLM (MIT License)。`ollama pull cogito-2.1:cloud` で利用可能です。"
+  - name: mistral-large-3:cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "mistral-large-3:cloud"
+    display_name: "Mistral Large 3 Cloud (Ollama Cloud)"
+    description: "Mistralの最新MoE大規模モデル。マルチモーダル・エンタープライズ用途向け。`ollama pull mistral-large-3:cloud` を実行してください。"
+  - name: ministral-3:3b-cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "ministral-3:3b-cloud"
+    display_name: "Ministral 3B Cloud (Ollama Cloud)"
+    description: "Ministral 3シリーズの3Bクラウド版。軽量ながら多言語・画像入力対応。`ollama pull ministral-3:3b-cloud` を実行してください。"
+  - name: ministral-3:8b-cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "ministral-3:8b-cloud"
+    display_name: "Ministral 8B Cloud (Ollama Cloud)"
+    description: "Ministral 3シリーズの8Bクラウド版。256Kコンテキスト・マルチモーダル対応。`ollama pull ministral-3:8b-cloud` が必要です。"
+  - name: ministral-3:14b-cloud
+    type: ollama
+    category: "LLM"
+    backend_model: "ministral-3:14b-cloud"
+    display_name: "Ministral 14B Cloud (Ollama Cloud)"
+    description: "Ministral 3シリーズ最大構成のクラウド版。高精度RAGやエージェント用途に。`ollama pull ministral-3:14b-cloud` を実行してください。"
   # --- 日本語/多言語対応のEmbeddingモデルのみ ---
   - name: text-embedding-3-small
     type: openai
@@ -80,6 +217,21 @@ models:
     category: "Embedding"
     display_name: "Snowflake Arctic Embed 2 (Ollama)"
     description: "Snowflakeの多言語対応埋め込みモデル Arctic Embed 2.0。日本語を含む多言語テキスト検索に適した高品質なベクトル表現を提供します。利用前にホストで `ollama pull snowflake-arctic-embed2` を実行してください。"
+  - name: all-minilm
+    type: ollama
+    category: "Embedding"
+    display_name: "all-MiniLM (Ollama)"
+    description: "多言語対応の軽量 sentence embedding モデル。日本語を含むテキストの類似度計算に利用できます。利用前にホストで `ollama pull all-minilm` を実行してください。"
+  - name: nomic-embed-text
+    type: ollama
+    category: "Embedding"
+    display_name: "Nomic Embed Text (Ollama)"
+    description: "Nomic社の汎用テキスト埋め込みモデル。多言語テキスト検索向けで、日本語もある程度取り扱えます。利用前にホストで `ollama pull nomic-embed-text` を実行してください。"
+  - name: mxbai-embed-large:335m
+    type: ollama
+    category: "Embedding"
+    display_name: "MXBAI Embed Large 335M (Ollama)"
+    description: "高精度な大規模埋め込みモデル。主に英語向けですが、日本語も動作します。品質検証用の候補として利用前にホストで `ollama pull mxbai-embed-large:335m` を実行してください。"
 
   # --- HuggingFace: Jina Embeddings v4 ---
   - name: jina-embeddings-v4

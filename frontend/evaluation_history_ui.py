@@ -24,6 +24,22 @@ def _create_label(row: pd.Series) -> str:
     return chunk_strategy or "unknown"
 
 
+def _format_seconds(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "-"
+    try:
+        seconds = float(seconds)
+    except Exception:  # noqa: BLE001
+        return "-"
+    if seconds < 60:
+        return f"{seconds:.1f} 秒"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.1f} 分"
+    hours = minutes / 60
+    return f"{hours:.1f} 時間"
+
+
 def _plot_overlap_comparison_for_history(results_df: pd.DataFrame, key_prefix: str = "") -> None:
     """一括評価タブと同様のオーバーラップ比較グラフを描画する."""
     required_columns = [
@@ -173,9 +189,11 @@ def _render_bulk_style_charts(results_df: pd.DataFrame, key_prefix: str = "") ->
 
     df = results_df.copy()
 
-    # embedding_model 列が存在しない場合はダミー値で補完し、グラフ描画時の KeyError を防ぐ
+    # embedding_model / llm_model 列が存在しない場合はダミー値で補完し、グラフ描画時の KeyError を防ぐ
     if "embedding_model" not in df.columns:
         df["embedding_model"] = "unknown"
+    if "llm_model" not in df.columns:
+        df["llm_model"] = "unknown"
 
     if "chunk_strategy" not in df.columns and "chunk_method" in df.columns:
         df["chunk_strategy"] = df["chunk_method"]
@@ -199,6 +217,10 @@ def _render_bulk_style_charts(results_df: pd.DataFrame, key_prefix: str = "") ->
         df["avg_chunk_len"] = 0
 
     df["label"] = df.apply(_create_label, axis=1)
+    df["model_pair"] = df.apply(
+        lambda row: f"{row.get('embedding_model', 'unknown')} / {row.get('llm_model', 'unknown')}",
+        axis=1,
+    )
 
     # ビューモードの選択（簡易 / 詳細）
     view_mode = st.radio(
@@ -250,8 +272,8 @@ def _render_bulk_style_charts(results_df: pd.DataFrame, key_prefix: str = "") ->
             if subset.empty:
                 continue
             fig = go.Figure()
-            for model in subset["embedding_model"].dropna().unique():
-                model_df = subset[subset["embedding_model"] == model]
+            for model in subset["model_pair"].dropna().unique():
+                model_df = subset[subset["model_pair"] == model]
                 if model_df.empty:
                     continue
                 r_values = [
@@ -277,7 +299,7 @@ def _render_bulk_style_charts(results_df: pd.DataFrame, key_prefix: str = "") ->
 
     if {"num_chunks", "avg_chunk_len", "overall_score"}.issubset(df.columns):
         st.write("### バブルチャート (チャンク分布)")
-        for model, model_data in df.groupby("embedding_model"):
+        for model, model_data in df.groupby("model_pair"):
             if model_data.empty:
                 continue
             plot_data = model_data.copy()
@@ -297,6 +319,8 @@ def _render_bulk_style_charts(results_df: pd.DataFrame, key_prefix: str = "") ->
                     "num_chunks": True,
                     "avg_chunk_len": ":.1f",
                     "overall_score": ".3f",
+                    "llm_model": True,
+                    "embedding_model": True,
                 },
                 labels={
                     "num_chunks": "チャンク数",
@@ -477,7 +501,18 @@ def show_evaluation_history(backend_url: str):
                         return {}
 
                     params_series = display_df['parameters'].apply(_parse_params)
-                    display_df['llm_model'] = params_series.apply(lambda d: d.get('llm_model'))
+                    display_df['param_llm_model'] = params_series.apply(lambda d: d.get('llm_model'))
+                    display_df['param_eval_llm_model'] = params_series.apply(lambda d: d.get('evaluation_llm_model'))
+                    display_df['param_force_llm_generation'] = params_series.apply(lambda d: d.get('force_llm_generation'))
+                    if 'llm_models' in display_df.columns:
+                        display_df['llm_model'] = display_df['llm_models']
+                    else:
+                        display_df['llm_model'] = display_df.get('param_llm_model')
+                    if 'evaluation_llm_models' in display_df.columns:
+                        display_df['evaluation_llm_model'] = display_df['evaluation_llm_models']
+                    else:
+                        display_df['evaluation_llm_model'] = display_df.get('param_eval_llm_model')
+                    display_df['force_llm_generation'] = display_df.get('param_force_llm_generation')
 
                 # チャンクサイズ / オーバーラップは experiment_results 側の集約値から範囲表現を生成
                 def _format_range(min_val: Any, max_val: Any) -> str | None:
@@ -511,18 +546,13 @@ def show_evaluation_history(backend_url: str):
                 display_columns = [
                     'created_date',
                     'created_at',
-                    'id',
-                    'experiment_name',
-                    'file_name',
-                    'pdf_file_id',
-                    'status',
                     'total_combinations',
                     'completed_combinations',
+                    'total_elapsed_seconds',
+                    'avg_job_duration_seconds',
                     'llm_model',
-                    'embedding_models',
-                    'chunk_methods',
-                    'chunk_size_range',
-                    'chunk_overlap_range',
+                    'evaluation_llm_model',
+                    'force_llm_generation',
                 ]
                 available_columns = [col for col in display_columns if col in display_df.columns]
 
@@ -533,6 +563,10 @@ def show_evaluation_history(backend_url: str):
                     column_config={
                         "created_date": "作成日",
                         "created_at": "作成日時",
+                        "total_combinations": "総ジョブ数",
+                        "completed_combinations": "完了ジョブ数",
+                        "total_elapsed_seconds": "合計処理時間 (秒)",
+                        "avg_job_duration_seconds": "平均ジョブ時間 (秒)",
                         "id": "実験ID",
                         "experiment_name": "実験名",
                         "file_name": "ファイル名",
@@ -545,6 +579,9 @@ def show_evaluation_history(backend_url: str):
                         "chunk_methods": "チャンク方式",
                         "chunk_size_range": "チャンクサイズ",
                         "chunk_overlap_range": "オーバーラップサイズ",
+                        "evaluation_llm_model": "評価LLM",
+                        "force_llm_generation": "再生成フラグ",
+                        "llm_model": "生成LLM",
                     }
                 )
 
@@ -553,6 +590,7 @@ def show_evaluation_history(backend_url: str):
                     for date_value in sorted(filtered_df['created_date'].dropna().unique(), reverse=True):
                         per_day_df = display_df[display_df['created_date'] == date_value]
                         with st.expander(f"{date_value} の実験 ({len(per_day_df)} 件)", expanded=(selected_date == date_value)):
+                            st.write(f"**{date_value} の実験 ({len(per_day_df)} 件)**")
                             st.dataframe(
                                 per_day_df[available_columns],
                                 use_container_width=True
@@ -570,6 +608,7 @@ def show_evaluation_history(backend_url: str):
                     selected_exp_name_series = detail_df_source.loc[detail_df_source['id'] == selected_exp_id, 'experiment_name']
                     selected_exp_name = selected_exp_name_series.iloc[0] if not selected_exp_name_series.empty else "unknown"
                     key_safe_exp_name = str(selected_exp_name).replace(" ", "_") if selected_exp_name else "unknown"
+                    selected_exp_record = detail_df_source.loc[detail_df_source['id'] == selected_exp_id].iloc[0].to_dict()
 
                     # この実験に紐づくPDF ID を取得し、他タブへのショートカットを提供
                     pdf_id_series = detail_df_source.loc[detail_df_source['id'] == selected_exp_id, 'pdf_file_id']
@@ -598,6 +637,59 @@ def show_evaluation_history(backend_url: str):
                                 st.info(
                                     "RAGAS一括評価タブでこのPDFがデフォルト選択されます。上部の『RAGAS一括評価』タブを開いてください。"
                                 )
+
+                    # 所要時間サマリー
+                    total_elapsed = selected_exp_record.get("total_elapsed_seconds")
+                    avg_job_duration = selected_exp_record.get("avg_job_duration_seconds")
+                    total_jobs = selected_exp_record.get("total_combinations")
+                    completed_jobs = selected_exp_record.get("completed_combinations")
+                    summary_cols = st.columns(3)
+                    with summary_cols[0]:
+                        st.metric("合計処理時間", _format_seconds(total_elapsed))
+                    with summary_cols[1]:
+                        st.metric("平均ジョブ時間", _format_seconds(avg_job_duration))
+                    with summary_cols[2]:
+                        st.metric("完了ジョブ数", f"{completed_jobs}/{total_jobs}" if completed_jobs is not None else "-")
+
+                    st.write("**評価設定**")
+                    eval_cols = st.columns(2)
+                    selected_eval_llm = selected_exp_record.get("evaluation_llm_model") or selected_exp_record.get("param_eval_llm_model")
+                    with eval_cols[0]:
+                        st.metric("RAGAS評価LLM", selected_eval_llm or "-")
+                    with eval_cols[1]:
+                        flag = selected_exp_record.get("force_llm_generation")
+                        st.metric("LLM再生成モード", "ON" if flag else "OFF")
+
+                    duration_summary = selected_exp_record.get("duration_summary")
+                    if isinstance(duration_summary, str):
+                        try:
+                            duration_summary = json.loads(duration_summary)
+                        except Exception:  # noqa: BLE001
+                            duration_summary = None
+                    if isinstance(duration_summary, dict):
+                        st.write("**処理時間サマリー (モデル別)**")
+                        dur_tabs = st.tabs(["LLM", "Embedding", "チャンク方式", "チャンク戦略"])
+
+                        def _show_duration_table(tab_idx: int, data_key: str, label: str) -> None:
+                            data_dict = duration_summary.get(data_key) if isinstance(duration_summary, dict) else {}
+                            if not isinstance(data_dict, dict) or not data_dict:
+                                with dur_tabs[tab_idx]:
+                                    st.info(f"{label} の処理時間データはありません。")
+                                return
+                            rows = [{"name": k, "total_seconds": float(v)} for k, v in data_dict.items()]
+                            df = pd.DataFrame(rows)
+                            df["total_minutes"] = df["total_seconds"] / 60.0
+                            df = df.sort_values("total_seconds", ascending=False)
+                            with dur_tabs[tab_idx]:
+                                st.dataframe(
+                                    df.rename(columns={"name": label}),
+                                    use_container_width=True,
+                                )
+
+                        _show_duration_table(0, "llm_models", "LLMモデル")
+                        _show_duration_table(1, "embedding_models", "Embeddingモデル")
+                        _show_duration_table(2, "chunk_methods", "チャンク方式")
+                        _show_duration_table(3, "chunk_strategies", "チャンク戦略")
 
                     # 実験結果を取得
                     try:
@@ -651,6 +743,8 @@ def show_evaluation_history(backend_url: str):
                                     'id',  # experiment_results.id
                                     'experiment_id',
                                     'embedding_model',
+                                    'llm_model',
+                                    'evaluation_llm_model',
                                     'chunk_strategy',
                                     'chunk_size',
                                     'chunk_overlap',
@@ -663,6 +757,7 @@ def show_evaluation_history(backend_url: str):
                                     'context_precision',
                                     'answer_correctness',
                                     'answer_similarity',
+                                    'duration_seconds',
                                     'status',
                                     'error_message',
                                 ]
@@ -673,7 +768,7 @@ def show_evaluation_history(backend_url: str):
                                 # --- CSVエクスポート用のフィルタ＆ダウンロード ---
                                 with st.expander("この実験の結果をCSVダウンロード", expanded=False):
                                     export_df = result_df.copy()
-                                    col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+                                    col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns(5)
 
                                     # Embeddingモデルでフィルタ
                                     if 'embedding_model' in export_df.columns:
@@ -759,6 +854,26 @@ def show_evaluation_history(backend_url: str):
                                             if selected_ovs:
                                                 export_df = export_df[export_df['chunk_overlap'].isin(selected_ovs)]
 
+                                    # LLMモデルでフィルタ
+                                    if 'llm_model' in export_df.columns:
+                                        with col_f5:
+                                            llm_choices = (
+                                                export_df['llm_model']
+                                                .dropna()
+                                                .astype(str)
+                                                .unique()
+                                                .tolist()
+                                            )
+                                            llm_choices = sorted(llm_choices)
+                                            selected_llms = st.multiselect(
+                                                "LLMモデル",
+                                                llm_choices,
+                                                default=llm_choices,
+                                                key=f"csv_llm_{selected_exp_id}",
+                                            )
+                                            if selected_llms:
+                                                export_df = export_df[export_df['llm_model'].astype(str).isin(selected_llms)]
+
                                     st.caption(f"CSV対象レコード数: {len(export_df)} 件")
                                     if available_result_columns and not export_df.empty:
                                         csv_bytes = export_df[available_result_columns].to_csv(index=False).encode("utf-8-sig")
@@ -776,6 +891,48 @@ def show_evaluation_history(backend_url: str):
                                         result_df[available_result_columns],
                                         use_container_width=True
                                     )
+
+                                if 'duration_seconds' in result_df.columns and result_df['duration_seconds'].notna().any():
+                                    st.write("**処理時間の可視化**")
+                                    duration_df = result_df[['llm_model', 'embedding_model', 'chunk_strategy', 'duration_seconds']].copy()
+                                    duration_df['duration_seconds'] = duration_df['duration_seconds'].fillna(0.0)
+                                    dur_cols = st.columns(2)
+                                    with dur_cols[0]:
+                                        llm_duration = (
+                                            duration_df.groupby('llm_model')['duration_seconds']
+                                            .mean()
+                                            .reset_index()
+                                            .sort_values('duration_seconds', ascending=False)
+                                        )
+                                        if not llm_duration.empty:
+                                            fig_llm_duration = px.bar(
+                                                llm_duration,
+                                                x='llm_model',
+                                                y='duration_seconds',
+                                                title="LLM別 平均ジョブ時間",
+                                                labels={'llm_model': 'LLMモデル', 'duration_seconds': '秒'},
+                                            )
+                                            st.plotly_chart(fig_llm_duration, use_container_width=True, key=f"duration_llm_{selected_exp_id}")
+                                        else:
+                                            st.info("LLM別の処理時間データが不足しています。")
+                                    with dur_cols[1]:
+                                        chunk_duration = (
+                                            duration_df.groupby('chunk_strategy')['duration_seconds']
+                                            .mean()
+                                            .reset_index()
+                                            .sort_values('duration_seconds', ascending=False)
+                                        )
+                                        if not chunk_duration.empty:
+                                            fig_chunk_duration = px.bar(
+                                                chunk_duration,
+                                                x='chunk_strategy',
+                                                y='duration_seconds',
+                                                title="チャンク戦略別 平均ジョブ時間",
+                                                labels={'chunk_strategy': 'チャンク戦略', 'duration_seconds': '秒'},
+                                            )
+                                            st.plotly_chart(fig_chunk_duration, use_container_width=True, key=f"duration_chunk_{selected_exp_id}")
+                                        else:
+                                            st.info("チャンク戦略別の処理時間データが不足しています。")
 
                                 metrics_cols = [
                                     'overall_score',
@@ -795,14 +952,195 @@ def show_evaluation_history(backend_url: str):
                                 if available_metrics:
                                     st.write("**評価指標**")
                                     st.dataframe(
-                                        metrics_source_df[['embedding_model', 'chunk_strategy'] + available_metrics],
+                                        metrics_source_df[['embedding_model', 'llm_model', 'chunk_strategy'] + available_metrics],
                                         use_container_width=True
                                     )
 
+                                    # LLM / Embedding 単位の平均比較
+                                    if {"llm_model", "embedding_model"}.issubset(metrics_source_df.columns):
+                                        st.write("**LLM / Embedding別 平均スコア比較**")
+                                        llm_summary = (
+                                            metrics_source_df.groupby("llm_model")[available_metrics]
+                                            .mean()
+                                            .reset_index()
+                                        )
+                                        embedding_summary = (
+                                            metrics_source_df.groupby("embedding_model")[available_metrics]
+                                            .mean()
+                                            .reset_index()
+                                        )
+
+                                        col_llm_summary, col_emb_summary = st.columns(2)
+                                        with col_llm_summary:
+                                            st.caption("LLMごとの平均スコア")
+                                            st.dataframe(llm_summary, use_container_width=True)
+                                        with col_emb_summary:
+                                            st.caption("Embeddingごとの平均スコア")
+                                            st.dataframe(embedding_summary, use_container_width=True)
+
+                                        chart_cols = st.columns(2)
+                                        with chart_cols[0]:
+                                            if not llm_summary.empty:
+                                                metric_llm = st.selectbox(
+                                                    "LLM別バーチャート指標",
+                                                    options=[m for m in available_metrics if m in llm_summary.columns],
+                                                    index=0,
+                                                    key=f"llm_bar_metric_{selected_exp_id}",
+                                                )
+                                                if metric_llm:
+                                                    llm_plot_df = llm_summary.sort_values(metric_llm, ascending=False)
+                                                    fig_llm_bar = px.bar(
+                                                        llm_plot_df,
+                                                        x="llm_model",
+                                                        y=metric_llm,
+                                                        title=f"{metric_llm} のLLM別平均スコア",
+                                                        labels={"llm_model": "LLMモデル", metric_llm: "スコア"},
+                                                    )
+                                                    fig_llm_bar.update_layout(height=380)
+                                                    st.plotly_chart(
+                                                        fig_llm_bar,
+                                                        use_container_width=True,
+                                                        key=f"llm_metric_bar_{selected_exp_id}",
+                                                    )
+                                        with chart_cols[1]:
+                                            if not embedding_summary.empty:
+                                                metric_emb = st.selectbox(
+                                                    "Embedding別バーチャート指標",
+                                                    options=[m for m in available_metrics if m in embedding_summary.columns],
+                                                    index=0,
+                                                    key=f"embedding_bar_metric_{selected_exp_id}",
+                                                )
+                                                if metric_emb:
+                                                    emb_plot_df = embedding_summary.sort_values(metric_emb, ascending=False)
+                                                    fig_emb_bar = px.bar(
+                                                        emb_plot_df,
+                                                        x="embedding_model",
+                                                        y=metric_emb,
+                                                        title=f"{metric_emb} のEmbedding別平均スコア",
+                                                        labels={"embedding_model": "Embeddingモデル", metric_emb: "スコア"},
+                                                    )
+                                                    fig_emb_bar.update_layout(height=380)
+                                                    st.plotly_chart(
+                                                        fig_emb_bar,
+                                                        use_container_width=True,
+                                                        key=f"embedding_metric_bar_{selected_exp_id}",
+                                                    )
+
+                                        combo_summary = (
+                                            metrics_source_df.groupby(["llm_model", "embedding_model"])[available_metrics]
+                                            .mean()
+                                            .reset_index()
+                                        )
+                                        st.caption("LLM × Embedding 組み合わせ平均")
+                                        st.dataframe(combo_summary, use_container_width=True)
+
+                                        selected_metric = st.selectbox(
+                                            "棒グラフで確認する指標 (LLM × Embedding)",
+                                            options=available_metrics,
+                                            index=0,
+                                            key=f"llm_emb_heatmap_metric_{selected_exp_id}",
+                                        )
+                                        if selected_metric in combo_summary.columns:
+                                            bar_llm_emb = px.bar(
+                                                combo_summary,
+                                                x="embedding_model",
+                                                y=selected_metric,
+                                                color="llm_model",
+                                                barmode="group",
+                                                title=f"{selected_metric} のLLM×Embedding比較",
+                                                labels={"embedding_model": "Embeddingモデル", "llm_model": "LLMモデル", selected_metric: "スコア"},
+                                            )
+                                            st.plotly_chart(
+                                                bar_llm_emb,
+                                                use_container_width=True,
+                                                key=f"llm_emb_bar_{selected_exp_id}",
+                                            )
+
+                                    # チャンク戦略別の平均スコア（モデル別）
+                                    if "chunk_strategy" in metrics_source_df.columns:
+                                        st.write("**チャンク戦略別 平均スコア (モデル別)**")
+                                        chunk_summary = (
+                                            metrics_source_df.groupby("chunk_strategy")[available_metrics]
+                                            .mean()
+                                            .reset_index()
+                                        )
+                                        st.caption("チャンク戦略全体の平均")
+                                        st.dataframe(chunk_summary, use_container_width=True)
+
+                                        if "llm_model" in metrics_source_df.columns:
+                                            chunk_llm_summary = (
+                                                metrics_source_df.groupby(["chunk_strategy", "llm_model"])[available_metrics]
+                                                .mean()
+                                                .reset_index()
+                                            )
+                                            st.caption("チャンク戦略 × LLM 平均")
+                                            st.dataframe(chunk_llm_summary, use_container_width=True)
+
+                                            selected_metric_chunk_llm = st.selectbox(
+                                                "LLM×チャンク戦略の棒グラフ指標",
+                                                options=available_metrics,
+                                                index=0,
+                                                key=f"chunk_llm_heatmap_metric_{selected_exp_id}",
+                                            )
+                                            if selected_metric_chunk_llm in chunk_llm_summary.columns:
+                                                fig_chunk_llm = px.bar(
+                                                    chunk_llm_summary,
+                                                    x="chunk_strategy",
+                                                    y=selected_metric_chunk_llm,
+                                                    color="llm_model",
+                                                    barmode="group",
+                                                    title=f"{selected_metric_chunk_llm} のLLM×チャンク戦略比較",
+                                                    labels={
+                                                        "chunk_strategy": "チャンク戦略",
+                                                        "llm_model": "LLMモデル",
+                                                        selected_metric_chunk_llm: "スコア",
+                                                    },
+                                                )
+                                                st.plotly_chart(
+                                                    fig_chunk_llm,
+                                                    use_container_width=True,
+                                                    key=f"chunk_llm_bar_{selected_exp_id}",
+                                                )
+
+                                        if "embedding_model" in metrics_source_df.columns:
+                                            chunk_emb_summary = (
+                                                metrics_source_df.groupby(["chunk_strategy", "embedding_model"])[available_metrics]
+                                                .mean()
+                                                .reset_index()
+                                            )
+                                            st.caption("チャンク戦略 × Embedding 平均")
+                                            st.dataframe(chunk_emb_summary, use_container_width=True)
+
+                                            selected_metric_chunk_emb = st.selectbox(
+                                                "Embedding×チャンク戦略の棒グラフ指標",
+                                                options=available_metrics,
+                                                index=0,
+                                                key=f"chunk_emb_heatmap_metric_{selected_exp_id}",
+                                            )
+                                            if selected_metric_chunk_emb in chunk_emb_summary.columns:
+                                                fig_chunk_emb = px.bar(
+                                                    chunk_emb_summary,
+                                                    x="chunk_strategy",
+                                                    y=selected_metric_chunk_emb,
+                                                    color="embedding_model",
+                                                    barmode="group",
+                                                    title=f"{selected_metric_chunk_emb} のEmbedding×チャンク戦略比較",
+                                                    labels={
+                                                        "chunk_strategy": "チャンク戦略",
+                                                        "embedding_model": "Embeddingモデル",
+                                                        selected_metric_chunk_emb: "スコア",
+                                                    },
+                                                )
+                                                st.plotly_chart(
+                                                    fig_chunk_emb,
+                                                    use_container_width=True,
+                                                    key=f"chunk_emb_bar_{selected_exp_id}",
+                                                )
+
                                     # グラフ用にメトリクスを整形（組み合わせごとに棒グラフ表示）
-                                    chart_df = metrics_source_df[['embedding_model', 'chunk_strategy'] + available_metrics].copy()
+                                    chart_df = metrics_source_df[['embedding_model', 'llm_model', 'chunk_strategy'] + available_metrics].copy()
                                     chart_df['combination'] = chart_df.apply(
-                                        lambda row: f"{row.get('embedding_model', 'unknown')} / {row.get('chunk_strategy', 'unknown')}",
+                                        lambda row: f"{row.get('embedding_model', 'unknown')} × {row.get('llm_model', 'unknown')} / {row.get('chunk_strategy', 'unknown')}",
                                         axis=1
                                     )
                                     metric_chart = chart_df.melt(

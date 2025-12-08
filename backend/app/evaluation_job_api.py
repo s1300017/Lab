@@ -4,7 +4,11 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from .evaluation_job_service import start_bulk_job, get_bulk_job_status
+from .evaluation_job_service import (
+    start_bulk_job,
+    get_bulk_job_status,
+    request_cancel_bulk_job,
+)
 
 
 router = APIRouter()
@@ -23,3 +27,10 @@ def bulk_job_status(job_id: str) -> dict[str, Any]:
     """一括評価ジョブの状態を取得するAPI。"""
 
     return get_bulk_job_status(job_id)
+
+
+@router.post("/bulk_job/cancel/{job_id}")
+def bulk_job_cancel(job_id: str) -> dict[str, Any]:
+    """一括評価ジョブのキャンセルを要求するAPI。"""
+
+    return request_cancel_bulk_job(job_id)

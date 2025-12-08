@@ -342,7 +342,33 @@ def history_pdf_questions(file_id: str) -> JSONResponse:
                 ),
                 {"fid": file_id},
             ).fetchall()
-            items = [dict(r._mapping) for r in rows]
+            items: list[dict[str, Any]] = []
+            for r in rows:
+                record = dict(r._mapping)
+                raw_params = record.get("parameters")
+                params_dict: dict[str, Any] | None = None
+                if raw_params:
+                    try:
+                        params_dict = json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+                    except Exception:  # noqa: BLE001
+                        params_dict = None
+                if params_dict:
+                    if not record.get("llm_models"):
+                        llm_from_params = None
+                        if isinstance(params_dict.get("llm_models"), list) and params_dict["llm_models"]:
+                            llm_from_params = params_dict["llm_models"]
+                        elif params_dict.get("llm_model"):
+                            llm_from_params = [params_dict["llm_model"]]
+                        if llm_from_params:
+                            record["llm_models"] = ",".join(str(x) for x in llm_from_params if x)
+                    if not record.get("evaluation_llm_models"):
+                        eval_llm = params_dict.get("evaluation_llm_model")
+                        if eval_llm:
+                            record["evaluation_llm_models"] = str(eval_llm)
+                    record["evaluation_llm_model"] = params_dict.get("evaluation_llm_model")
+                    if "force_llm_generation" in params_dict:
+                        record["force_llm_generation"] = bool(params_dict.get("force_llm_generation"))
+                items.append(record)
             return JSONResponse(content=jsonable_encoder({"items": items}))
     except Exception as e:  # noqa: BLE001
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -465,10 +491,15 @@ def history_experiments() -> JSONResponse:
                         e.status,
                         e.total_combinations,
                         e.completed_combinations,
+                        e.total_elapsed_seconds,
+                        e.avg_job_duration_seconds,
+                        e.duration_summary,
                         e.created_at,
                         e.updated_at,
                         agg.embedding_models,
+                        agg.llm_models,
                         agg.chunk_methods,
+                        agg.evaluation_llm_models,
                         agg.min_chunk_size,
                         agg.max_chunk_size,
                         agg.min_chunk_overlap,
@@ -478,6 +509,8 @@ def history_experiments() -> JSONResponse:
                         SELECT
                             experiment_id,
                             string_agg(DISTINCT embedding_model, ',') AS embedding_models,
+                            string_agg(DISTINCT llm_model, ',') AS llm_models,
+                            string_agg(DISTINCT evaluation_llm_model, ',') AS evaluation_llm_models,
                             string_agg(
                                 DISTINCT
                                 CASE
@@ -499,7 +532,22 @@ def history_experiments() -> JSONResponse:
                     """
                 )
             ).fetchall()
-            items = [dict(r._mapping) for r in rows]
+            items: list[dict[str, Any]] = []
+            for r in rows:
+                record = dict(r._mapping)
+                if not record.get("llm_models"):
+                    raw_params = record.get("parameters")
+                    llm_from_params = None
+                    if raw_params:
+                        try:
+                            params_dict = json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+                            if isinstance(params_dict, dict):
+                                llm_from_params = params_dict.get("llm_model")
+                        except Exception:  # noqa: BLE001
+                            llm_from_params = None
+                    if llm_from_params:
+                        record["llm_models"] = str(llm_from_params)
+                items.append(record)
             return JSONResponse(content=jsonable_encoder({"items": items}))
     except Exception as e:  # noqa: BLE001
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -513,18 +561,64 @@ def history_experiment_results(experiment_id: int) -> JSONResponse:
             rows = conn.execute(
                 text(
                     """
-                    SELECT id, embedding_model, chunk_strategy, chunk_size, chunk_overlap,
-                           num_chunks, avg_chunk_len, overall_score, faithfulness,
-                           answer_relevancy, context_recall, context_precision,
-                           answer_correctness, answer_similarity, details, created_at
-                    FROM experiment_results
-                    WHERE experiment_id = :eid
-                    ORDER BY id ASC
+                    SELECT
+                        r.id,
+                        r.embedding_model,
+                        r.llm_model,
+                        r.chunk_strategy,
+                        r.chunk_size,
+                        r.chunk_overlap,
+                        r.num_chunks,
+                        r.avg_chunk_len,
+                        r.overall_score,
+                        r.faithfulness,
+                        r.answer_relevancy,
+                        r.context_recall,
+                        r.context_precision,
+                        r.answer_correctness,
+                        r.answer_similarity,
+                        r.evaluation_llm_model,
+                        r.duration_seconds,
+                        r.details,
+                        r.created_at,
+                        e.parameters
+                    FROM experiment_results AS r
+                    LEFT JOIN experiments AS e
+                        ON e.id = r.experiment_id
+                    WHERE r.experiment_id = :eid
+                    ORDER BY r.id ASC
                     """
                 ),
                 {"eid": experiment_id},
             ).fetchall()
-            items = [dict(r._mapping) for r in rows]
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                record = dict(row._mapping)
+                raw_params = record.get("parameters")
+                params_dict: dict[str, Any] | None = None
+                if raw_params:
+                    try:
+                        params_dict = json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+                    except Exception:  # noqa: BLE001
+                        params_dict = None
+
+                if not record.get("llm_model") and params_dict:
+                    llm_from_params: str | None = None
+                    if isinstance(params_dict.get("llm_models"), list) and params_dict["llm_models"]:
+                        llm_from_params = str(params_dict["llm_models"][0])
+                    elif params_dict.get("llm_model"):
+                        llm_from_params = str(params_dict.get("llm_model"))
+                    if llm_from_params:
+                        record["llm_model"] = llm_from_params
+
+                if not record.get("evaluation_llm_model") and params_dict:
+                    eval_from_params = params_dict.get("evaluation_llm_model")
+                    if eval_from_params:
+                        record["evaluation_llm_model"] = str(eval_from_params)
+                if params_dict and "force_llm_generation" in params_dict:
+                    record["force_llm_generation"] = bool(params_dict.get("force_llm_generation"))
+                record.pop("parameters", None)
+                items.append(record)
             return JSONResponse(content=jsonable_encoder({"items": items}))
     except Exception as e:  # noqa: BLE001
         return JSONResponse(status_code=500, content={"error": str(e)})

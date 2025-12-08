@@ -157,6 +157,15 @@ def persist_pdf_upload_to_db(
         logger.debug(traceback.format_exc(), extra={"file_id": file_id})
 
 
+def _safe_float(val: Any) -> float | None:
+    try:
+        if val is None:
+            return None
+        return float(val)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def persist_experiment_results(
     pdf_file_id: str | None,
     request_params: dict,
@@ -201,16 +210,49 @@ def persist_experiment_results(
         if not experiment_name:
             experiment_name = f"auto_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
+        total_duration = 0.0
+        duration_count = 0
+        duration_summary: dict[str, dict[str, float]] = {
+            "llm_models": {},
+            "embedding_models": {},
+            "chunk_methods": {},
+            "chunk_strategies": {},
+        }
+
+        def _add_duration(bucket: dict[str, float], key: Any, duration: float) -> None:
+            if not key:
+                return
+            bucket[str(key)] = bucket.get(str(key), 0.0) + duration
+
+        duration_values: list[tuple[float, dict[str, Any]]] = []
+        for res in flat_results:
+            duration_val = _safe_float(res.get("duration_seconds"))
+            if duration_val is None or duration_val < 0:
+                continue
+            duration_values.append((duration_val, res))
+            total_duration += duration_val
+            duration_count += 1
+
+            _add_duration(duration_summary["llm_models"], res.get("llm_model"), duration_val)
+            _add_duration(duration_summary["embedding_models"], res.get("embedding_model"), duration_val)
+            _add_duration(duration_summary["chunk_methods"], res.get("chunk_method"), duration_val)
+            _add_duration(duration_summary["chunk_strategies"], res.get("chunk_strategy"), duration_val)
+
+        avg_job_duration = (total_duration / duration_count) if duration_count > 0 else None
+        duration_summary_json = json.dumps(duration_summary, ensure_ascii=False) if duration_count > 0 else None
+
         with engine.begin() as conn:
             result_obj = conn.execute(
                 text(
                     """
                     INSERT INTO experiments (
                         pdf_file_id, experiment_name, parameters, status,
-                        total_combinations, completed_combinations
+                        total_combinations, completed_combinations,
+                        total_elapsed_seconds, avg_job_duration_seconds, duration_summary
                     ) VALUES (
                         :pdf_file_id, :experiment_name, :parameters, :status,
-                        :total_combinations, :completed_combinations
+                        :total_combinations, :completed_combinations,
+                        :total_elapsed_seconds, :avg_job_duration_seconds, :duration_summary
                     )
                     RETURNING id
                     """
@@ -222,6 +264,9 @@ def persist_experiment_results(
                     "status": status,
                     "total_combinations": total,
                     "completed_combinations": completed,
+                    "total_elapsed_seconds": total_duration if duration_count > 0 else None,
+                    "avg_job_duration_seconds": avg_job_duration,
+                    "duration_summary": duration_summary_json,
                 },
             )
             experiment_id = result_obj.scalar()
@@ -251,6 +296,8 @@ def persist_experiment_results(
                 row: dict[str, Any] = {
                     "experiment_id": experiment_id,
                     "embedding_model": res.get("embedding_model"),
+                    "llm_model": res.get("llm_model"),
+                    "evaluation_llm_model": res.get("evaluation_llm_model"),
                     "chunk_strategy": res.get("chunk_strategy") or res.get("chunk_method"),
                     "chunk_size": res.get("chunk_size"),
                     "chunk_overlap": res.get("chunk_overlap"),
@@ -263,6 +310,7 @@ def persist_experiment_results(
                     "context_precision": None if is_error else res.get("context_precision"),
                     "answer_correctness": None if is_error else res.get("answer_correctness"),
                     "answer_similarity": None if is_error else res.get("answer_similarity"),
+                    "duration_seconds": _safe_float(res.get("duration_seconds")),
                     "details": json.dumps(details_payload, ensure_ascii=False) if details_payload else None,
                 }
                 result_rows.append(row)
@@ -272,13 +320,13 @@ def persist_experiment_results(
                     text(
                         """
                         INSERT INTO experiment_results (
-                            experiment_id, embedding_model, chunk_strategy, chunk_size, chunk_overlap,
+                            experiment_id, embedding_model, llm_model, evaluation_llm_model, chunk_strategy, chunk_size, chunk_overlap,
                             num_chunks, avg_chunk_len, overall_score, faithfulness, answer_relevancy,
-                            context_recall, context_precision, answer_correctness, answer_similarity, details
+                            context_recall, context_precision, answer_correctness, answer_similarity, duration_seconds, details
                         ) VALUES (
-                            :experiment_id, :embedding_model, :chunk_strategy, :chunk_size, :chunk_overlap,
+                            :experiment_id, :embedding_model, :llm_model, :evaluation_llm_model, :chunk_strategy, :chunk_size, :chunk_overlap,
                             :num_chunks, :avg_chunk_len, :overall_score, :faithfulness, :answer_relevancy,
-                            :context_recall, :context_precision, :answer_correctness, :answer_similarity, :details
+                            :context_recall, :context_precision, :answer_correctness, :answer_similarity, :duration_seconds, :details
                         )
                         """
                     ),
