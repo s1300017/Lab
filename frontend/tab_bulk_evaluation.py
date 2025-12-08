@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 import base64
 import time
 import re
+import math
 import pandas as pd
 import streamlit as st
 
@@ -16,6 +17,226 @@ from model_utils import (
     fetch_llm_models as _fetch_llm_models_common,
     fetch_history_pdfs as _fetch_history_pdfs_common,
 )
+
+
+USD_TO_JPY_RATE = 150.0  # ざっくり換算
+DEFAULT_CONTEXT_TOKENS_PER_QUESTION = 900.0
+DEFAULT_OUTPUT_TOKENS_PER_QUESTION = 320.0
+MIN_OUTPUT_TOKENS_PER_QUESTION = 120.0
+DEFAULT_QUESTION_TOKENS_PER_QUESTION = 40.0
+PRICING_TIER_PREFERENCE = ["standard", "flex", "batch", "priority"]
+EMBEDDING_PRICING_TIER_PREFERENCE = ["standard", "batch"]
+DEFAULT_EMBEDDING_CHARS_PER_TOKEN = 3.6
+DEFAULT_EMBEDDING_CHUNK_SIZE = 1000
+DEFAULT_EMBEDDING_OVERLAP = 200
+DEFAULT_METHOD_CHUNK_CHAR_ESTIMATE = {
+    "sentence": 400,
+    "paragraph": 1200,
+    "semantic": 900,
+}
+
+
+def _compute_question_usage(max_pairs: int) -> int:
+    """質問モード設定から実際に使用する質問数を推定する。"""
+    if max_pairs <= 0:
+        return 0
+    question_mode = st.session_state.get("bulk_eval_question_mode", "all")
+    n_limit = st.session_state.get("bulk_eval_question_count")
+    if question_mode == "head_n":
+        if isinstance(n_limit, int) and n_limit > 0:
+            return max(1, min(n_limit, max_pairs))
+        return min(5, max_pairs)
+    return max_pairs
+
+
+def _extract_openai_pricing_per_1k(meta: Dict[str, Any]) -> Dict[str, Any] | None:
+    """models.yamlのpricing情報から1Kトークンあたりの単価を抽出する。"""
+    pricing = meta.get("pricing")
+    if not isinstance(pricing, dict):
+        return None
+
+    def _convert_tier(tier_name: str, tier_data: Dict[str, Any]) -> Dict[str, Any] | None:
+        if not isinstance(tier_data, dict):
+            return None
+        input_price = tier_data.get("input_per_m_tokens_usd")
+        output_price = tier_data.get("output_per_m_tokens_usd")
+        if input_price is None or output_price is None:
+            return None
+        cached_price = tier_data.get("cached_input_per_m_tokens_usd", input_price)
+        return {
+            "tier": tier_name,
+            "input_per_1k": float(input_price) / 1000.0,
+            "cached_input_per_1k": float(cached_price) / 1000.0,
+            "output_per_1k": float(output_price) / 1000.0,
+        }
+
+    for tier_name in PRICING_TIER_PREFERENCE:
+        if tier_name in pricing:
+            converted = _convert_tier(tier_name, pricing[tier_name])
+            if converted:
+                return converted
+
+    for tier_name, tier_data in pricing.items():
+        converted = _convert_tier(str(tier_name), tier_data)
+        if converted:
+            return converted
+    return None
+
+
+def _extract_embedding_pricing_per_1k(meta: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Embeddingモデルのpricing情報から1Kトークン単価を取得する。"""
+    pricing = meta.get("pricing")
+    if not isinstance(pricing, dict):
+        return None
+
+    for tier_name in EMBEDDING_PRICING_TIER_PREFERENCE:
+        tier_data = pricing.get(tier_name)
+        if isinstance(tier_data, dict):
+            cost = tier_data.get("cost_per_m_tokens_usd")
+            if cost is not None:
+                return {
+                    "tier": tier_name,
+                    "cost_per_1k": float(cost) / 1000.0,
+                }
+    for tier_name, tier_data in pricing.items():
+        if isinstance(tier_data, dict):
+            cost = tier_data.get("cost_per_m_tokens_usd")
+            if cost is not None:
+                return {
+                    "tier": str(tier_name),
+                    "cost_per_1k": float(cost) / 1000.0,
+                }
+    return None
+
+
+def _estimate_openai_costs(
+    model_names: List[str],
+    llm_meta_map: Dict[str, Dict[str, Any]],
+    pricing_map: Dict[str, Dict[str, Any]],
+    question_count: int,
+    purpose_label: str,
+    *,
+    context_multiplier: float = 1.0,
+    output_multiplier: float = 1.0,
+    job_multiplier: float = 1.0,
+) -> List[Dict[str, Any]]:
+    """OpenAIモデルごとの概算トークン・コストを推定する。"""
+    if question_count <= 0:
+        return []
+    effective_multiplier = max(float(job_multiplier), 1.0)
+    rows: List[Dict[str, Any]] = []
+    for model_name in model_names:
+        if not model_name:
+            continue
+        meta = llm_meta_map.get(model_name) or {}
+        provider_type = (meta.get("type") or "").lower()
+        if provider_type != "openai":
+            continue
+        pricing = pricing_map.get(model_name)
+        if not pricing:
+            continue
+        input_tokens = question_count * (
+            (DEFAULT_CONTEXT_TOKENS_PER_QUESTION * context_multiplier)
+            + DEFAULT_QUESTION_TOKENS_PER_QUESTION
+        )
+        base_output = DEFAULT_OUTPUT_TOKENS_PER_QUESTION * output_multiplier
+        output_tokens = question_count * max(MIN_OUTPUT_TOKENS_PER_QUESTION, base_output)
+        input_tokens *= effective_multiplier
+        output_tokens *= effective_multiplier
+        usd_cost = (
+            (input_tokens / 1000.0) * pricing["input_per_1k"]
+            + (output_tokens / 1000.0) * pricing["output_per_1k"]
+        )
+        rows.append(
+            {
+                "用途": purpose_label,
+                "モデル": meta.get("display_name") or model_name,
+                "料金ティア": pricing.get("tier"),
+                "推定入力トークン": int(math.ceil(input_tokens)),
+                "推定出力トークン": int(math.ceil(output_tokens)),
+                "推定コスト(USD)": round(usd_cost, 4),
+                "推定コスト(JPY)": int(round(usd_cost * USD_TO_JPY_RATE)),
+            }
+        )
+    return rows
+
+
+def _estimate_tokens_for_chunk_config(
+    total_chars: int,
+    method: str,
+    chunk_size: int | None = None,
+    overlap: int | None = None,
+) -> float:
+    """チャンク設定1種類あたりに必要なおおよそのEmbeddingトークン数を推定する。"""
+    if total_chars <= 0:
+        return 0.0
+    method_lower = (method or "").lower()
+    chars_per_token = DEFAULT_EMBEDDING_CHARS_PER_TOKEN
+    if method_lower in {"recursive", "fixed"}:
+        size = int(chunk_size or DEFAULT_EMBEDDING_CHUNK_SIZE)
+        size = max(size, 1)
+        ov = int(overlap or 0)
+        ov = max(0, min(ov, size - 1))
+        effective_chars = size - ov
+        if effective_chars <= 0:
+            effective_chars = size
+        num_chunks = max(1, math.ceil(total_chars / effective_chars))
+        tokens_per_chunk = size / chars_per_token
+        return num_chunks * tokens_per_chunk
+    approx_size = DEFAULT_METHOD_CHUNK_CHAR_ESTIMATE.get(
+        method_lower, DEFAULT_EMBEDDING_CHUNK_SIZE
+    )
+    num_chunks = max(1, math.ceil(total_chars / approx_size))
+    tokens_per_chunk = approx_size / chars_per_token
+    return num_chunks * tokens_per_chunk
+
+
+def _enumerate_embedding_chunk_tokens(
+    total_chars: int,
+    chunk_methods: List[str],
+    chunk_sizes: List[int],
+    chunk_overlaps: List[int],
+) -> List[float]:
+    """選択されたチャンク設定ごとのEmbeddingトークン推定値を列挙する。"""
+    if total_chars <= 0 or not chunk_methods:
+        return []
+
+    size_list = chunk_sizes or [DEFAULT_EMBEDDING_CHUNK_SIZE]
+    overlap_list = chunk_overlaps or [DEFAULT_EMBEDDING_OVERLAP]
+    tokens_list: List[float] = []
+    for method in chunk_methods:
+        method_lower = (method or "").lower()
+        if method_lower in {"recursive", "fixed"}:
+            for size in size_list:
+                for overlap in overlap_list:
+                    tokens_list.append(
+                        _estimate_tokens_for_chunk_config(total_chars, method_lower, size, overlap)
+                    )
+        else:
+            tokens_list.append(
+                _estimate_tokens_for_chunk_config(total_chars, method_lower)
+            )
+    return tokens_list
+
+
+def _count_chunk_combinations(
+    chunk_methods: List[str],
+    chunk_sizes: List[int],
+    chunk_overlaps: List[int],
+) -> int:
+    """チャンク方式ごとの組み合わせ数（1埋め込みあたり）を概算する。"""
+    if not chunk_methods:
+        return 1
+    size_count = len(chunk_sizes) if chunk_sizes else 1
+    overlap_count = len(chunk_overlaps) if chunk_overlaps else 1
+    total = 0
+    for method in chunk_methods:
+        m = (method or "").lower()
+        if m in {"recursive", "fixed"}:
+            total += max(size_count, 1) * max(overlap_count, 1)
+        else:
+            total += 1
+    return max(total, 1)
 
 
 def _fetch_embedding_models(BACKEND_URL: str) -> List[Dict[str, str]]:
@@ -576,15 +797,27 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 key="bulk_eval_question_count",
                 help="大きい値にするほど評価時間が長くなります。",
             )
+        question_usage = _compute_question_usage(max_pairs)
+        st.session_state["bulk_eval_question_usage"] = question_usage
 
         # RAG回答生成および評価に使用するLLMの選択
         llm_models = _fetch_llm_models(BACKEND_URL.rstrip("/"))
         selected_llm_models: List[str] = []
         selected_eval_llm: str | None = None
+        openai_llm_total_usd = 0.0
+        openai_llm_total_jpy = 0
         force_llm_generation = st.session_state.get("bulk_force_llm_generation", False)
         if llm_models:
             provider_labels = {"huggingface": "HuggingFace", "ollama": "Ollama", "openai": "OpenAI"}
             llm_names = [m.get("name", "") for m in llm_models if m.get("name")]
+            llm_meta_map = {m.get("name"): m for m in llm_models if m.get("name")}
+            openai_pricing_map: Dict[str, Dict[str, Any]] = {}
+            for name, meta in llm_meta_map.items():
+                if (meta.get("type") or "").lower() != "openai":
+                    continue
+                tier_data = _extract_openai_pricing_per_1k(meta)
+                if tier_data:
+                    openai_pricing_map[name] = tier_data
             llm_labels = {}
             for m in llm_models:
                 name = m.get("name")
@@ -610,10 +843,10 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
             if "bulk_llm_model_select" not in st.session_state:
                 st.session_state["bulk_llm_model_select"] = list(default_llm_choices)
             else:
-                current_selection = [
-                    name for name in st.session_state.get("bulk_llm_model_select", []) if name in llm_names
-                ]
-                if not current_selection and default_llm_choices:
+                previous_selection = st.session_state.get("bulk_llm_model_select", [])
+                current_selection = [name for name in previous_selection if name in llm_names]
+                if not current_selection and previous_selection and default_llm_choices:
+                    # モデル一覧更新などで既存の選択肢が無効化された場合のみデフォルトへフォールバック
                     current_selection = list(default_llm_choices)
                 st.session_state["bulk_llm_model_select"] = current_selection
 
@@ -639,16 +872,17 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
             )
             if default_eval_llm not in llm_names and llm_names:
                 default_eval_llm = llm_names[0]
-            if "bulk_eval_llm_select" not in st.session_state or st.session_state["bulk_eval_llm_select"] not in llm_names:
+            if (
+                "bulk_eval_llm_select" not in st.session_state
+                or st.session_state["bulk_eval_llm_select"] not in llm_names
+            ):
                 st.session_state["bulk_eval_llm_select"] = default_eval_llm
-            eval_select_idx = llm_names.index(st.session_state["bulk_eval_llm_select"]) if llm_names else 0
             selected_eval_llm = None
             if llm_names:
                 selected_eval_llm = st.selectbox(
                     "RAGAS評価LLM（採点者）",
                     options=llm_names,
                     format_func=lambda name: llm_labels.get(name, name),
-                    index=eval_select_idx,
                     key="bulk_eval_llm_select",
                     help="RAGASの採点で使用するLLMです。評価結果に一貫性を持たせたい場合は固定してください。",
                 )
@@ -664,8 +898,17 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
 
         # Embeddingモデルの選択（複数選択）
         embedding_models = _fetch_embedding_models(BACKEND_URL.rstrip("/"))
+        embedding_meta_map: Dict[str, Dict[str, Any]] = {}
+        embedding_pricing_map: Dict[str, Dict[str, Any]] = {}
+        openai_embedding_total_usd = 0.0
+        openai_embedding_total_jpy = 0
         if embedding_models:
             provider_labels = {"huggingface": "HuggingFace", "ollama": "Ollama", "openai": "OpenAI"}
+            embedding_meta_map = {m.get("name"): m for m in embedding_models if m.get("name")}
+            for name, meta in embedding_meta_map.items():
+                tier_data = _extract_embedding_pricing_per_1k(meta)
+                if tier_data:
+                    embedding_pricing_map[name] = tier_data
             providers = [m.get("type", "unknown") for m in embedding_models]
             unique_providers = []
             for p in providers:
@@ -813,6 +1056,97 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 help="値が高いほど意味的に近い文同士を強くまとめます。",
             )
 
+        llm_cost_rows: List[Dict[str, Any]] = []
+        question_usage = st.session_state.get("bulk_eval_question_usage", question_usage)
+        chunk_combo_multiplier = _count_chunk_combinations(
+            selected_chunk_methods,
+            chunk_sizes,
+            chunk_overlaps,
+        )
+        embedding_count = len(selected_embeddings) if selected_embeddings else 1
+        llm_job_multiplier = max(1.0, float(chunk_combo_multiplier * embedding_count))
+        if question_usage and question_usage > 0 and llm_models:
+            openai_generation_models = [
+                name
+                for name in selected_llm_models
+                if llm_meta_map.get(name, {}).get("type") == "openai"
+            ]
+            if openai_generation_models:
+                llm_cost_rows.extend(
+                    _estimate_openai_costs(
+                        openai_generation_models,
+                        llm_meta_map,
+                        openai_pricing_map,
+                        question_usage,
+                        "RAG回答生成",
+                        job_multiplier=llm_job_multiplier,
+                    )
+                )
+            if selected_eval_llm and llm_meta_map.get(selected_eval_llm, {}).get("type") == "openai":
+                llm_cost_rows.extend(
+                    _estimate_openai_costs(
+                        [selected_eval_llm],
+                        llm_meta_map,
+                        openai_pricing_map,
+                        question_usage,
+                        "RAGAS採点",
+                        context_multiplier=0.6,
+                        output_multiplier=0.5,
+                        job_multiplier=llm_job_multiplier,
+                    )
+                )
+        if llm_cost_rows:
+            cost_df = pd.DataFrame(llm_cost_rows)
+            st.caption(
+                "OpenAIモデルの概算トークン／料金（1K tokens単価, $1 ≒ ¥150, 質問数×デフォルトトークン係数×ジョブ数で算出）"
+            )
+            st.dataframe(cost_df, use_container_width=True)
+            openai_llm_total_usd = sum(row.get("推定コスト(USD)", 0.0) or 0.0 for row in llm_cost_rows)
+            openai_llm_total_jpy = sum(int(row.get("推定コスト(JPY)", 0) or 0) for row in llm_cost_rows)
+
+        embedding_cost_rows: List[Dict[str, Any]] = []
+        total_chars_for_embedding = len(eval_text or "")
+        if (
+            total_chars_for_embedding > 0
+            and selected_embeddings
+            and selected_chunk_methods
+        ):
+            chunk_tokens = _enumerate_embedding_chunk_tokens(
+                total_chars_for_embedding,
+                selected_chunk_methods,
+                chunk_sizes,
+                chunk_overlaps,
+            )
+            if chunk_tokens:
+                tokens_per_embedding = sum(chunk_tokens)
+                for emb in selected_embeddings:
+                    pricing = embedding_pricing_map.get(emb)
+                    meta = embedding_meta_map.get(emb, {}) if embedding_meta_map else {}
+                    if not pricing:
+                        continue
+                    usd_cost = (tokens_per_embedding / 1000.0) * pricing["cost_per_1k"]
+                    embedding_cost_rows.append(
+                        {
+                            "用途": "データ埋め込み",
+                            "モデル": meta.get("display_name") or emb,
+                            "料金ティア": pricing.get("tier"),
+                            "推定入力トークン": int(math.ceil(tokens_per_embedding)),
+                            "推定出力トークン": 0,
+                            "推定コスト(USD)": round(usd_cost, 4),
+                            "推定コスト(JPY)": int(round(usd_cost * USD_TO_JPY_RATE)),
+                        }
+                    )
+                    if (meta.get("type") or "").lower() == "openai":
+                        openai_embedding_total_usd += round(usd_cost, 4)
+                        openai_embedding_total_jpy += int(round(usd_cost * USD_TO_JPY_RATE))
+
+        if embedding_cost_rows:
+            embedding_cost_df = pd.DataFrame(embedding_cost_rows)
+            st.caption(
+                "Embeddingモデルの概算トークン／料金（1K tokens単価, ドキュメント長×チャンク設定から推定）"
+            )
+            st.dataframe(embedding_cost_df, use_container_width=True)
+
         include_answer_similarity = st.checkbox(
             "answer_similarity 指標も計算する (重め)",
             value=False,
@@ -881,118 +1215,124 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
         st.markdown("---")
         st.subheader("一括評価の実行")
 
+        run_blockers: List[str] = []
+        if not eval_text:
+            run_blockers.append("評価対象のテキストが読み込まれていません。")
+        if not eval_questions or not eval_answers:
+            run_blockers.append("評価用の質問と回答が揃っていません。")
+        if not selected_llm_models:
+            run_blockers.append("少なくとも1つのLLMモデルを選択してください。")
+        if not selected_embeddings:
+            run_blockers.append("少なくとも1つの埋め込みモデルを選択してください。")
+        if not selected_chunk_methods:
+            run_blockers.append("少なくとも1つのチャンク方式を選択してください。")
+        can_execute_bulk = len(run_blockers) == 0
+        if not can_execute_bulk:
+            st.info(
+                "一括評価を実行するには以下の設定を完了してください:\n- "
+                + "\n- ".join(run_blockers)
+            )
+
         # 既存ジョブがある場合は古い確認状態をクリア
         if st.session_state.get("bulk_eval_job_id"):
             st.session_state.pop("bulk_eval_confirm_payload", None)
             st.session_state.pop("bulk_eval_confirm_summary", None)
 
-        if st.button("この設定で一括評価を実行", key="run_bulk_evaluate"):
+        if st.button(
+            "この設定で一括評価を実行",
+            key="run_bulk_evaluate",
+            disabled=not can_execute_bulk,
+        ):
             # まずは現在の設定からジョブとサマリー情報だけを生成し、実際の実行は確認後に行う
-            if not eval_text or not eval_questions or not eval_answers:
+            # 質問数と回答数が揃っていない場合は短い方に揃える
+            total_q = len(eval_questions)
+            total_a = len(eval_answers)
+            max_pairs = min(total_q, total_a)
+            if max_pairs == 0:
                 st.error(
                     "評価対象のテキストまたはQ&Aが見つかりません。PDFアップロードとQA自動生成、"
                     "もしくは『履歴』タブからの復元を行ってから再試行してください。"
                 )
-            else:
-                # 質問数と回答数が揃っていない場合は短い方に揃える
-                total_q = len(eval_questions)
-                total_a = len(eval_answers)
-                max_pairs = min(total_q, total_a)
-                if max_pairs == 0:
-                    st.error(
-                        "評価対象のテキストまたはQ&Aが見つかりません。PDFアップロードとQA自動生成、"
-                        "もしくは『履歴』タブからの復元を行ってから再試行してください。"
-                    )
-                    return
-                if total_q != total_a:
-                    st.warning(
-                        f"質問数({total_q})と回答数({total_a})が一致しません。"
-                        f"評価には先頭 {max_pairs} 件のみを使用します。"
-                    )
-
-                question_mode = st.session_state.get("bulk_eval_question_mode", "all")
-                n_limit = st.session_state.get("bulk_eval_question_count")
-
-                if question_mode == "head_n" and isinstance(n_limit, int):
-                    use_n = min(max(n_limit, 1), max_pairs)
-                else:
-                    use_n = max_pairs
-
-                questions_eval = eval_questions[:use_n]
-                answers_eval = eval_answers[:use_n]
-
-                if not selected_embeddings:
-                    st.error("少なくとも1つの埋め込みモデルを選択してください。")
-                    return
-                if not selected_llm_models:
-                    st.error("少なくとも1つのLLMモデルを選択してください。")
-                    return
-                if not selected_chunk_methods:
-                    st.error("少なくとも1つのチャンク方式を選択してください。")
-                    return
-
-                # Embedding × チャンク方式 × サイズ × オーバーラップ の組み合わせでジョブを生成
-                jobs: List[Dict[str, Any]] = []
-                file_id = st.session_state.get("file_id")
-
-                eval_llm_for_job = selected_eval_llm or (
-                    selected_llm_models[0] if selected_llm_models else None
+                return
+            if total_q != total_a:
+                st.warning(
+                    f"質問数({total_q})と回答数({total_a})が一致しません。"
+                    f"評価には先頭 {max_pairs} 件のみを使用します。"
                 )
-                for llm_model in selected_llm_models:
-                    for emb in selected_embeddings:
-                        for method in selected_chunk_methods:
-                            if method == "semantic":
-                                job: Dict[str, Any] = {
-                                    "llm_model": llm_model,
-                                    "evaluation_llm_model": eval_llm_for_job,
-                                    "embedding_model": emb,
-                                    "chunk_methods": [method],
-                                    "text": eval_text,
-                                    "questions": questions_eval,
-                                    "answers": answers_eval,
-                                    "include_answer_similarity": include_answer_similarity,
-                                    "force_llm_generation": force_llm_generation,
-                                    "semantic_params": {
-                                        "similarity_threshold": float(similarity_threshold)
-                                    },
-                                }
-                                if file_id:
-                                    job["file_id"] = file_id
-                                jobs.append(job)
-                            elif method in ("sentence", "paragraph"):
-                                job = {
-                                    "llm_model": llm_model,
-                                    "evaluation_llm_model": eval_llm_for_job,
-                                    "embedding_model": emb,
-                                    "chunk_methods": [method],
-                                    "text": eval_text,
-                                    "questions": questions_eval,
-                                    "answers": answers_eval,
-                                    "include_answer_similarity": include_answer_similarity,
-                                    "force_llm_generation": force_llm_generation,
-                                }
-                                if file_id:
-                                    job["file_id"] = file_id
-                                jobs.append(job)
-                            else:
-                                for size in chunk_sizes:
-                                    for ov in chunk_overlaps:
-                                        job = {
-                                            "llm_model": llm_model,
-                                            "evaluation_llm_model": eval_llm_for_job,
-                                            "embedding_model": emb,
-                                            "chunk_methods": [method],
-                                            "chunk_sizes": [int(size)],
-                                            "chunk_overlaps": [int(ov)],
-                                            "text": eval_text,
-                                            "questions": questions_eval,
-                                            "answers": answers_eval,
-                                            "include_answer_similarity": include_answer_similarity,
-                                            "force_llm_generation": force_llm_generation,
-                                        }
-                                        if file_id:
-                                            job["file_id"] = file_id
-                                        jobs.append(job)
+
+            question_mode = st.session_state.get("bulk_eval_question_mode", "all")
+            n_limit = st.session_state.get("bulk_eval_question_count")
+
+            if question_mode == "head_n" and isinstance(n_limit, int):
+                use_n = min(max(n_limit, 1), max_pairs)
+            else:
+                use_n = max_pairs
+
+            questions_eval = eval_questions[:use_n]
+            answers_eval = eval_answers[:use_n]
+
+            # Embedding × チャンク方式 × サイズ × オーバーラップ の組み合わせでジョブを生成
+            jobs: List[Dict[str, Any]] = []
+            file_id = st.session_state.get("file_id")
+
+            eval_llm_for_job = selected_eval_llm or (
+                selected_llm_models[0] if selected_llm_models else None
+            )
+            for llm_model in selected_llm_models:
+                for emb in selected_embeddings:
+                    for method in selected_chunk_methods:
+                        if method == "semantic":
+                            job: Dict[str, Any] = {
+                                "llm_model": llm_model,
+                                "evaluation_llm_model": eval_llm_for_job,
+                                "embedding_model": emb,
+                                "chunk_methods": [method],
+                                "text": eval_text,
+                                "questions": questions_eval,
+                                "answers": answers_eval,
+                                "include_answer_similarity": include_answer_similarity,
+                                "force_llm_generation": force_llm_generation,
+                                "semantic_params": {
+                                    "similarity_threshold": float(similarity_threshold)
+                                },
+                            }
+                            if file_id:
+                                job["file_id"] = file_id
+                            jobs.append(job)
+                        elif method in ("sentence", "paragraph"):
+                            job = {
+                                "llm_model": llm_model,
+                                "evaluation_llm_model": eval_llm_for_job,
+                                "embedding_model": emb,
+                                "chunk_methods": [method],
+                                "text": eval_text,
+                                "questions": questions_eval,
+                                "answers": answers_eval,
+                                "include_answer_similarity": include_answer_similarity,
+                                "force_llm_generation": force_llm_generation,
+                            }
+                            if file_id:
+                                job["file_id"] = file_id
+                            jobs.append(job)
+                        else:
+                            for size in chunk_sizes:
+                                for ov in chunk_overlaps:
+                                    job = {
+                                        "llm_model": llm_model,
+                                        "evaluation_llm_model": eval_llm_for_job,
+                                        "embedding_model": emb,
+                                        "chunk_methods": [method],
+                                        "chunk_sizes": [int(size)],
+                                        "chunk_overlaps": [int(ov)],
+                                        "text": eval_text,
+                                        "questions": questions_eval,
+                                        "answers": answers_eval,
+                                        "include_answer_similarity": include_answer_similarity,
+                                        "force_llm_generation": force_llm_generation,
+                                    }
+                                    if file_id:
+                                        job["file_id"] = file_id
+                                    jobs.append(job)
 
                 if not jobs:
                     st.error("有効な評価ジョブが生成できませんでした。設定を見直してください。")
@@ -1033,6 +1373,36 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                 }
                 st.session_state["bulk_eval_confirm_payload"] = payload
                 st.session_state["bulk_eval_confirm_summary"] = summary
+
+        openai_total_usd = openai_llm_total_usd + openai_embedding_total_usd
+        openai_total_jpy = openai_llm_total_jpy + openai_embedding_total_jpy
+        if openai_total_usd > 0 or openai_total_jpy > 0:
+            summary_rows = []
+            if openai_llm_total_usd > 0:
+                summary_rows.append(
+                    {
+                        "区分": "LLM（生成＋採点）",
+                        "概算コスト(USD)": round(openai_llm_total_usd, 4),
+                        "概算コスト(JPY)": openai_llm_total_jpy,
+                    }
+                )
+            if openai_embedding_total_usd > 0:
+                summary_rows.append(
+                    {
+                        "区分": "Embedding",
+                        "概算コスト(USD)": round(openai_embedding_total_usd, 4),
+                        "概算コスト(JPY)": openai_embedding_total_jpy,
+                    }
+                )
+            summary_rows.append(
+                {
+                    "区分": "合計",
+                    "概算コスト(USD)": round(openai_total_usd, 4),
+                    "概算コスト(JPY)": openai_total_jpy,
+                }
+            )
+            st.caption("OpenAIモデル選択時の概算コスト合計（LLM + Embedding）")
+            st.table(pd.DataFrame(summary_rows))
 
         # 実行前の確認セクション（簡易モーダル的なUI）
         confirm_payload: Any = st.session_state.get("bulk_eval_confirm_payload")

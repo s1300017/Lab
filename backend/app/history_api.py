@@ -60,6 +60,67 @@ def history_pdf_files() -> JSONResponse:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@router.get("/history/pdf-files/chunk-status")
+def history_pdf_chunk_status(pdf_file_id: str | None = None) -> JSONResponse:
+    """指定PDFまたは全体のチャンク有無を返す。"""
+
+    try:
+        with engine.begin() as conn:
+            if pdf_file_id:
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT COUNT(*) FROM pdf_chunks
+                        WHERE pdf_file_id = :fid
+                        """
+                    ),
+                    {"fid": pdf_file_id},
+                ).fetchone()
+                chunk_count = int(row[0]) if row else 0
+                return JSONResponse(
+                    content=jsonable_encoder(
+                        {
+                            "pdf_file_id": pdf_file_id,
+                            "chunk_count": chunk_count,
+                            "has_chunks": chunk_count > 0,
+                        }
+                    )
+                )
+
+            row_distinct = conn.execute(
+                text(
+                    """
+                    SELECT COUNT(DISTINCT pdf_file_id)
+                    FROM pdf_chunks
+                    WHERE pdf_file_id IS NOT NULL
+                    """
+                ),
+            ).fetchone()
+            num_pdfs_with_chunks = int(row_distinct[0]) if row_distinct else 0
+
+            row_total = conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*) FROM pdf_chunks
+                    """
+                ),
+            ).fetchone()
+            total_chunks = int(row_total[0]) if row_total else 0
+
+            return JSONResponse(
+                content=jsonable_encoder(
+                    {
+                        "pdf_file_id": None,
+                        "chunk_count": total_chunks,
+                        "num_pdfs_with_chunks": num_pdfs_with_chunks,
+                        "has_chunks": total_chunks > 0,
+                    }
+                )
+            )
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @router.get("/history/jobs/errors")
 def history_failed_jobs(limit: int = 50) -> JSONResponse:
     """最近の失敗ジョブ（upload_jobs / evaluation_jobs）を返す。

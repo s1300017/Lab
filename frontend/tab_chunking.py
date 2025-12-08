@@ -140,6 +140,7 @@ def render_chunking_tab(
             # 現在のLLMモデルとあわせて永続化（LLMは既存の選択をそのまま利用）
             current_llm = st.session_state.get("llm_model", "gpt-oss")
             _persist_model_selection(BACKEND_URL, current_llm, selected_global_emb)
+            st.caption(f"現在のRAG/チャンキング用Embeddingモデル: {current_emb}")
 
         # --- 対象PDFの選択 ---
         history_pdfs = _fetch_history_pdfs(BACKEND_URL)

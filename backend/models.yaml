@@ -72,16 +72,229 @@ models:
     category: "LLM"
     display_name: "DeepSeek R1 14B (Ollama)"
     description: "Ollamaで実行されるDeepSeek R1 14Bモデル。8B版よりも高精度な推論が可能な中〜大規模モデルで、日本語RAGや高度な推論タスク向けです。利用前にホストで `ollama pull deepseek-r1:14b` を実行してください。"
+  - name: gpt-5.1
+    type: openai
+    category: "LLM"
+    display_name: "GPT-5.1 (OpenAI)"
+    description: "最新世代のフラッグシップモデル。高度な推論とエージェントタスクに最適です。"
+    pricing:
+      batch:
+        input_per_m_tokens_usd: 0.625
+        cached_input_per_m_tokens_usd: 0.0625
+        output_per_m_tokens_usd: 5.0
+      flex:
+        input_per_m_tokens_usd: 0.625
+        cached_input_per_m_tokens_usd: 0.0625
+        output_per_m_tokens_usd: 5.0
+      standard:
+        input_per_m_tokens_usd: 1.25
+        cached_input_per_m_tokens_usd: 0.125
+        output_per_m_tokens_usd: 10.0
+      priority:
+        input_per_m_tokens_usd: 2.5
+        cached_input_per_m_tokens_usd: 0.25
+        output_per_m_tokens_usd: 20.0
+  - name: gpt-5
+    type: openai
+    category: "LLM"
+    display_name: "GPT-5 (OpenAI)"
+    description: "GPT-5.1に次ぐ高性能モデル。推論・コーディング用途に対応します。"
+    pricing:
+      batch:
+        input_per_m_tokens_usd: 0.625
+        cached_input_per_m_tokens_usd: 0.0625
+        output_per_m_tokens_usd: 5.0
+      flex:
+        input_per_m_tokens_usd: 0.625
+        cached_input_per_m_tokens_usd: 0.0625
+        output_per_m_tokens_usd: 5.0
+      standard:
+        input_per_m_tokens_usd: 1.25
+        cached_input_per_m_tokens_usd: 0.125
+        output_per_m_tokens_usd: 10.0
+      priority:
+        input_per_m_tokens_usd: 2.5
+        cached_input_per_m_tokens_usd: 0.25
+        output_per_m_tokens_usd: 20.0
+  - name: gpt-5-mini
+    type: openai
+    category: "LLM"
+    display_name: "GPT-5 mini (OpenAI)"
+    description: "GPT-5系の高速・低コスト版。日常的なタスクに適します。"
+    pricing:
+      batch:
+        input_per_m_tokens_usd: 0.125
+        cached_input_per_m_tokens_usd: 0.0125
+        output_per_m_tokens_usd: 1.0
+      flex:
+        input_per_m_tokens_usd: 0.125
+        cached_input_per_m_tokens_usd: 0.0125
+        output_per_m_tokens_usd: 1.0
+      standard:
+        input_per_m_tokens_usd: 0.25
+        cached_input_per_m_tokens_usd: 0.025
+        output_per_m_tokens_usd: 2.0
+      priority:
+        input_per_m_tokens_usd: 0.45
+        cached_input_per_m_tokens_usd: 0.045
+        output_per_m_tokens_usd: 3.6
+  - name: gpt-5-nano
+    type: openai
+    category: "LLM"
+    display_name: "GPT-5 nano (OpenAI)"
+    description: "GPT-5系で最も安価かつ低レイテンシなモデル。軽量タスク向け。"
+    pricing:
+      batch:
+        input_per_m_tokens_usd: 0.025
+        cached_input_per_m_tokens_usd: 0.0025
+        output_per_m_tokens_usd: 0.2
+      flex:
+        input_per_m_tokens_usd: 0.025
+        cached_input_per_m_tokens_usd: 0.0025
+        output_per_m_tokens_usd: 0.2
+      standard:
+        input_per_m_tokens_usd: 0.05
+        cached_input_per_m_tokens_usd: 0.005
+        output_per_m_tokens_usd: 0.4
+  - name: gpt-5-pro
+    type: openai
+    category: "LLM"
+    display_name: "GPT-5 Pro (OpenAI)"
+    description: "より大きなコンピュートを割り当てた高精度モデル。"
+    pricing:
+      batch:
+        input_per_m_tokens_usd: 7.5
+        output_per_m_tokens_usd: 60.0
+      standard:
+        input_per_m_tokens_usd: 15.0
+        output_per_m_tokens_usd: 120.0
+  - name: gpt-4.1
+    type: openai
+    category: "LLM"
+    display_name: "GPT-4.1 (OpenAI)"
+    description: "非推論系で最も賢いモデル。RAG用途でも高精度です。"
+    pricing:
+      batch:
+        input_per_m_tokens_usd: 1.0
+        output_per_m_tokens_usd: 4.0
+      standard:
+        input_per_m_tokens_usd: 2.0
+        cached_input_per_m_tokens_usd: 0.5
+        output_per_m_tokens_usd: 8.0
+      priority:
+        input_per_m_tokens_usd: 3.5
+        cached_input_per_m_tokens_usd: 0.875
+        output_per_m_tokens_usd: 14.0
+  - name: gpt-4.1-mini
+    type: openai
+    category: "LLM"
+    display_name: "GPT-4.1 mini (OpenAI)"
+    description: "GPT-4.1の小型・高速版。"
+    pricing:
+      batch:
+        input_per_m_tokens_usd: 0.2
+        output_per_m_tokens_usd: 0.8
+      standard:
+        input_per_m_tokens_usd: 0.4
+        cached_input_per_m_tokens_usd: 0.1
+        output_per_m_tokens_usd: 1.6
+      priority:
+        input_per_m_tokens_usd: 0.7
+        cached_input_per_m_tokens_usd: 0.175
+        output_per_m_tokens_usd: 2.8
+  - name: gpt-4.1-nano
+    type: openai
+    category: "LLM"
+    display_name: "GPT-4.1 nano (OpenAI)"
+    description: "GPT-4.1系の最小構成。"
+    pricing:
+      batch:
+        input_per_m_tokens_usd: 0.05
+        output_per_m_tokens_usd: 0.2
+      standard:
+        input_per_m_tokens_usd: 0.1
+        cached_input_per_m_tokens_usd: 0.025
+        output_per_m_tokens_usd: 0.4
+      priority:
+        input_per_m_tokens_usd: 0.2
+        cached_input_per_m_tokens_usd: 0.05
+        output_per_m_tokens_usd: 0.8
   - name: gpt-4o
     type: openai
     category: "LLM"
     display_name: "GPT-4o (OpenAI)"
-    description: "OpenAIの最新のGPT-4oモデル。非常に高品質な応答を提供します。"
+    description: "汎用で高速なGPT-4oモデル。"
+    pricing:
+      batch:
+        input_per_m_tokens_usd: 2.5
+        output_per_m_tokens_usd: 7.5
+      standard:
+        input_per_m_tokens_usd: 2.5
+        cached_input_per_m_tokens_usd: 1.25
+        output_per_m_tokens_usd: 10.0
+      priority:
+        input_per_m_tokens_usd: 4.25
+        cached_input_per_m_tokens_usd: 2.125
+        output_per_m_tokens_usd: 17.0
   - name: gpt-4o-mini
     type: openai
     category: "LLM"
-    display_name: "GPT-4o-mini (OpenAI)"
-    description: "OpenAIのGPT-4o-miniモデル。高品質な応答を提供します。"
+    display_name: "GPT-4o mini (OpenAI)"
+    description: "GPT-4oの小型・低コスト版。"
+    pricing:
+      batch:
+        input_per_m_tokens_usd: 0.075
+        output_per_m_tokens_usd: 0.3
+      standard:
+        input_per_m_tokens_usd: 0.15
+        cached_input_per_m_tokens_usd: 0.075
+        output_per_m_tokens_usd: 0.6
+      priority:
+        input_per_m_tokens_usd: 0.25
+        cached_input_per_m_tokens_usd: 0.125
+        output_per_m_tokens_usd: 1.0
+  - name: o4-mini
+    type: openai
+    category: "LLM"
+    display_name: "o4-mini (OpenAI)"
+    description: "高速・低コストな推論モデル。"
+    pricing:
+      batch:
+        input_per_m_tokens_usd: 0.55
+        output_per_m_tokens_usd: 2.2
+      flex:
+        input_per_m_tokens_usd: 0.55
+        cached_input_per_m_tokens_usd: 0.138
+        output_per_m_tokens_usd: 2.2
+      standard:
+        input_per_m_tokens_usd: 1.1
+        cached_input_per_m_tokens_usd: 0.275
+        output_per_m_tokens_usd: 4.4
+      priority:
+        input_per_m_tokens_usd: 2.0
+        cached_input_per_m_tokens_usd: 0.5
+        output_per_m_tokens_usd: 8.0
+  - name: o3
+    type: openai
+    category: "LLM"
+    display_name: "o3 (OpenAI)"
+    description: "複雑な推論タスク向けのoシリーズモデル。"
+    pricing:
+      batch:
+        input_per_m_tokens_usd: 1.0
+        output_per_m_tokens_usd: 4.0
+      flex:
+        input_per_m_tokens_usd: 1.0
+        cached_input_per_m_tokens_usd: 0.25
+        output_per_m_tokens_usd: 4.0
+      standard:
+        input_per_m_tokens_usd: 2.0
+        cached_input_per_m_tokens_usd: 0.5
+        output_per_m_tokens_usd: 8.0
+      priority:
+        input_per_m_tokens_usd: 3.5
+        cached_input_per_m_tokens_usd: 0.875
+        output_per_m_tokens_usd: 14.0
   - name: qwen3-coder:480b-cloud
     type: ollama
     category: "LLM"
@@ -172,16 +385,21 @@ models:
     category: "Embedding"
     display_name: "OpenAI text-embedding-3-small"
     description: "OpenAIの最新の多言語対応埋め込みモデル（小規模）。日本語を含む多言語テキストに対応し、高効率な埋め込みを提供します。"
+    pricing:
+      standard:
+        cost_per_m_tokens_usd: 0.02
+      batch:
+        cost_per_m_tokens_usd: 0.01
   - name: text-embedding-3-large
     type: openai
     category: "Embedding"
     display_name: "OpenAI text-embedding-3-large"
     description: "OpenAIの最新の多言語対応埋め込みモデル（大規模）。日本語テキストに対しても高精度な埋め込みを提供します。"
-  - name: text-embedding-ada-002
-    type: openai
-    category: "Embedding"
-    display_name: "OpenAI text-embedding-ada-002"
-    description: "OpenAIの多言語対応埋め込みモデル。日本語を含む多言語テキストに広く利用されています。"
+    pricing:
+      standard:
+        cost_per_m_tokens_usd: 0.13
+      batch:
+        cost_per_m_tokens_usd: 0.065
 
   - name: huggingface_paraphrase_multilingual
     type: huggingface

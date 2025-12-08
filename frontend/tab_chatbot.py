@@ -12,6 +12,21 @@ from http_client import http_get, http_post, format_http_error
 from model_utils import fetch_model_lists, fetch_history_pdfs
 
 
+def _fetch_chunk_status(BACKEND_URL: str, pdf_file_id: str | None = None) -> Dict[str, Any] | None:
+    """チャンク存在状況を取得するヘルパー。"""
+    try:
+        url = f"{BACKEND_URL.rstrip('/')}/history/pdf-files/chunk-status"
+        if pdf_file_id:
+            url = f"{url}?pdf_file_id={pdf_file_id}"
+        resp = http_get(url)
+        if resp.status_code == 200:
+            return resp.json()
+        st.warning(f"チャンク状態の取得に失敗しました: {resp.status_code} {resp.text}")
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"チャンク状態の取得中にエラーが発生しました: {e}")
+    return None
+
+
 def _fetch_models(BACKEND_URL: str) -> tuple[list[dict], list[dict]]:
     """バックエンドの /list_models からLLM/Embeddingモデル一覧を取得する。
 
@@ -60,8 +75,8 @@ def render_chatbot_tab(
     with tab:
         st.header("チャットボット")
 
-        # --- チャット用LLM / Embeddingモデルの選択 ---
-        llm_models, embedding_models = _fetch_models(BACKEND_URL.rstrip("/"))
+        # --- チャット用LLMの選択（Embeddingは共通設定を参照） ---
+        llm_models, _ = _fetch_models(BACKEND_URL.rstrip("/"))
 
         # LLMモデル選択
         selected_llm_name = (
@@ -92,29 +107,9 @@ def render_chatbot_tab(
         st.session_state.chat_model = selected_llm_name
         st.session_state.llm_model = selected_llm_name
 
-        # Embeddingモデル選択
+        # Embeddingモデルは共通設定（チャンキング/一括評価タブ）だけで管理
         selected_emb_name = st.session_state.get("embedding_model", "huggingface_bge_small")
-        if embedding_models:
-            emb_names = [m.get("name", "") for m in embedding_models]
-            emb_labels: list[str] = []
-            for m in embedding_models:
-                provider = m.get("type") or "unknown"
-                display = m.get("display_name") or m.get("name") or "unknown"
-                emb_labels.append(f"[{provider}] {display}")
-            if selected_emb_name in emb_names:
-                default_emb_idx = emb_names.index(selected_emb_name)
-            else:
-                default_emb_idx = 0
-                selected_emb_name = emb_names[0]
-            idx_emb = st.selectbox(
-                "チャット用Embeddingモデル",
-                options=list(range(len(emb_names))),
-                format_func=lambda i: emb_labels[i],
-                index=default_emb_idx,
-                key="chat_embedding_model_select",
-            )
-            selected_emb_name = emb_names[idx_emb]
-        st.session_state.embedding_model = selected_emb_name
+        st.caption(f"現在のRAG/Embeddingモデル: {selected_emb_name}")
 
         # 選択内容をバックエンドに永続化
         _persist_model_selection(BACKEND_URL.rstrip("/"), selected_llm_name, selected_emb_name)
@@ -149,6 +144,11 @@ def render_chatbot_tab(
             st.caption("現在のRAG対象: すべてのPDF")
         else:
             st.caption("現在のRAG対象: 単一PDF（下の『対象PDF』から選択）")
+            chunk_status = _fetch_chunk_status(BACKEND_URL.rstrip("/"))
+            if chunk_status and not chunk_status.get("has_chunks"):
+                st.warning(
+                    "DBにチャンク化データが存在しません。チャットを利用する前にPDFをアップロードし、ベクトルストアを構築してください。"
+                )
 
         selected_pdf_id = st.session_state.get("rag_pdf_file_id") or st.session_state.get(
             "file_id"
@@ -181,6 +181,11 @@ def render_chatbot_tab(
                 st.session_state["rag_pdf_file_id"] = selected_pdf_id
                 if selected_pdf_id is not None:
                     st.caption(f"現在のRAG対象PDF ID: {selected_pdf_id}")
+                    chunk_status = _fetch_chunk_status(BACKEND_URL.rstrip("/"), selected_pdf_id)
+                    if chunk_status and not chunk_status.get("has_chunks"):
+                        st.warning(
+                            "このPDFにはチャンク化データがありません。チャット前に『ベクトルストア構築』を実行してください。"
+                        )
 
                 # 履歴から抽出テキスト・QAを復元（他タブも有効化）
                 if st.button(
@@ -414,6 +419,20 @@ def render_chatbot_tab(
                                         height=120,
                                         key=f"chat_hist_context_{timestamp_label}_{i}",
                                     )
+                        context_source_pdfs = message.get("context_source_pdfs")
+                        if context_source_pdfs:
+                            with st.expander(
+                                "この応答で使用したコンテキスト元PDFを表示",
+                                expanded=False,
+                            ):
+                                for i, pdf in enumerate(context_source_pdfs, start=1):
+                                    st.markdown(f"**コンテキスト元PDF {i}**")
+                                    st.text_area(
+                                        f"hist_context_source_pdf_{timestamp_label}_{i}",
+                                        value=str(pdf),
+                                        height=120,
+                                        key=f"chat_hist_context_source_pdf_{timestamp_label}_{i}",
+                                    )
         elif filter_applied:
             st.info("選択された条件に一致するチャット履歴はありません。")
 
@@ -531,15 +550,21 @@ def render_chatbot_tab(
                         response_text = data.get("answer", "（応答がありません）")
                         model_used = data.get("llm_model_used", chat_model)
                         contexts = data.get("contexts") or []
+                        context_notice = data.get("context_notice")
+                        context_source_pdfs = data.get("context_source_pdfs")
                     else:
                         response_text = (
                             f"APIエラー: {format_http_error(response)}"
                         )
                         contexts = None
+                        context_notice = None
+                        context_source_pdfs = None
                 except Exception as e:  # noqa: BLE001
                     response_text = f"リクエストエラー: {str(e)}"
                     model_used = None
                     contexts = None
+                    context_notice = None
+                    context_source_pdfs = None
 
             # --- バックエンドAPIの応答のみを表示・履歴追加 ---
             with st.chat_message("assistant"):
@@ -550,6 +575,8 @@ def render_chatbot_tab(
                     )
                 )
                 st.markdown(response_text)
+                if context_notice:
+                    st.info(context_notice)
                 if model_used:
                     st.markdown(
                         f'<span style="font-size:0.75rem; color:#888;" '
@@ -575,6 +602,19 @@ def render_chatbot_tab(
                                 height=120,
                                 key=f"chat_live_context_{response_timestamp}_{i}",
                             )
+                if context_source_pdfs:
+                    with st.expander(
+                        "この応答で使用したコンテキスト元PDFを表示",
+                        expanded=False,
+                    ):
+                        for i, pdf in enumerate(context_source_pdfs, start=1):
+                            st.markdown(f"**コンテキスト元PDF {i}**")
+                            st.text_area(
+                                f"live_context_source_pdf_{response_timestamp}_{i}",
+                                value=str(pdf),
+                                height=120,
+                                key=f"chat_live_context_source_pdf_{response_timestamp}_{i}",
+                            )
                 st.session_state.chat_messages.append(
                     {
                         "role": "assistant",
@@ -582,6 +622,9 @@ def render_chatbot_tab(
                         "model": model_used,
                         "timestamp": response_timestamp,
                         "request_id": request_id,
+                        "contexts": contexts,
+                        "context_notice": context_notice,
+                        "context_source_pdfs": context_source_pdfs,
                     }
                 )
 

@@ -9,7 +9,7 @@ import textwrap
 import logging
 
 from fastapi import HTTPException
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, bindparam
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores.pgvector import PGVector
@@ -68,6 +68,33 @@ def _init_generation_llm(model_name: str, purpose: str = "/query"):
     from . import main as main_module
 
     return main_module.init_generation_llm(model_name, purpose=purpose)
+
+
+def _resolve_pdf_names(pdf_ids: set[str]) -> dict[str, str]:
+    """pdf_file_id から表示名を引く簡易ヘルパー。"""
+
+    if not pdf_ids:
+        return {}
+    stmt = text(
+        """
+        SELECT id, COALESCE(original_name, file_name, id) AS display_name
+        FROM pdf_files
+        WHERE id IN :ids
+        """
+    )
+    stmt = stmt.bindparams(bindparam("ids", expanding=True))
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(stmt, {"ids": list(pdf_ids)}).fetchall()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[WARN] pdf name lookup failed: %s", e)
+        return {}
+    name_map: dict[str, str] = {}
+    for row in rows:
+        pdf_id = row[0]
+        display_name = row[1] or pdf_id
+        name_map[pdf_id] = display_name
+    return name_map
 
 
 # --- チャット履歴永続化ヘルパ（main.py / chat_api.py から移植） ---
@@ -556,6 +583,8 @@ def query_rag(request: Any) -> dict[str, Any]:
         # 関連するドキュメントを取得し、コンテキスト文字列を構築
         retrieved_docs = retriever.get_relevant_documents(request.query)
         contexts = [doc.page_content for doc in retrieved_docs]
+        context_notice: str | None = None
+        pdf_name_map: dict[str, str] = {}
         try:
             logger.debug(
                 "[DEBUG] /query retrieved_docs=%d, contexts_len=%d",
@@ -573,32 +602,43 @@ def query_rag(request: Any) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             pass
 
-        if not contexts:
-            # コンテキストが全く取得できなかった場合は、PDFに基づく回答ができないことを明示
-            raise HTTPException(
-                status_code=404,
-                detail="関連するコンテキストが見つからなかったため、回答を生成できません。",
+        if contexts:
+            # LLM へ質問とコンテキストを渡して回答を生成
+            context_text = "\n".join(contexts)
+            prompt = textwrap.dedent(
+                f"""
+                あなたは日本語のRAGシステムにおける回答エンジンです。以下の制約を厳密に守ってください。
+                - 提供されたコンテキストに含まれる事実のみを用いて回答すること。
+                - 文書内に記載が見つからない場合は「本文に該当記述がありません。」と明示すること。
+                - 回答は自然な日本語で2〜3文以内にまとめること。
+                - 重要な根拠がある場合はその文を要約して含めること。
+
+                ### コンテキスト
+                {context_text}
+
+                ### 質問
+                {request.query}
+
+                ### 回答
+                """
+            ).strip()
+        else:
+            context_notice = (
+                "関連するコンテキストが見つからなかったため、一般的なチャット応答で回答しました。"
             )
+            prompt = textwrap.dedent(
+                f"""
+                あなたは親切な日本語のAIアシスタントです。
+                文書コンテキストは見つかりませんでしたが、一般常識の範囲でユーザーの質問に答えてください。
+                不確かな場合はその旨を伝え、簡潔でフレンドリーな回答を行ってください。
 
-        # LLM へ質問とコンテキストを渡して回答を生成
-        context_text = "\n".join(contexts)
-        prompt = textwrap.dedent(
-            f"""
-            あなたは日本語のRAGシステムにおける回答エンジンです。以下の制約を厳密に守ってください。
-            - 提供されたコンテキストに含まれる事実のみを用いて回答すること。
-            - 文書内に記載が見つからない場合は「本文に該当記述がありません。」と明示すること。
-            - 回答は自然な日本語で2〜3文以内にまとめること。
-            - 重要な根拠がある場合はその文を要約して含めること。
+                ### ユーザーからの質問
+                {request.query}
 
-            ### コンテキスト
-            {context_text}
-
-            ### 質問
-            {request.query}
-
-            ### 回答
-            """
-        ).strip()
+                ### 回答
+                """
+            ).strip()
+            context_text = ""
 
         raw_answer = llm_instance.invoke(prompt)
         answer = _extract_answer_text(raw_answer).strip()
@@ -648,6 +688,31 @@ def query_rag(request: Any) -> dict[str, Any]:
 
         _persist_chat_log_and_contexts(scope, request, answer, contexts, resolved_llm)
 
+        pdf_names: list[str] | None = None
+        if contexts:
+            if scope == "single" and request.pdf_file_id:
+                resolved = _resolve_pdf_names({request.pdf_file_id})
+                pdf_names = [
+                    resolved.get(request.pdf_file_id, request.pdf_file_id)
+                ]
+            elif scope == "all" and retrieved_docs:
+                ids = {
+                    (getattr(doc, "metadata", {}) or {}).get("pdf_file_id")
+                    for doc in retrieved_docs
+                    if (getattr(doc, "metadata", {}) or {}).get("pdf_file_id")
+                }
+                ids = {pid for pid in ids if pid}
+                if ids:
+                    pdf_name_map = _resolve_pdf_names(ids)
+                    pdf_names = [
+                        pdf_name_map.get(
+                            (getattr(doc, "metadata", {}) or {}).get("pdf_file_id"),
+                            (getattr(doc, "metadata", {}) or {}).get("pdf_file_id"),
+                        )
+                        for doc in retrieved_docs
+                        if (getattr(doc, "metadata", {}) or {}).get("pdf_file_id")
+                    ] or None
+
         return {
             "answer": answer,
             "contexts": contexts,
@@ -655,6 +720,8 @@ def query_rag(request: Any) -> dict[str, Any]:
                 {"page_content": doc.page_content} for doc in retrieved_docs
             ],
             "llm_model_used": resolved_llm,
+            "context_notice": context_notice,
+            "context_source_pdfs": pdf_names,
         }
 
     except HTTPException:

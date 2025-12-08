@@ -236,8 +236,8 @@ def test_query_rag_success(monkeypatch) -> None:
     assert called["persist"]["contexts"] == result["contexts"]
 
 
-def test_query_rag_no_contexts_raises_404(monkeypatch) -> None:
-    """関連コンテキストが無い場合に 404 が返ることを確認する。"""
+def test_query_rag_no_contexts_returns_general_chat(monkeypatch) -> None:
+    """関連コンテキストが無い場合でも一般チャット応答で返すことを確認する。"""
 
     class DummyLLM:
         def invoke(self, prompt):  # noqa: ANN001
@@ -276,9 +276,11 @@ def test_query_rag_no_contexts_raises_404(monkeypatch) -> None:
         pdf_file_id="fid1",
     )
 
-    with pytest.raises(HTTPException) as exc:
-        chat_service.query_rag(req)
-    assert exc.value.status_code == 404
+    result = chat_service.query_rag(req)
+    assert result["contexts"] == []
+    assert "関連するコンテキストが見つからなかった" in (result.get("context_notice") or "")
+    assert isinstance(result["answer"], str) and result["answer"]
+    assert result.get("context_source_pdfs") is None
 
 
 def test_query_rag_fallback_when_answer_empty(monkeypatch) -> None:
