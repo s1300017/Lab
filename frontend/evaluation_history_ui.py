@@ -978,7 +978,7 @@ def show_evaluation_history(backend_url: str):
                                             st.caption("Embeddingごとの平均スコア")
                                             st.dataframe(embedding_summary, use_container_width=True)
 
-                                        chart_cols = st.columns(2)
+                                        chart_cols = st.columns(3)
                                         with chart_cols[0]:
                                             if not llm_summary.empty:
                                                 metric_llm = st.selectbox(
@@ -1002,6 +1002,29 @@ def show_evaluation_history(backend_url: str):
                                                         use_container_width=True,
                                                         key=f"llm_metric_bar_{selected_exp_id}",
                                                     )
+                                        if not llm_summary.empty:
+                                            st.caption("LLM別 メトリクス比較（複数指標）")
+                                            llm_metric_chart = llm_summary.melt(
+                                                id_vars="llm_model",
+                                                value_vars=[m for m in available_metrics if m in llm_summary.columns],
+                                                var_name="metric",
+                                                value_name="score",
+                                            )
+                                            fig_llm_multi = px.bar(
+                                                llm_metric_chart,
+                                                x="llm_model",
+                                                y="score",
+                                                color="metric",
+                                                barmode="group",
+                                                title="LLM別 複数指標スコア",
+                                                labels={"llm_model": "LLMモデル", "score": "スコア", "metric": "指標"},
+                                            )
+                                            fig_llm_multi.update_layout(height=420)
+                                            st.plotly_chart(
+                                                fig_llm_multi,
+                                                use_container_width=True,
+                                                key=f"llm_metric_multi_bar_{selected_exp_id}",
+                                            )
                                         with chart_cols[1]:
                                             if not embedding_summary.empty:
                                                 metric_emb = st.selectbox(
@@ -1025,6 +1048,35 @@ def show_evaluation_history(backend_url: str):
                                                         use_container_width=True,
                                                         key=f"embedding_metric_bar_{selected_exp_id}",
                                                     )
+                                        with chart_cols[2]:
+                                            if "chunk_strategy" in metrics_source_df.columns:
+                                                chunk_summary = (
+                                                    metrics_source_df.groupby("chunk_strategy")[available_metrics]
+                                                    .mean()
+                                                    .reset_index()
+                                                )
+                                                if not chunk_summary.empty:
+                                                    metric_chunk = st.selectbox(
+                                                        "チャンク戦略別バーチャート指標",
+                                                        options=[m for m in available_metrics if m in chunk_summary.columns],
+                                                        index=0,
+                                                        key=f"chunk_bar_metric_{selected_exp_id}",
+                                                    )
+                                                    if metric_chunk:
+                                                        chunk_plot_df = chunk_summary.sort_values(metric_chunk, ascending=False)
+                                                        fig_chunk_bar = px.bar(
+                                                            chunk_plot_df,
+                                                            x="chunk_strategy",
+                                                            y=metric_chunk,
+                                                            title=f"{metric_chunk} のチャンク戦略別平均スコア",
+                                                            labels={"chunk_strategy": "チャンク戦略", metric_chunk: "スコア"},
+                                                        )
+                                                        fig_chunk_bar.update_layout(height=380)
+                                                        st.plotly_chart(
+                                                            fig_chunk_bar,
+                                                            use_container_width=True,
+                                                            key=f"chunk_metric_bar_{selected_exp_id}",
+                                                        )
 
                                         combo_summary = (
                                             metrics_source_df.groupby(["llm_model", "embedding_model"])[available_metrics]
@@ -1035,26 +1087,187 @@ def show_evaluation_history(backend_url: str):
                                         st.dataframe(combo_summary, use_container_width=True)
 
                                         selected_metric = st.selectbox(
-                                            "棒グラフで確認する指標 (LLM × Embedding)",
-                                            options=available_metrics,
+                                            "LLM × Embedding組み合わせのバーチャート指標",
+                                            options=[m for m in available_metrics if m in combo_summary.columns],
                                             index=0,
-                                            key=f"llm_emb_heatmap_metric_{selected_exp_id}",
+                                            key=f"combo_bar_metric_{selected_exp_id}",
                                         )
-                                        if selected_metric in combo_summary.columns:
-                                            bar_llm_emb = px.bar(
-                                                combo_summary,
-                                                x="embedding_model",
+                                        if selected_metric:
+                                            combo_plot_df = combo_summary.sort_values(selected_metric, ascending=False)
+                                            fig_combo_bar = px.bar(
+                                                combo_plot_df,
+                                                x="llm_model",
                                                 y=selected_metric,
-                                                color="llm_model",
+                                                color="embedding_model",
                                                 barmode="group",
-                                                title=f"{selected_metric} のLLM×Embedding比較",
-                                                labels={"embedding_model": "Embeddingモデル", "llm_model": "LLMモデル", selected_metric: "スコア"},
+                                                title=f"{selected_metric} のLLM×Embedding平均スコア",
+                                                labels={"llm_model": "LLMモデル", "embedding_model": "Embeddingモデル", selected_metric: "スコア"},
                                             )
+                                            fig_combo_bar.update_layout(height=420)
                                             st.plotly_chart(
-                                                bar_llm_emb,
+                                                fig_combo_bar,
                                                 use_container_width=True,
-                                                key=f"llm_emb_bar_{selected_exp_id}",
+                                                key=f"combo_metric_bar_{selected_exp_id}",
                                             )
+
+                                        def _render_focus_tables(
+                                            source_df: pd.DataFrame,
+                                            group_col: str,
+                                            label: str,
+                                            key_prefix: str,
+                                        ) -> None:
+                                            if group_col not in source_df.columns:
+                                                st.info(f"{label} のデータ列がありません。")
+                                                return
+                                            grouped = (
+                                                source_df.groupby(group_col)[available_metrics]
+                                                .mean()
+                                                .reset_index()
+                                            )
+                                            grouped = grouped.dropna(subset=[group_col])
+                                            if grouped.empty:
+                                                st.info(f"{label} のデータがありません。")
+                                                return
+                                            st.dataframe(
+                                                grouped.rename(columns={group_col: label}),
+                                                use_container_width=True,
+                                            )
+                                            metric_name = st.selectbox(
+                                                f"{label}別バーチャート指標",
+                                                options=[m for m in available_metrics if m in grouped.columns],
+                                                index=0,
+                                                key=f"{key_prefix}_metric_{selected_exp_id}",
+                                            )
+                                            if metric_name:
+                                                plot_df = grouped.sort_values(metric_name, ascending=False)
+                                                fig = px.bar(
+                                                    plot_df,
+                                                    x=group_col,
+                                                    y=metric_name,
+                                                    title=f"{metric_name} の{label}別平均スコア",
+                                                    labels={group_col: label, metric_name: "スコア"},
+                                                )
+                                                fig.update_layout(height=360)
+                                                st.plotly_chart(
+                                                    fig,
+                                                    use_container_width=True,
+                                                    key=f"{key_prefix}_chart_{selected_exp_id}",
+                                                )
+
+                                        st.write("**LLM / Embedding / チャンク戦略の詳細比較**")
+                                        focus_tabs = st.tabs(
+                                            ["LLMごとの詳細", "Embeddingごとの詳細", "チャンク戦略ごとの詳細"]
+                                        )
+
+                                        llm_candidates = (
+                                            metrics_source_df["llm_model"]
+                                            .dropna()
+                                            .astype(str)
+                                            .unique()
+                                            .tolist()
+                                        )
+                                        if llm_candidates:
+                                            with focus_tabs[0]:
+                                                llm_candidates = sorted(llm_candidates)
+                                                selected_llm_focus = st.selectbox(
+                                                    "詳細を表示するLLMを選択",
+                                                    options=llm_candidates,
+                                                    index=0,
+                                                    key=f"focus_llm_select_{selected_exp_id}",
+                                                )
+                                                llm_focus_df = metrics_source_df[
+                                                    metrics_source_df["llm_model"].astype(str) == selected_llm_focus
+                                                ]
+                                                st.caption(f"LLM: {selected_llm_focus}")
+                                                _render_focus_tables(
+                                                    llm_focus_df,
+                                                    "embedding_model",
+                                                    "Embeddingモデル",
+                                                    "focus_llm_embedding",
+                                                )
+                                                _render_focus_tables(
+                                                    llm_focus_df,
+                                                    "chunk_strategy",
+                                                    "チャンク戦略",
+                                                    "focus_llm_chunk",
+                                                )
+                                        else:
+                                            with focus_tabs[0]:
+                                                st.info("LLMモデル情報がないため詳細比較できません。")
+
+                                        embedding_candidates = (
+                                            metrics_source_df["embedding_model"]
+                                            .dropna()
+                                            .astype(str)
+                                            .unique()
+                                            .tolist()
+                                        )
+                                        if embedding_candidates:
+                                            with focus_tabs[1]:
+                                                embedding_candidates = sorted(embedding_candidates)
+                                                selected_emb_focus = st.selectbox(
+                                                    "詳細を表示するEmbeddingモデルを選択",
+                                                    options=embedding_candidates,
+                                                    index=0,
+                                                    key=f"focus_embedding_select_{selected_exp_id}",
+                                                )
+                                                emb_focus_df = metrics_source_df[
+                                                    metrics_source_df["embedding_model"].astype(str)
+                                                    == selected_emb_focus
+                                                ]
+                                                st.caption(f"Embedding: {selected_emb_focus}")
+                                                _render_focus_tables(
+                                                    emb_focus_df,
+                                                    "llm_model",
+                                                    "LLMモデル",
+                                                    "focus_embedding_llm",
+                                                )
+                                                _render_focus_tables(
+                                                    emb_focus_df,
+                                                    "chunk_strategy",
+                                                    "チャンク戦略",
+                                                    "focus_embedding_chunk",
+                                                )
+                                        else:
+                                            with focus_tabs[1]:
+                                                st.info("Embeddingモデル情報がないため詳細比較できません。")
+
+                                        chunk_candidates = (
+                                            metrics_source_df["chunk_strategy"]
+                                            .dropna()
+                                            .astype(str)
+                                            .unique()
+                                            .tolist()
+                                        )
+                                        if chunk_candidates:
+                                            with focus_tabs[2]:
+                                                chunk_candidates = sorted(chunk_candidates)
+                                                selected_chunk_focus = st.selectbox(
+                                                    "詳細を表示するチャンク戦略を選択",
+                                                    options=chunk_candidates,
+                                                    index=0,
+                                                    key=f"focus_chunk_select_{selected_exp_id}",
+                                                )
+                                                chunk_focus_df = metrics_source_df[
+                                                    metrics_source_df["chunk_strategy"].astype(str)
+                                                    == selected_chunk_focus
+                                                ]
+                                                st.caption(f"チャンク戦略: {selected_chunk_focus}")
+                                                _render_focus_tables(
+                                                    chunk_focus_df,
+                                                    "llm_model",
+                                                    "LLMモデル",
+                                                    "focus_chunk_llm",
+                                                )
+                                                _render_focus_tables(
+                                                    chunk_focus_df,
+                                                    "embedding_model",
+                                                    "Embeddingモデル",
+                                                    "focus_chunk_embedding",
+                                                )
+                                        else:
+                                            with focus_tabs[2]:
+                                                st.info("チャンク戦略情報がないため詳細比較できません。")
 
                                     # チャンク戦略別の平均スコア（モデル別）
                                     if "chunk_strategy" in metrics_source_df.columns:
