@@ -24,7 +24,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_js_eval import streamlit_js_eval  # localStorage操作用
 from http_client import http_get, http_post, http_delete, format_http_error
-from evaluation_history_ui import show_evaluation_history
+from evaluation_history_ui import show_cross_experiment_comparison, show_evaluation_history
 from graph_utils import (
     japanese_font,
     plot_overlap_comparison,
@@ -432,11 +432,12 @@ render_pdf_upload_sidebar(
 )
 
 # メインコンテンツのタブ定義
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["チャンキング設定", "一括評価", "チャットボット", "卒論向け分析", "履歴", "システム説明"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["チャンキング設定", "一括評価", "チャットボット", "卒論向け分析", "履歴", "システム説明", "横断比較"])
 tab_chatbot = tab3  # チャットボットタブ
 tab_thesis = tab4   # 卒論向け分析タブ
 tab_history = tab5  # 履歴タブ
 tab_overview = tab6  # システム説明タブ
+tab_cross_compare = tab7  # 横断比較タブ
 
 # システム説明タブ
 render_overview_tab(tab_overview)
@@ -485,6 +486,13 @@ render_chatbot_tab(tab_chatbot, BACKEND_URL, save_state_to_localstorage)
 
 # 卒論向け分析タブ
 render_thesis_tab(tab_thesis, BACKEND_URL)
+
+# 横断比較タブ（実験をまたいだ任意組み合わせ比較）
+with tab_cross_compare:
+    try:
+        show_cross_experiment_comparison(BACKEND_URL.rstrip("/"))
+    except Exception as e:
+        st.error(f"横断比較の表示に失敗しました: {e}")
 
 # 履歴タブ
 with tab_history:

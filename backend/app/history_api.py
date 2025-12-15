@@ -8,7 +8,7 @@ from fastapi import APIRouter
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pytz import timezone
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, bindparam
 from pathlib import Path
 import json
 
@@ -691,5 +691,119 @@ def history_experiment_results(experiment_id: int) -> JSONResponse:
                 record.pop("parameters", None)
                 items.append(record)
             return JSONResponse(content=jsonable_encoder({"items": items}))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@router.post("/history/experiment-results/query")
+def history_experiment_results_query(payload: dict) -> JSONResponse:
+    """複数実験の評価結果をまとめて返す。"""
+    try:
+        if not isinstance(payload, dict):
+            return JSONResponse(status_code=400, content={"error": "payload must be a JSON object"})
+
+        def _normalize_experiment_ids(raw: Any) -> list[int]:
+            if raw is None:
+                return []
+            if isinstance(raw, int):
+                return [raw]
+            if isinstance(raw, str):
+                parts = [p.strip() for p in raw.split(",") if p.strip()]
+                out: list[int] = []
+                for p in parts:
+                    try:
+                        out.append(int(p))
+                    except Exception:  # noqa: BLE001
+                        continue
+                return out
+            if isinstance(raw, (list, tuple)):
+                out = []
+                for v in raw:
+                    if v is None:
+                        continue
+                    try:
+                        out.append(int(v))
+                    except Exception:  # noqa: BLE001
+                        continue
+                return out
+            try:
+                return [int(raw)]
+            except Exception:  # noqa: BLE001
+                return []
+
+        raw_ids = payload.get("experiment_ids")
+        experiment_ids = sorted(set(_normalize_experiment_ids(raw_ids)))
+        if not experiment_ids:
+            return JSONResponse(status_code=400, content={"error": "experiment_ids が必要です"})
+
+        stmt = text(
+            """
+            SELECT
+                r.id,
+                r.experiment_id,
+                r.embedding_model,
+                r.llm_model,
+                r.chunk_strategy,
+                r.chunk_size,
+                r.chunk_overlap,
+                r.num_chunks,
+                r.avg_chunk_len,
+                r.overall_score,
+                r.faithfulness,
+                r.answer_relevancy,
+                r.context_recall,
+                r.context_precision,
+                r.answer_correctness,
+                r.answer_similarity,
+                r.evaluation_llm_model,
+                r.duration_seconds,
+                r.details,
+                r.created_at,
+                e.pdf_file_id,
+                e.experiment_name,
+                e.created_at AS experiment_created_at,
+                e.parameters
+            FROM experiment_results AS r
+            LEFT JOIN experiments AS e
+                ON e.id = r.experiment_id
+            WHERE r.experiment_id IN :eids
+            ORDER BY r.experiment_id ASC, r.id ASC
+            """
+        )
+        stmt = stmt.bindparams(bindparam("eids", expanding=True))
+
+        with engine.begin() as conn:
+            rows = conn.execute(stmt, {"eids": experiment_ids}).fetchall()
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            record = dict(row._mapping)
+            raw_params = record.get("parameters")
+            params_dict: dict[str, Any] | None = None
+            if raw_params:
+                try:
+                    params_dict = json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+                except Exception:  # noqa: BLE001
+                    params_dict = None
+
+            if not record.get("llm_model") and params_dict:
+                llm_from_params: str | None = None
+                if isinstance(params_dict.get("llm_models"), list) and params_dict["llm_models"]:
+                    llm_from_params = str(params_dict["llm_models"][0])
+                elif params_dict.get("llm_model"):
+                    llm_from_params = str(params_dict.get("llm_model"))
+                if llm_from_params:
+                    record["llm_model"] = llm_from_params
+
+            if not record.get("evaluation_llm_model") and params_dict:
+                eval_from_params = params_dict.get("evaluation_llm_model")
+                if eval_from_params:
+                    record["evaluation_llm_model"] = str(eval_from_params)
+            if params_dict and "force_llm_generation" in params_dict:
+                record["force_llm_generation"] = bool(params_dict.get("force_llm_generation"))
+            record.pop("parameters", None)
+            items.append(record)
+
+        return JSONResponse(content=jsonable_encoder({"items": items}))
+
     except Exception as e:  # noqa: BLE001
         return JSONResponse(status_code=500, content={"error": str(e)})

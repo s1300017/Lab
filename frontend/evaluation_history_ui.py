@@ -1,6 +1,6 @@
 # 評価履歴表示UI（Streamlit）
 import streamlit as st
-from http_client import http_get, http_delete
+from http_client import http_get, http_post, http_delete
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -18,9 +18,8 @@ def _create_label(row: pd.Series) -> str:
         return chunk_strategy.lower()
     # pandas.NA を含む値に対して直接 ==/!= を行うと "boolean value of NA is ambiguous" になるため、
     # 先に pd.isna で判定してからその他の条件をチェックする
-    if chunk_size is not None and not pd.isna(chunk_size):
-        if chunk_size != "":
-            return f"{chunk_strategy}-{chunk_size}"
+    if chunk_size is not None and not pd.isna(chunk_size) and chunk_size != "":
+        return f"{chunk_strategy}-{chunk_size}"
     return chunk_strategy or "unknown"
 
 
@@ -606,7 +605,7 @@ def show_evaluation_history(backend_url: str):
                             )
 
                 st.subheader("実験詳細")
-                detail_df_source = filtered_df
+                detail_df_source = display_df
                 selected_exp_id = st.selectbox(
                     "詳細を表示する実験を選択",
                     options=detail_df_source['id'].tolist(),
@@ -1853,6 +1852,272 @@ def show_evaluation_history(backend_url: str):
                 st.error(f"統計情報取得エラー: {response.status_code}")
         except Exception as e:
             st.error(f"統計情報取得エラー: {str(e)}")
+
+
+def show_cross_experiment_comparison(backend_url: str) -> None:
+    st.header("横断比較")
+    st.caption("複数実験の評価結果をまとめて取得し、任意の組み合わせで表/グラフ比較します。")
+
+    experiments = []
+    experiments_error = None
+    try:
+        response = http_get(f"{backend_url}/history/experiments")
+        if response.status_code == 200:
+            data = response.json() or {}
+            experiments = data.get("items", data.get("experiments", []))
+        else:
+            experiments_error = f"実験履歴取得エラー: {response.status_code}"
+    except Exception as e:  # noqa: BLE001
+        experiments_error = f"実験履歴取得エラー: {str(e)}"
+
+    if experiments_error:
+        st.error(experiments_error)
+        return
+    if not experiments:
+        st.info("実験履歴がありません。")
+        return
+
+    exp_df = pd.DataFrame(experiments)
+    if "id" not in exp_df.columns:
+        st.info("実験IDが取得できないため、横断比較は利用できません。")
+        return
+
+    exp_df = exp_df.copy()
+    if "created_at" in exp_df.columns:
+        try:
+            exp_df["created_at"] = pd.to_datetime(exp_df["created_at"], errors="coerce")
+            exp_df["created_at_str"] = exp_df["created_at"].dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:  # noqa: BLE001
+            exp_df["created_at_str"] = ""
+    else:
+        exp_df["created_at_str"] = ""
+
+    def _exp_label(row: pd.Series) -> str:
+        exp_id = row.get("id")
+        pdf_id = row.get("pdf_file_id")
+        name = row.get("experiment_name")
+        created_str = row.get("created_at_str")
+        parts = [f"ID:{exp_id}"]
+        if pdf_id is not None and str(pdf_id).strip() != "":
+            parts.append(f"PDF:{pdf_id}")
+        if created_str:
+            parts.append(str(created_str))
+        if name:
+            parts.append(str(name))
+        return " | ".join(parts)
+
+    exp_df["_label"] = exp_df.apply(_exp_label, axis=1)
+    id_to_label = {
+        int(r["id"]): str(r["_label"]) for _, r in exp_df.iterrows() if pd.notna(r.get("id"))
+    }
+    exp_ids = sorted(id_to_label.keys())
+
+    selected_exp_ids = st.multiselect(
+        "比較対象の実験を選択",
+        options=exp_ids,
+        default=[],
+        format_func=lambda v: id_to_label.get(int(v), f"ID:{v}"),
+        key="cross_compare_experiment_ids_main",
+    )
+
+    if not selected_exp_ids:
+        st.info("まず比較対象の実験を選択してください。")
+        return
+
+    exp_id_tuple = tuple(sorted(int(x) for x in selected_exp_ids))
+    key_suffix = str(abs(hash(exp_id_tuple)))
+
+    with st.spinner("選択された実験の評価結果を取得中..."):
+        try:
+            resp = http_post(
+                f"{backend_url}/history/experiment-results/query",
+                json={"experiment_ids": selected_exp_ids},
+            )
+        except Exception as e:  # noqa: BLE001
+            st.error(f"評価結果取得エラー: {e}")
+            return
+
+    if resp.status_code != 200:
+        st.error(f"評価結果取得エラー: {resp.status_code} {resp.text}")
+        return
+
+    result_data = resp.json() or {}
+    results = result_data.get("items", [])
+    if not isinstance(results, list):
+        results = []
+    if not results:
+        st.info("選択された実験の評価結果がありません。")
+        return
+
+    for res in results:
+        details_dict = {}
+        details_raw = res.get("details")
+        if isinstance(details_raw, str):
+            try:
+                details_dict = json.loads(details_raw)
+            except json.JSONDecodeError:
+                details_dict = {}
+        elif isinstance(details_raw, dict):
+            details_dict = details_raw
+
+        if isinstance(details_dict, dict):
+            res.setdefault("metrics", details_dict.get("metrics", []))
+            res["details_dict"] = details_dict
+        else:
+            res.setdefault("metrics", [])
+            res["details_dict"] = {}
+
+    result_df = pd.DataFrame(results)
+    if "details_dict" in result_df.columns:
+
+        def _extract_status(d: dict | None) -> str | None:
+            if isinstance(d, dict):
+                return d.get("status")
+            return None
+
+        def _extract_error(d: dict | None) -> str | None:
+            if isinstance(d, dict):
+                return d.get("error")
+            return None
+
+        result_df["status"] = result_df["details_dict"].apply(_extract_status)
+        result_df["error_message"] = result_df["details_dict"].apply(_extract_error)
+
+    st.markdown("#### 絞り込み")
+    filtered_df = result_df.copy()
+    col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+
+    if "embedding_model" in filtered_df.columns:
+        with col_f1:
+            emb_choices = filtered_df["embedding_model"].dropna().astype(str).unique().tolist()
+            emb_choices = sorted(emb_choices)
+            selected_embs = st.multiselect(
+                "Embeddingモデル",
+                emb_choices,
+                default=emb_choices,
+                key=f"cross_compare_emb_{key_suffix}_main",
+            )
+            if selected_embs:
+                filtered_df = filtered_df[filtered_df["embedding_model"].astype(str).isin(selected_embs)]
+
+    if "llm_model" in filtered_df.columns:
+        with col_f2:
+            llm_choices = filtered_df["llm_model"].dropna().astype(str).unique().tolist()
+            llm_choices = sorted(llm_choices)
+            selected_llms = st.multiselect(
+                "生成LLM",
+                llm_choices,
+                default=llm_choices,
+                key=f"cross_compare_llm_{key_suffix}_main",
+            )
+            if selected_llms:
+                filtered_df = filtered_df[filtered_df["llm_model"].astype(str).isin(selected_llms)]
+
+    if "chunk_strategy" in filtered_df.columns:
+        with col_f3:
+            strat_choices = filtered_df["chunk_strategy"].dropna().astype(str).unique().tolist()
+            strat_choices = sorted(strat_choices)
+            selected_strats = st.multiselect(
+                "チャンク戦略",
+                strat_choices,
+                default=strat_choices,
+                key=f"cross_compare_chunk_strategy_{key_suffix}_main",
+            )
+            if selected_strats:
+                filtered_df = filtered_df[filtered_df["chunk_strategy"].astype(str).isin(selected_strats)]
+
+    if "status" in filtered_df.columns:
+        with col_f4:
+            status_choices = filtered_df["status"].dropna().astype(str).unique().tolist()
+            status_choices = sorted(status_choices)
+            selected_statuses = st.multiselect(
+                "ステータス",
+                status_choices,
+                default=status_choices,
+                key=f"cross_compare_status_{key_suffix}_main",
+            )
+            if selected_statuses:
+                filtered_df = filtered_df[filtered_df["status"].astype(str).isin(selected_statuses)]
+
+    if filtered_df.empty:
+        st.info("絞り込み条件に一致する評価結果がありません。")
+        return
+
+    st.markdown("#### 比較対象の評価結果を選択")
+    work_df = filtered_df.copy()
+    sort_cols = [c for c in ["experiment_id", "id"] if c in work_df.columns]
+    if sort_cols:
+        work_df = work_df.sort_values(sort_cols, ascending=True)
+    work_df = work_df.reset_index(drop=True)
+
+    display_columns = [
+        "id",
+        "experiment_id",
+        "experiment_name",
+        "pdf_file_id",
+        "embedding_model",
+        "llm_model",
+        "evaluation_llm_model",
+        "chunk_strategy",
+        "chunk_size",
+        "chunk_overlap",
+        "overall_score",
+        "faithfulness",
+        "answer_relevancy",
+        "context_recall",
+        "context_precision",
+        "answer_correctness",
+        "answer_similarity",
+        "duration_seconds",
+        "status",
+        "error_message",
+    ]
+    display_columns = [c for c in display_columns if c in work_df.columns]
+    editor_df = work_df[display_columns].copy() if display_columns else work_df.copy()
+    editor_df.insert(0, "selected", False)
+
+    edited_df = st.data_editor(
+        editor_df,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "selected": st.column_config.CheckboxColumn("選択", help="比較対象に含める行を選択します")
+        },
+        disabled=[c for c in editor_df.columns if c != "selected"],
+        key=f"cross_compare_editor_{key_suffix}_main",
+    )
+
+    selected_mask = edited_df.get("selected")
+    if selected_mask is None:
+        st.info("比較対象が未選択です。")
+        return
+
+    try:
+        selected_mask = selected_mask.fillna(False).astype(bool)
+    except Exception:  # noqa: BLE001
+        selected_mask = selected_mask
+
+    selected_df = work_df.loc[selected_mask].copy()
+    st.write(f"**表示中**: {len(work_df)} 件 / **選択中**: {len(selected_df)} 件")
+
+    if selected_df.empty:
+        st.info("比較対象が未選択です。")
+        return
+
+    _render_bulk_style_charts(selected_df, key_prefix=f"cross_compare_{key_suffix}_main_")
+
+    with st.expander("選択結果をCSVダウンロード", expanded=False):
+        try:
+            csv_bytes = selected_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="CSVをダウンロード",
+                data=csv_bytes,
+                file_name=f"cross_compare_selected_{key_suffix}.csv",
+                mime="text/csv",
+                key=f"cross_compare_download_{key_suffix}_main",
+            )
+        except Exception as e:  # noqa: BLE001
+            st.error(f"CSV生成に失敗しました: {e}")
 
 if __name__ == "__main__":
     # テスト用
