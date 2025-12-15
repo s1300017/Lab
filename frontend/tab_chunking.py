@@ -115,32 +115,9 @@ def render_chunking_tab(
             "一括評価タブと同じパラメータ体系で、サンプルテキストに対するチャンキング結果を確認できます。"
         )
 
-        # --- 共通Embeddingモデルの選択（RAG/チャンキング用） ---
-        embedding_models_all = _fetch_embedding_models(BACKEND_URL)
-        if embedding_models_all:
-            embedding_names_all = [m.get("name", "") for m in embedding_models_all]
-            embedding_labels_all = [
-                m.get("display_name") or m.get("name") or "unknown" for m in embedding_models_all
-            ]
-            current_emb = st.session_state.get("embedding_model", "huggingface_bge_small")
-            default_emb_idx = (
-                embedding_names_all.index(current_emb)
-                if current_emb in embedding_names_all
-                else 0
-            )
-            idx_global_emb = st.selectbox(
-                "RAG/チャンキング用の共通Embeddingモデル",
-                options=list(range(len(embedding_names_all))),
-                format_func=lambda i: embedding_labels_all[i],
-                index=default_emb_idx,
-                key="chunking_global_embedding_select",
-            )
-            selected_global_emb = embedding_names_all[idx_global_emb]
-            st.session_state["embedding_model"] = selected_global_emb
-            # 現在のLLMモデルとあわせて永続化（LLMは既存の選択をそのまま利用）
-            current_llm = st.session_state.get("llm_model", "gpt-oss")
-            _persist_model_selection(BACKEND_URL, current_llm, selected_global_emb)
-            st.caption(f"現在のRAG/チャンキング用Embeddingモデル: {current_emb}")
+        # --- 共通Embeddingモデルは別タブで管理し、このタブでは参照のみ ---
+        current_emb = st.session_state.get("embedding_model", "huggingface_bge_small")
+        st.caption(f"現在のRAG/チャンキング用Embeddingモデル: {current_emb}")
 
         # --- 対象PDFの選択 ---
         history_pdfs = _fetch_history_pdfs(BACKEND_URL)
@@ -244,7 +221,7 @@ def render_chunking_tab(
         similarity_threshold = 0.7
         if chunk_method == "semantic":
             st.markdown("### セマンティックチャンキング設定")
-            embedding_models = embedding_models_all or _fetch_embedding_models(BACKEND_URL)
+            embedding_models = _fetch_embedding_models(BACKEND_URL)
             if embedding_models:
                 embedding_names = [m.get("name", "") for m in embedding_models]
                 embedding_labels = [

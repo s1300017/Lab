@@ -111,6 +111,21 @@ def render_chatbot_tab(
         selected_emb_name = st.session_state.get("embedding_model", "huggingface_bge_small")
         st.caption(f"現在のRAG/Embeddingモデル: {selected_emb_name}")
 
+        prompt_style_options = ["chat_jp", "simple_en"]
+        default_prompt_style = st.session_state.get("chat_rag_prompt_style") or "simple_en"
+        if default_prompt_style not in prompt_style_options:
+            default_prompt_style = "simple_en"
+        st.selectbox(
+            "RAG回答生成プロンプト",
+            options=prompt_style_options,
+            index=prompt_style_options.index(default_prompt_style),
+            key="chat_rag_prompt_style",
+            help=(
+                "chat_jp: 日本語制約プロンプト / "
+                "simple_en: 簡易英語プロンプト（デフォルト）"
+            ),
+        )
+
         # 選択内容をバックエンドに永続化
         _persist_model_selection(BACKEND_URL.rstrip("/"), selected_llm_name, selected_emb_name)
 
@@ -274,6 +289,7 @@ def render_chatbot_tab(
                                         "timestamp": ts,
                                         "contexts": ctx_list,
                                         "request_id": req_id,
+                                        "context_source_pdfs": row.get("context_source_pdfs"),
                                     }
                                 )
                 except Exception as e:  # noqa: BLE001
@@ -535,6 +551,9 @@ def render_chatbot_tab(
                             "embedding_model", "huggingface_bge_small"
                         ),
                         "scope": current_scope,
+                        "rag_prompt_style": st.session_state.get(
+                            "chat_rag_prompt_style", "simple_en"
+                        ),
                     }
                     if current_scope == "single" and current_pdf_id:
                         query_payload["pdf_file_id"] = current_pdf_id

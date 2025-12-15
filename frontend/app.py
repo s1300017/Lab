@@ -652,6 +652,26 @@ with tab_history:
                             st.success("PDFを復元しました。各タブから操作できます。")
                             st.rerun()
 
+                qa_question_count_default = st.session_state.get("qa_question_count", 5)
+                try:
+                    qa_question_count_default = int(qa_question_count_default)
+                except Exception:
+                    qa_question_count_default = 5
+                if qa_question_count_default < 1:
+                    qa_question_count_default = 1
+                if qa_question_count_default > 50:
+                    qa_question_count_default = 50
+
+                st.slider(
+                    "質問生成数（QA生成）",
+                    min_value=1,
+                    max_value=50,
+                    value=qa_question_count_default,
+                    step=1,
+                    key="qa_question_count",
+                    help="このPDFから生成する質問の数を指定します（1〜50）。",
+                )
+
                 col_generate_qa, _ = st.columns([1, 3])
                 with col_generate_qa:
                     if st.button("このPDFから質問を生成する", key=f"generate_qa_for_history_{selected_pdf['id']}"):
@@ -659,11 +679,13 @@ with tab_history:
                             try:
                                 question_model = selected_pdf.get("question_llm_model") or "mistral"
                                 answer_model = selected_pdf.get("answer_llm_model") or "mistral"
+                                qa_question_count = st.session_state.get("qa_question_count", 5)
                                 resp_qa = http_post(
                                     f"{BACKEND_URL}/pdf/{selected_pdf['id']}/generate_qa",
                                     data={
                                         "question_llm_model": question_model,
                                         "answer_llm_model": answer_model,
+                                        "question_count": str(qa_question_count),
                                     },
                                 )
                                 if resp_qa.status_code == 200:

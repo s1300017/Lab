@@ -58,6 +58,7 @@ class QueryRequest(BaseModel):
     embedding_model: str = "huggingface_bge_small"  # デフォルト値を設定
     scope: str = "single"  # "single" または "all"
     pdf_file_id: str | None = None  # scope == "single" のときに対象PDFを指定
+    rag_prompt_style: str = "simple_en"  # 'chat_jp' or 'simple_en'
 
 
 class BuildVectorStoreRequest(BaseModel):

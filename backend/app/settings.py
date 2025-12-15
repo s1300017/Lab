@@ -56,6 +56,7 @@ SUPPORTED_EMBEDDING_MODELS = {
     # Ollama埋め込みモデル
     "nomic-embed-text",
     "mxbai-embed-large",
+    "mxbai-embed-large:335m",
     "all-minilm",
     "bge-m3",
     "qwen3-embedding",

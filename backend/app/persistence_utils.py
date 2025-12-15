@@ -284,6 +284,33 @@ def persist_experiment_results(
                 if isinstance(metrics_list, list) and metrics_list:
                     details_payload["metrics"] = metrics_list
 
+                # 評価ジョブの再現性に必要なメタ情報（列に無いものは details に入れる）
+                if res.get("rag_prompt_style") is not None:
+                    details_payload["rag_prompt_style"] = res.get("rag_prompt_style")
+                if res.get("similarity_threshold") is not None:
+                    details_payload["similarity_threshold"] = res.get("similarity_threshold")
+                if res.get("force_llm_generation") is not None:
+                    details_payload["force_llm_generation"] = res.get("force_llm_generation")
+
+                # 参照用の入力識別子（実験比較の最低条件）
+                if res.get("file_id") is not None:
+                    details_payload["file_id"] = res.get("file_id")
+                if res.get("pdf_file_id") is not None:
+                    details_payload["pdf_file_id"] = res.get("pdf_file_id")
+                if res.get("question_mode") is not None:
+                    details_payload["question_mode"] = res.get("question_mode")
+                if res.get("use_n") is not None:
+                    details_payload["use_n"] = res.get("use_n")
+
+                # Retrieval条件（再現性に直結）
+                retrieval_keys = ("top_k", "use_mmr", "fetch_k", "lambda_mult")
+                retrieval_conditions: dict[str, Any] = {}
+                for k in retrieval_keys:
+                    if res.get(k) is not None:
+                        retrieval_conditions[k] = res.get(k)
+                if retrieval_conditions:
+                    details_payload["retrieval_conditions"] = retrieval_conditions
+
                 details_payload["status"] = "error" if is_error else "ok"
                 if is_error:
                     if res.get("error") is not None:

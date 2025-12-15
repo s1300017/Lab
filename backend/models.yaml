@@ -340,9 +340,9 @@ models:
   - name: kimi-k2:cloud
     type: ollama
     category: "LLM"
-    backend_model: "kimi-k2:cloud"
+    backend_model: "kimi-k2:1t-cloud"
     display_name: "Kimi K2 Cloud (Ollama Cloud)"
-    description: "Moonshot AIのMoEモデルKimi K2。マルチリンガルな指示応答に適しています。`ollama pull kimi-k2:cloud` が必要です。"
+    description: "Moonshot AIのMoEモデルKimi K2。マルチリンガルな指示応答に適しています。`ollama pull kimi-k2:1t-cloud` が必要です。"
   - name: kimi-k2-thinking:cloud
     type: ollama
     category: "LLM"
@@ -358,9 +358,9 @@ models:
   - name: mistral-large-3:cloud
     type: ollama
     category: "LLM"
-    backend_model: "mistral-large-3:cloud"
+    backend_model: "mistral-large-3:675b-cloud"
     display_name: "Mistral Large 3 Cloud (Ollama Cloud)"
-    description: "Mistralの最新MoE大規模モデル。マルチモーダル・エンタープライズ用途向け。`ollama pull mistral-large-3:cloud` を実行してください。"
+    description: "Mistralの最新MoE大規模モデル。マルチモーダル・エンタープライズ用途向け。`ollama pull mistral-large-3:675b-cloud` を実行してください。"
   - name: ministral-3:3b-cloud
     type: ollama
     category: "LLM"

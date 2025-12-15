@@ -222,6 +222,15 @@ def _render_bulk_style_charts(results_df: pd.DataFrame, key_prefix: str = "") ->
         axis=1,
     )
 
+    try:
+        overall_non_na = pd.to_numeric(df.get("overall_score"), errors="coerce")
+        if overall_non_na.notna().any() and (overall_non_na.fillna(0).abs().sum() == 0):
+            st.warning(
+                "overall_score がすべて 0.0 です。評価自体は完了していますが、指標が計算できていない/全て0になっている可能性があります（参照回答やメトリクス設定、LLM応答内容を確認してください）。"
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
     # ビューモードの選択（簡易 / 詳細）
     view_mode = st.radio(
         "グラフ表示モード",
@@ -245,7 +254,7 @@ def _render_bulk_style_charts(results_df: pd.DataFrame, key_prefix: str = "") ->
                 title="チャンク戦略別 平均総合スコア",
                 labels={"chunk_strategy": "チャンク戦略", "overall_score": "平均総合スコア"},
             )
-            fig.update_layout(height=400)
+            fig.update_layout(height=400, yaxis=dict(range=[0, 1]))
             st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}chunk_strategy_bar_simple")
         else:
             st.info("簡易ビューを表示するための列（chunk_strategy / overall_score）が不足しています。")
@@ -345,7 +354,7 @@ def _render_bulk_style_charts(results_df: pd.DataFrame, key_prefix: str = "") ->
             title="チャンク戦略別 平均総合スコア",
             labels={"chunk_strategy": "チャンク戦略", "overall_score": "平均総合スコア"},
         )
-        fig.update_layout(height=400)
+        fig.update_layout(height=400, yaxis=dict(range=[0, 1]))
         st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}chunk_strategy_bar")
 
 

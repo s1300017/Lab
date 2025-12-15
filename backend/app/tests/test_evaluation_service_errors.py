@@ -87,4 +87,8 @@ async def test_bulk_evaluate_missing_questions_or_answers(monkeypatch) -> None:
     assert isinstance(res, dict)
     assert "error" in res
     msg = res["error"]
-    assert "questions/answersが指定されていません" in msg or "PDFアップロードとQA自動生成を先に実施" in msg
+    assert (
+        "questionsが指定されていません" in msg
+        or "questions/answersが指定されていません" in msg
+        or "PDFアップロードとQA自動生成を先に実施" in msg
+    )

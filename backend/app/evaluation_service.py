@@ -5,8 +5,10 @@ import json
 import logging
 import math
 import os
-import random
+import sys
 import re
+import textwrap
+import time
 import statistics
 import time
 import traceback
@@ -14,6 +16,7 @@ from collections import defaultdict
 from copy import deepcopy
 from datetime import datetime
 from hashlib import sha256
+from logging.handlers import RotatingFileHandler
 from typing import Any, Iterable, Mapping, Sequence
 
 from datasets import Dataset
@@ -47,11 +50,242 @@ from .chunk_utils import (
     paragraph_chunk_text,
     semantic_chunk_text,
 )
-from .llm_ragas_utils import RAGASLLMAsyncAdapter
+from .llm_ragas_utils import RAGASLLMAsyncAdapter, _extract_answer_text, build_rag_answer_prompt
 from .persistence_utils import persist_experiment_results
+from .settings import JsonFormatter
 
 
 logger = logging.getLogger(__name__)
+
+
+_RAGAS_EVAL_LOGGER: logging.Logger | None = None
+
+
+def _get_ragas_eval_logger() -> logging.Logger:
+    global _RAGAS_EVAL_LOGGER
+
+    if _RAGAS_EVAL_LOGGER is not None:
+        return _RAGAS_EVAL_LOGGER
+
+    log_path = os.getenv("RAGAS_EVAL_LOG_PATH", "").strip()
+    if not log_path:
+        is_pytest = ("PYTEST_CURRENT_TEST" in os.environ) or ("pytest" in sys.modules)
+        if not is_pytest:
+            try:
+                from pathlib import Path
+
+                project_root = Path(__file__).resolve().parents[2]
+                log_path = str(project_root / "logs" / "ragas_eval.log")
+            except Exception:  # noqa: BLE001
+                log_path = ""
+    max_bytes_env = os.getenv("RAGAS_EVAL_LOG_MAX_BYTES", "10485760").strip()
+    backup_count_env = os.getenv("RAGAS_EVAL_LOG_BACKUP_COUNT", "5").strip()
+    level_name = os.getenv("RAGAS_EVAL_LOG_LEVEL", "INFO").upper().strip()
+
+    ragas_logger = logging.getLogger("ragas_eval")
+    ragas_logger.setLevel(getattr(logging, level_name, logging.INFO))
+    ragas_logger.propagate = False
+
+    if log_path:
+        try:
+            max_bytes = int(max_bytes_env) if max_bytes_env else 10485760
+        except Exception:  # noqa: BLE001
+            max_bytes = 10485760
+        try:
+            backup_count = int(backup_count_env) if backup_count_env else 5
+        except Exception:  # noqa: BLE001
+            backup_count = 5
+
+        try:
+            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+            handler = RotatingFileHandler(
+                log_path,
+                maxBytes=max(0, max_bytes),
+                backupCount=max(0, backup_count),
+                encoding="utf-8",
+            )
+            handler.setFormatter(JsonFormatter())
+
+            if not any(
+                getattr(h, "baseFilename", None) == getattr(handler, "baseFilename", None)
+                for h in ragas_logger.handlers
+            ):
+                ragas_logger.addHandler(handler)
+        except Exception:  # noqa: BLE001
+            pass
+
+    _RAGAS_EVAL_LOGGER = ragas_logger
+    return ragas_logger
+
+
+def _run_ragas_evaluate_to_pandas(
+    *,
+    dataset: Any,
+    metrics: list[Any],
+    llm: Any,
+    embeddings: Any,
+    max_workers: int,
+    timeout: int | None,
+) -> Any:
+    result = evaluate(
+        dataset=dataset,
+        metrics=metrics,
+        llm=llm,
+        embeddings=embeddings,
+        run_config=RunConfig(
+            timeout=timeout,
+            max_workers=max_workers,
+        ),
+    )
+    if hasattr(result, "to_pandas"):
+        return result.to_pandas()
+    if hasattr(result, "to_dict") and hasattr(result, "columns"):
+        return result
+    return None
+
+
+def _auto_parallel_limits(
+    data: Any,
+    *,
+    default_parallel_tasks: int,
+    default_parallel_configs: int,
+    resolve_provider,
+) -> tuple[int, int, str]:
+    def _as_list(d: Any) -> list[dict[str, Any]]:
+        if isinstance(d, list):
+            return [x for x in d if isinstance(x, dict)]
+        if isinstance(d, dict):
+            return [d]
+        return []
+
+    items = _as_list(data)
+    providers: set[str] = set()
+    for one in items:
+        llm_name = one.get("llm_model")
+        eval_llm_name = one.get("evaluation_llm_model")
+        for name in (llm_name, eval_llm_name):
+            if not name:
+                continue
+            try:
+                providers.add(str(resolve_provider(str(name))).strip())
+            except Exception:  # noqa: BLE001
+                continue
+
+    has_openai = "openai" in providers
+    has_ollama = "ollama" in providers
+
+    if has_openai:
+        return default_parallel_tasks, default_parallel_configs, "openai"
+    if has_ollama:
+        return default_parallel_tasks, default_parallel_configs, "ollama"
+    return default_parallel_tasks, default_parallel_configs, "unknown"
+
+
+def _resolve_parallel_limits_for_bulk_evaluate(
+    *,
+    cpu_count: int | None = None,
+) -> tuple[int, int, int, int, str, str]:
+    """bulk_evaluate 用の並列数設定を環境変数から解決する。
+
+    Ollama は 429 等のエラーを踏みやすいため、環境変数で明示されていない(auto)場合のみ
+    安全側にキャップする。
+    """
+
+    cpu = cpu_count or (os.cpu_count() or 4)
+    cpu_based_default_parallel = max(2, min(8, max(1, cpu // 2)))
+
+    env_tasks = os.getenv("EVAL_MAX_PARALLEL_TASKS")
+    env_configs = os.getenv("EVAL_MAX_PARALLEL_CONFIGS")
+
+    default_tasks_openai = int(os.getenv("EVAL_MAX_PARALLEL_TASKS_OPENAI", "2"))
+    default_configs_openai = int(os.getenv("EVAL_MAX_PARALLEL_CONFIGS_OPENAI", "1"))
+
+    raw_tasks_ollama = os.getenv("EVAL_MAX_PARALLEL_TASKS_OLLAMA")
+    raw_configs_ollama = os.getenv("EVAL_MAX_PARALLEL_CONFIGS_OLLAMA")
+
+    if raw_tasks_ollama is None or str(raw_tasks_ollama).strip() == "":
+        default_tasks_ollama = cpu_based_default_parallel
+        tasks_ollama_explicit = False
+    else:
+        default_tasks_ollama = int(str(raw_tasks_ollama).strip())
+        tasks_ollama_explicit = True
+
+    if raw_configs_ollama is None or str(raw_configs_ollama).strip() == "":
+        default_configs_ollama = 2
+        configs_ollama_explicit = False
+    else:
+        default_configs_ollama = int(str(raw_configs_ollama).strip())
+        configs_ollama_explicit = True
+
+    if env_tasks is None or str(env_tasks).strip() == "":
+        tasks_openai = max(1, int(default_tasks_openai))
+        tasks_ollama = max(1, int(default_tasks_ollama))
+        env_tasks_mode = "auto"
+    else:
+        forced = max(1, int(env_tasks))
+        tasks_openai = forced
+        tasks_ollama = forced
+        env_tasks_mode = "set"
+
+    if env_configs is None or str(env_configs).strip() == "":
+        configs_openai = max(1, int(default_configs_openai))
+        configs_ollama = max(1, int(default_configs_ollama))
+        env_configs_mode = "auto"
+    else:
+        try:
+            forced_cfg = max(1, int(env_configs))
+        except ValueError:
+            forced_cfg = 1
+        configs_openai = forced_cfg
+        configs_ollama = forced_cfg
+        env_configs_mode = "set"
+
+    # Ollama は未指定(auto)の場合のみ安全側にキャップする（明示指定は尊重する）
+    if env_tasks_mode == "auto" and not tasks_ollama_explicit:
+        before = tasks_ollama
+        tasks_ollama = min(tasks_ollama, 1)
+        if tasks_ollama != before:
+            logger.info(
+                "[設定] OllamaのTASKS並列数を安全側にキャップ: %d -> %d",
+                before,
+                tasks_ollama,
+            )
+
+    if env_configs_mode == "auto" and not configs_ollama_explicit:
+        before = configs_ollama
+        configs_ollama = min(configs_ollama, 1)
+        if configs_ollama != before:
+            logger.info(
+                "[設定] OllamaのCONFIGS並列数を安全側にキャップ: %d -> %d",
+                before,
+                configs_ollama,
+            )
+
+    return (
+        tasks_openai,
+        tasks_ollama,
+        configs_openai,
+        configs_ollama,
+        env_tasks_mode,
+        env_configs_mode,
+    )
+
+
+def _pick_provider_from_config(one: Any, *, resolve_provider) -> str:
+    if not isinstance(one, dict):
+        return "unknown"
+    llm_name = one.get("llm_model")
+    eval_llm_name = one.get("evaluation_llm_model")
+    for name in (llm_name, eval_llm_name):
+        if not name:
+            continue
+        try:
+            provider = str(resolve_provider(str(name))).strip()
+            if provider:
+                return provider
+        except Exception:  # noqa: BLE001
+            continue
+    return "unknown"
 
 
 def _unique_preserve_order(seq: Iterable[Any]) -> list[Any]:
@@ -74,9 +308,29 @@ def _summarize_bulk_request(request_items: Sequence[dict[str, Any]]) -> dict[str
     first = valid_items[0]
     summary: dict[str, Any] = {}
 
-    for key in ("experiment_name", "file_id", "pdf_file_id", "question_mode", "use_n"):
+    for key in (
+        "experiment_name",
+        "file_id",
+        "pdf_file_id",
+        "question_mode",
+        "use_n",
+        "top_k",
+        "use_mmr",
+        "fetch_k",
+        "lambda_mult",
+    ):
         if first.get(key) is not None:
             summary[key] = first.get(key)
+
+    # Retrieval条件は「実験条件」として保存（複数ジョブで値が異なる可能性もあるため unique を保存）
+    retrieval_keys = ("top_k", "use_mmr", "fetch_k", "lambda_mult")
+    for key in retrieval_keys:
+        values = _unique_preserve_order(
+            item.get(key) for item in valid_items if item.get(key) is not None
+        )
+        if not values:
+            continue
+        summary[key] = values[0] if len(values) == 1 else values
 
     llm_models = _unique_preserve_order(
         item.get("llm_model")
@@ -196,6 +450,11 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
     jst_now_str = main_module.jst_now_str
 
     try:
+        ragas_logger = _get_ragas_eval_logger()
+        ragas_logger.info(
+            "[RAGAS] bulk_evaluate start",
+            extra={"component": "ragas", "endpoint": "bulk_evaluate", "job_id": job_id},
+        )
         # --- 数値のNaN/infガード用ユーティリティ ---
         def safe_val(x: Any) -> float:
             try:
@@ -235,19 +494,40 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
 
         # 並列処理の最大数を制限するセマフォを作成
         cpu_count = os.cpu_count() or 4
-        # CPUコア数に応じてデフォルト並列数を自動調整（最小2、最大8）
-        default_parallel = max(2, min(8, max(1, cpu_count // 2)))
-        MAX_PARALLEL_TASKS = int(os.getenv("EVAL_MAX_PARALLEL_TASKS", str(default_parallel)))
-        semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
 
-        # 一括評価の「設定ごと」の並列数（外側ループ用）
-        # デフォルトは 1（従来どおり逐次実行）。環境変数で ON にした場合のみ並列化する。
-        try:
-            MAX_PARALLEL_CONFIGS = int(os.getenv("EVAL_MAX_PARALLEL_CONFIGS", "1"))
-        except ValueError:
-            MAX_PARALLEL_CONFIGS = 1
-        if MAX_PARALLEL_CONFIGS < 1:
-            MAX_PARALLEL_CONFIGS = 1
+        (
+            MAX_PARALLEL_TASKS_OPENAI,
+            MAX_PARALLEL_TASKS_OLLAMA,
+            MAX_PARALLEL_CONFIGS_OPENAI,
+            MAX_PARALLEL_CONFIGS_OLLAMA,
+            env_tasks_mode,
+            env_configs_mode,
+        ) = _resolve_parallel_limits_for_bulk_evaluate(cpu_count=cpu_count)
+
+        def _resolve_provider(model_name: str) -> str:
+            _, entry = main_module._resolve_llm_entry(model_name)  # type: ignore[attr-defined]
+            return str(entry.get("provider") or "unknown")
+
+        # provider別セマフォ
+        semaphore_tasks_openai = asyncio.Semaphore(MAX_PARALLEL_TASKS_OPENAI)
+        semaphore_tasks_ollama = asyncio.Semaphore(MAX_PARALLEL_TASKS_OLLAMA)
+        outer_semaphore_openai = asyncio.Semaphore(MAX_PARALLEL_CONFIGS_OPENAI)
+        outer_semaphore_ollama = asyncio.Semaphore(MAX_PARALLEL_CONFIGS_OLLAMA)
+
+        # retrieval は provider に依存しないため、タスク並列数の大きい方に揃える
+        semaphore_retrieval = asyncio.Semaphore(
+            max(MAX_PARALLEL_TASKS_OPENAI, MAX_PARALLEL_TASKS_OLLAMA),
+        )
+
+        logger.info(
+            "[設定] 並列数: TASKS(openai=%d, ollama=%d, mode=%s) / CONFIGS(openai=%d, ollama=%d, mode=%s)",
+            MAX_PARALLEL_TASKS_OPENAI,
+            MAX_PARALLEL_TASKS_OLLAMA,
+            env_tasks_mode,
+            MAX_PARALLEL_CONFIGS_OPENAI,
+            MAX_PARALLEL_CONFIGS_OLLAMA,
+            env_configs_mode,
+        )
 
         # 計測ログの有効化（環境変数でON/OFF）
         TIMING_LOG = os.getenv("EVAL_TIMING_LOG", "1").lower() in {"1", "true", "yes"}
@@ -291,6 +571,19 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
             try:
                 logger.info("[進捗] 評価データを処理中...")
                 _check_cancel()
+                try:
+                    ragas_logger.info(
+                        "[RAGAS] evaluate_one_bulk start",
+                        extra={
+                            "component": "ragas",
+                            "endpoint": "bulk_evaluate",
+                            "job_id": job_id,
+                            "pdf_file_id": one.get("pdf_file_id"),
+                            "file_id": one.get("file_id"),
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 # タイムアウト設定（環境変数で調整可能）
                 # 既定値: LLM呼び出し=45秒, 評価全体は質問数に応じて自動調整
                 LLM_TIMEOUT = _parse_timeout_env("EVAL_LLM_TIMEOUT_SECONDS", 45)
@@ -303,14 +596,39 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                 request_llm_model = one.get("llm_model", DEFAULT_LLM_NAME)
                 evaluation_llm_model = one.get("evaluation_llm_model")
                 force_llm_generation = bool(one.get("force_llm_generation"))
+                rag_prompt_style = one.get("rag_prompt_style") or "simple_en"
                 llm_instance_generation, resolved_llm_model = init_generation_llm(
                     request_llm_model,
                     purpose="/bulk_evaluate generation",
                 )
+
+                resolved_eval_llm_model = evaluation_llm_model or DEFAULT_LLM_NAME
+
+                generation_provider = _resolve_provider(resolved_llm_model)
+                if generation_provider == "openai":
+                    semaphore_tasks = semaphore_tasks_openai
+                    max_workers_generation = MAX_PARALLEL_TASKS_OPENAI
+                else:
+                    semaphore_tasks = semaphore_tasks_ollama
+                    max_workers_generation = MAX_PARALLEL_TASKS_OLLAMA
+
+                evaluation_provider = _resolve_provider(resolved_eval_llm_model)
+                if evaluation_provider == "openai":
+                    max_workers_eval = MAX_PARALLEL_TASKS_OPENAI
+                else:
+                    max_workers_eval = MAX_PARALLEL_TASKS_OLLAMA
+                if evaluation_provider == "ollama" and "cloud" in str(resolved_eval_llm_model).lower():
+                    try:
+                        max_workers_eval = min(
+                            max_workers_eval,
+                            max(1, int(os.getenv("EVAL_MAX_PARALLEL_TASKS_OLLAMA_CLOUD", "1"))),
+                        )
+                    except Exception:  # noqa: BLE001
+                        max_workers_eval = 1
                 logger.info(
                     "[設定] 生成LLM=%s / 評価LLM=%s / 再生成フラグ=%s",
                     resolved_llm_model,
-                    evaluation_llm_model or DEFAULT_LLM_NAME,
+                    resolved_eval_llm_model,
                     force_llm_generation,
                 )
 
@@ -348,13 +666,17 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         "警告: 'openai' は包括的な指定です。具体的な 'text-embedding-3-small' または 'text-embedding-3-large' を選択してください。",
                     )
 
-                questions = one.get("questions")
+                raw_questions = one.get("questions")
                 # ground_truthキーまたはanswersキーのどちらかを使用（互換性のため）
-                answers = one.get("ground_truth", one.get("answers"))
-                if not questions or not answers:
+                raw_ground_truth = one.get("ground_truth", one.get("answers"))
+                if not isinstance(raw_questions, list) or not raw_questions:
                     raise ValueError(
-                        "questions/answersが指定されていません。PDFアップロード時の自動生成結果をそのまま送信してください。",
+                        "questionsが指定されていません。PDFアップロード時の自動生成結果をそのまま送信してください。",
                     )
+                questions = [str(q) for q in raw_questions]
+                ground_truth: list[str] | None = None
+                if isinstance(raw_ground_truth, list) and raw_ground_truth:
+                    ground_truth = [str(a) for a in raw_ground_truth]
 
                 # 質問数が多すぎる場合は環境変数 EVAL_MAX_QUESTIONS で上限をかける
                 try:
@@ -367,7 +689,6 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
 
                 if (
                     isinstance(questions, list)
-                    and isinstance(answers, list)
                     and max_questions is not None
                     and max_questions > 0
                     and len(questions) > max_questions
@@ -378,14 +699,28 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         max_questions,
                     )
                     questions = questions[:max_questions]
-                    answers = answers[:max_questions]
 
-                if not (sample_text and questions and answers):
+                    if ground_truth is not None:
+                        ground_truth = ground_truth[:max_questions]
+
+                if ground_truth is not None and len(ground_truth) != len(questions):
+                    use_n = min(len(questions), len(ground_truth))
+                    logger.warning(
+                        "[警告] questions(%d) と answers/ground_truth(%d) の件数が一致しません。先頭 %d 件に揃えます。",
+                        len(questions),
+                        len(ground_truth),
+                        use_n,
+                    )
+                    questions = questions[:use_n]
+                    ground_truth = ground_truth[:use_n]
+
+                if not (sample_text and questions):
                     raise ValueError(
-                        "PDFアップロードとQA自動生成を先に実施してください（text, questions, answers必須）。",
+                        "PDFアップロードとQA自動生成を先に実施してください（text, questions必須）。",
                     )
 
                 include_answer_similarity = _bool_env(one.get("include_answer_similarity"), True)
+                has_reference = bool(ground_truth)
 
                 # 質問数に応じて評価タイムアウトのデフォルト値を自動調整
                 question_count = len(questions)
@@ -407,11 +742,36 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                     return "no-timeout" if t is None else f"{t}s"
 
                 logger.info(
-                    "[設定] TIMEOUT: LLM_TIMEOUT=%s, EVAL_TIMEOUT=%s, MAX_PARALLEL_TASKS=%d",
+                    "[設定] TIMEOUT: LLM_TIMEOUT=%s, EVAL_TIMEOUT=%s, MAX_PARALLEL_TASKS(generation=%d, eval=%d)",
                     _fmt(LLM_TIMEOUT),
                     _fmt(EVAL_TIMEOUT),
-                    MAX_PARALLEL_TASKS,
+                    max_workers_generation,
+                    max_workers_eval,
                 )
+                try:
+                    ragas_logger.info(
+                        "[RAGAS] job config",
+                        extra={
+                            "component": "ragas",
+                            "endpoint": "bulk_evaluate",
+                            "job_id": job_id,
+                            "file_id": one.get("file_id"),
+                            "pdf_file_id": one.get("pdf_file_id"),
+                            "llm_model": resolved_llm_model,
+                            "evaluation_llm_model": resolved_eval_llm_model,
+                            "embedding_model": embedding_model,
+                            "chunk_methods": chunk_methods,
+                            "rag_prompt_style": rag_prompt_style,
+                            "top_k": one.get("top_k"),
+                            "use_mmr": one.get("use_mmr"),
+                            "fetch_k": one.get("fetch_k"),
+                            "lambda_mult": one.get("lambda_mult"),
+                            "max_workers_generation": max_workers_generation,
+                            "max_workers_eval": max_workers_eval,
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
                 results: list[dict[str, Any]] = []
 
@@ -662,18 +1022,18 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
 
                         # PDFアップロード時の回答が揃っていれば使い回し（高速化）
                         if (
-                            answers
-                            and len(answers) == len(questions)
+                            ground_truth
+                            and len(ground_truth) == len(questions)
                             and not force_llm_generation
                         ):
                             logger.info(
                                 "[進捗] PDFアップロード時の回答を使用（%d個の回答）",
-                                len(answers),
+                                len(ground_truth),
                             )
-                            pred_answers = list(answers)
+                            pred_answers = list(ground_truth)
 
                             async def get_context_only(q: str) -> list[str]:
-                                async with semaphore:
+                                async with semaphore_retrieval:
                                     _check_cancel()
                                     retrieved_docs = await asyncio.to_thread(
                                         retriever.get_relevant_documents,
@@ -694,7 +1054,8 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                             )
 
                             async def get_context_and_answer(q: str) -> tuple[list[str], str]:
-                                async with semaphore:  # セマフォで並列処理数を制限
+                                # 呼ばれるLLM(provider)に応じてセマフォを切り替える
+                                async with semaphore_tasks:
                                     _check_cancel()
                                     retrieved_docs = await asyncio.to_thread(
                                         retriever.get_relevant_documents,
@@ -704,35 +1065,51 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                                         doc.page_content for doc in retrieved_docs
                                     ]
                                     llm_instance = llm_instance_generation
-                                    prompt = ChatPromptTemplate.from_template(
-                                        """Answer the question based only on the following context:\n{context}\n\nQuestion: {question}""",
-                                    )
+                                    if rag_prompt_style == "simple_en":
+                                        prompt = ChatPromptTemplate.from_template(
+                                            """Answer the question based only on the following context:\n{context}\n\nQuestion: {question}""",
+                                        )
 
-                                    def _to_text(x: Any) -> Any:
-                                        try:
-                                            return x.to_string()
-                                        except Exception:  # noqa: BLE001
-                                            return x
+                                        def _to_text(x: Any) -> Any:
+                                            try:
+                                                return x.to_string()
+                                            except Exception:  # noqa: BLE001
+                                                return x
 
-                                    llm_runnable = RunnableLambda(
-                                        lambda x: llm_instance.invoke(_to_text(x)),
-                                    )
-                                    chain = (
-                                        {
-                                            "context": lambda _: context_texts,
-                                            "question": lambda _: q,
-                                        }
-                                        | prompt
-                                        | llm_runnable
-                                        | StrOutputParser()
-                                    )
+                                        llm_runnable = RunnableLambda(
+                                            lambda x: llm_instance.invoke(_to_text(x)),
+                                        )
+                                        chain = (
+                                            {
+                                                "context": lambda _: context_texts,
+                                                "question": lambda _: q,
+                                            }
+                                            | prompt
+                                            | llm_runnable
+                                            | StrOutputParser()
+                                        )
+                                        call = lambda: chain.ainvoke({})
+                                    else:
+                                        prompt_text = build_rag_answer_prompt(
+                                            context="\n".join(context_texts),
+                                            question=q,
+                                        )
+
+                                        async def _invoke_prompt() -> str:
+                                            raw = await asyncio.to_thread(
+                                                llm_instance.invoke,
+                                                prompt_text,
+                                            )
+                                            return _extract_answer_text(raw).strip()
+
+                                        call = _invoke_prompt
 
                                     try:
                                         if LLM_TIMEOUT is None:
-                                            answer = await chain.ainvoke({})
+                                            answer = await call()
                                         else:
                                             answer = await asyncio.wait_for(
-                                                chain.ainvoke({}),
+                                                call(),
                                                 timeout=LLM_TIMEOUT,
                                             )
                                     except asyncio.TimeoutError:
@@ -762,15 +1139,15 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         _check_cancel()
                         logger.info("[進捗] 評価メトリクスの計算を開始...")
 
-                        dataset_dict = {
+                        dataset_dict: dict[str, Any] = {
                             "question": questions,
                             "answer": pred_answers,
                             "contexts": contexts,
-                            "ground_truth": answers,
                         }
-                        dataset_dict_with_ref = dict(dataset_dict)
-                        dataset_dict_with_ref["reference"] = answers
-                        dataset = Dataset.from_dict(dataset_dict_with_ref)
+                        if has_reference and ground_truth is not None:
+                            dataset_dict["ground_truth"] = ground_truth
+                            dataset_dict["reference"] = ground_truth
+                        dataset = Dataset.from_dict(dataset_dict)
 
                         llm_instance_eval = get_llm_eval(evaluation_llm_model)
                         ragas_llm = RAGASLLMAsyncAdapter(llm_instance_eval)
@@ -785,6 +1162,8 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         ]
                         selected_metric_defs = []
                         for name, metric in metric_defs:
+                            if name in {"answer_correctness", "answer_similarity"} and not has_reference:
+                                continue
                             if name == "answer_similarity" and not include_answer_similarity:
                                 continue
                             selected_metric_defs.append((name, metric))
@@ -801,45 +1180,29 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         try:
                             _t0_eval = _tnow()
                             if EVAL_TIMEOUT is None:
-                                eval_res_all = await asyncio.to_thread(
-                                    evaluate,
+                                eval_df = await asyncio.to_thread(
+                                    _run_ragas_evaluate_to_pandas,
                                     dataset=dataset,
                                     metrics=metrics_local,
                                     llm=ragas_llm,
                                     embeddings=embedder,
-                                    run_config=RunConfig(
-                                        timeout=EVAL_TIMEOUT,
-                                        max_workers=MAX_PARALLEL_TASKS,
-                                    ),
+                                    max_workers=max_workers_eval,
+                                    timeout=EVAL_TIMEOUT,
                                 )
                             else:
-                                eval_res_all = await asyncio.wait_for(
+                                eval_df = await asyncio.wait_for(
                                     asyncio.to_thread(
-                                        evaluate,
+                                        _run_ragas_evaluate_to_pandas,
                                         dataset=dataset,
                                         metrics=metrics_local,
                                         llm=ragas_llm,
                                         embeddings=embedder,
-                                        run_config=RunConfig(
-                                            timeout=EVAL_TIMEOUT,
-                                            max_workers=MAX_PARALLEL_TASKS,
-                                        ),
+                                        max_workers=max_workers_eval,
+                                        timeout=EVAL_TIMEOUT,
                                     ),
                                     timeout=EVAL_TIMEOUT,
                                 )
                             _tlog("ragas.evaluate", _t0_eval)
-                            try:
-                                if hasattr(eval_res_all, "to_pandas"):
-                                    eval_df = eval_res_all.to_pandas()
-                                elif hasattr(eval_res_all, "to_dict") and hasattr(
-                                    eval_res_all,
-                                    "columns",
-                                ):
-                                    eval_df = eval_res_all
-                                else:
-                                    eval_df = None
-                            except Exception:  # noqa: BLE001
-                                eval_df = None
                         except asyncio.TimeoutError:
                             logger.warning(
                                 "[警告] ragas.evaluate 一括評価がタイムアウト: timeout=%s",
@@ -849,67 +1212,53 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         except TypeError:
                             try:
                                 if EVAL_TIMEOUT is None:
-                                    eval_res_all = await asyncio.to_thread(
-                                        evaluate,
+                                    eval_df = await asyncio.to_thread(
+                                        _run_ragas_evaluate_to_pandas,
                                         dataset=dataset,
                                         metrics=metrics_local,
                                         llm=ragas_llm,
-                                        run_config=RunConfig(
-                                            timeout=EVAL_TIMEOUT,
-                                            max_workers=MAX_PARALLEL_TASKS,
-                                        ),
+                                        embeddings=embedder,
+                                        max_workers=max_workers_eval,
+                                        timeout=EVAL_TIMEOUT,
                                     )
                                 else:
-                                    eval_res_all = await asyncio.wait_for(
+                                    eval_df = await asyncio.wait_for(
                                         asyncio.to_thread(
-                                            evaluate,
+                                            _run_ragas_evaluate_to_pandas,
                                             dataset=dataset,
                                             metrics=metrics_local,
                                             llm=ragas_llm,
-                                            run_config=RunConfig(
-                                                timeout=EVAL_TIMEOUT,
-                                                max_workers=MAX_PARALLEL_TASKS,
-                                            ),
+                                            embeddings=embedder,
+                                            max_workers=max_workers_eval,
+                                            timeout=EVAL_TIMEOUT,
                                         ),
                                         timeout=EVAL_TIMEOUT,
                                     )
-                                if hasattr(eval_res_all, "to_pandas"):
-                                    eval_df = eval_res_all.to_pandas()
-                                elif hasattr(eval_res_all, "to_dict") and hasattr(
-                                    eval_res_all,
-                                    "columns",
-                                ):
-                                    eval_df = eval_res_all
-                                else:
-                                    eval_df = None
                             except TypeError:
                                 try:
                                     if EVAL_TIMEOUT is None:
-                                        eval_res_all = await asyncio.to_thread(
-                                            evaluate,
+                                        eval_df = await asyncio.to_thread(
+                                            _run_ragas_evaluate_to_pandas,
                                             dataset=dataset,
                                             metrics=metrics_local,
                                             llm=ragas_llm,
+                                            embeddings=embedder,
+                                            max_workers=max_workers_eval,
+                                            timeout=None,
                                         )
                                     else:
-                                        eval_res_all = await asyncio.wait_for(
+                                        eval_df = await asyncio.wait_for(
                                             asyncio.to_thread(
-                                                evaluate,
+                                                _run_ragas_evaluate_to_pandas,
                                                 dataset=dataset,
                                                 metrics=metrics_local,
                                                 llm=ragas_llm,
+                                                embeddings=embedder,
+                                                max_workers=max_workers_eval,
+                                                timeout=None,
                                             ),
                                             timeout=EVAL_TIMEOUT,
                                         )
-                                    if hasattr(eval_res_all, "to_pandas"):
-                                        eval_df = eval_res_all.to_pandas()
-                                    elif hasattr(eval_res_all, "to_dict") and hasattr(
-                                        eval_res_all,
-                                        "columns",
-                                    ):
-                                        eval_df = eval_res_all
-                                    else:
-                                        eval_df = None
                                 except Exception:  # noqa: BLE001
                                     logger.warning("[警告] ragas.evaluate 一括評価フォールバック失敗")
                                     eval_df = None
@@ -917,6 +1266,7 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         metrics_keys = [name for name, _ in selected_metric_defs]
                         metrics_per_qa: list[dict[str, Any]] = []
                         metrics_avg = {k: 0.0 for k in metrics_keys}
+                        metrics_error: str | None = None
                         try:
                             if eval_df is not None:
                                 # eval_dfの列情報と answer_similarity のサンプル値をデバッグ出力
@@ -966,8 +1316,8 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                                                 else ""
                                             ),
                                             "ground_truth": (
-                                                answers[idx_row]
-                                                if idx_row < len(answers)
+                                                ground_truth[idx_row]
+                                                if ground_truth is not None and idx_row < len(ground_truth)
                                                 else ""
                                             ),
                                             "metrics": metric_values,
@@ -978,13 +1328,41 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                                         if hasattr(eval_df, "columns") and k in list(
                                             eval_df.columns,  # type: ignore[attr-defined]
                                         ):
-                                            metrics_avg[k] = safe_val(
-                                                float(eval_df[k].mean()),  # type: ignore[index]
-                                            )
+                                            raw_mean = float(eval_df[k].mean())  # type: ignore[index]
+                                            metrics_avg[k] = safe_val(raw_mean)
                                         else:
                                             metrics_avg[k] = 0.0
                                     except Exception:  # noqa: BLE001
                                         metrics_avg[k] = 0.0
+
+                                try:
+                                    cols_all = list(getattr(eval_df, "columns", []))
+                                except Exception:  # noqa: BLE001
+                                    cols_all = []
+                                metric_cols = [k for k in metrics_keys if k in cols_all]
+                                if metric_cols:
+                                    any_finite_metric = False
+                                    for col in metric_cols:
+                                        try:
+                                            values = eval_df[col].tolist()  # type: ignore[index]
+                                        except Exception:  # noqa: BLE001
+                                            continue
+                                        for v in values:
+                                            try:
+                                                fv = float(v)
+                                            except Exception:  # noqa: BLE001
+                                                continue
+                                            if not (math.isnan(fv) or math.isinf(fv)):
+                                                any_finite_metric = True
+                                                break
+                                        if any_finite_metric:
+                                            break
+                                    if not any_finite_metric:
+                                        metrics_error = (
+                                            "RAGAS評価メトリクスが取得できませんでした（全てNaN/inf）。"
+                                            "評価LLMのレート制限(429)・利用上限、またはモデル応答を確認してください。"
+                                            f" evaluation_llm_model={resolved_eval_llm_model}"
+                                        )
                             else:
                                 metrics_per_qa = [
                                     {
@@ -999,11 +1377,17 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                                             else ""
                                         ),
                                         "ground_truth": (
-                                            answers[idx]
-                                            if idx < len(answers)
+                                            ground_truth[idx]
+                                            if ground_truth is not None and idx < len(ground_truth)
                                             else ""
                                         ),
                                         "metrics": {k: 0.0 for k in metrics_keys},
+                                        "retrieval_conditions": {
+                                            "top_k": top_k,
+                                            "use_mmr": use_mmr,
+                                            "fetch_k": fetch_k,
+                                            "lambda_mult": lambda_mult,
+                                        },
                                     }
                                     for idx in range(len(questions))
                                 ]
@@ -1022,8 +1406,8 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                                         else ""
                                     ),
                                     "ground_truth": (
-                                        answers[idx]
-                                        if idx < len(answers)
+                                        ground_truth[idx]
+                                        if ground_truth is not None and idx < len(ground_truth)
                                         else ""
                                     ),
                                     "metrics": {k: 0.0 for k in metrics_keys},
@@ -1032,12 +1416,15 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                             ]
                             metrics_avg = {k: 0.0 for k in metrics_keys}
 
+                        if metrics_error:
+                            raise RuntimeError(metrics_error)
+
                         overall_score = (
-                            metrics_avg["answer_relevancy"] * 0.25
-                            + metrics_avg["faithfulness"] * 0.25
-                            + metrics_avg["context_precision"] * 0.2
-                            + metrics_avg["context_recall"] * 0.2
-                            + metrics_avg["answer_correctness"] * 0.1
+                            metrics_avg.get("answer_relevancy", 0.0) * 0.25
+                            + metrics_avg.get("faithfulness", 0.0) * 0.25
+                            + metrics_avg.get("context_precision", 0.0) * 0.2
+                            + metrics_avg.get("context_recall", 0.0) * 0.2
+                            + metrics_avg.get("answer_correctness", 0.0) * 0.1
                         )
                         overall_score = safe_val(overall_score)
 
@@ -1064,6 +1451,15 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         response_dict: dict[str, Any] = {
                             "embedding_model": embedding_model,
                             "llm_model": resolved_llm_model,
+                            "rag_prompt_style": rag_prompt_style,
+                            "file_id": one.get("file_id"),
+                            "pdf_file_id": one.get("pdf_file_id"),
+                            "question_mode": one.get("question_mode"),
+                            "use_n": one.get("use_n"),
+                            "top_k": top_k,
+                            "use_mmr": use_mmr,
+                            "fetch_k": fetch_k,
+                            "lambda_mult": lambda_mult,
                             "chunk_size": (
                                 chunk_size_val if chunk_method != "semantic" else None
                             ),
@@ -1079,8 +1475,7 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                             "avg_chunk_len": avg_chunk_len,
                             "metrics": metrics_per_qa,
                             "force_llm_generation": force_llm_generation,
-                            "evaluation_llm_model": evaluation_llm_model
-                            or DEFAULT_LLM_NAME,
+                            "evaluation_llm_model": resolved_eval_llm_model,
                         }
 
                         for metric_name, metric_value in metrics_avg.items():
@@ -1105,6 +1500,24 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                         )
                         response_dict["duration_seconds"] = duration_seconds
                         results.append(response_dict)
+                        try:
+                            ragas_logger.info(
+                                "[RAGAS] evaluate_one_bulk done",
+                                extra={
+                                    "component": "ragas",
+                                    "endpoint": "bulk_evaluate",
+                                    "job_id": job_id,
+                                    "file_id": one.get("file_id"),
+                                    "pdf_file_id": one.get("pdf_file_id"),
+                                    "llm_model": resolved_llm_model,
+                                    "embedding_model": embedding_model,
+                                    "chunk_method": chunk_method,
+                                    "overall_score": overall_score,
+                                    "duration_seconds": duration_seconds,
+                                },
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                     except Exception as e:  # noqa: BLE001
                         import traceback
 
@@ -1116,11 +1529,29 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                             e,
                             duration_seconds,
                         )
+                        try:
+                            ragas_logger.error(
+                                "[RAGAS] evaluate_one_bulk error",
+                                extra={
+                                    "component": "ragas",
+                                    "endpoint": "bulk_evaluate",
+                                    "job_id": job_id,
+                                    "file_id": one.get("file_id"),
+                                    "pdf_file_id": one.get("pdf_file_id"),
+                                    "llm_model": resolved_llm_model,
+                                    "embedding_model": embedding_model,
+                                    "chunk_method": chunk_method,
+                                    "duration_seconds": duration_seconds,
+                                    "error": str(e),
+                                    "error_detail": error_detail,
+                                },
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                         logger.debug(error_detail)
                         results.append(
                             {
                                 "error": str(e),
-                                "chunk_method": chunk_method,
                                 "error_detail": error_detail,
                                 "input_data": one,
                                 "duration_seconds": duration_seconds,
@@ -1147,6 +1578,21 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
                 error_detail = traceback.format_exc()
                 logger.error("[重要エラー] evaluate_one_bulk処理全体で例外が発生: %s", e)
                 logger.debug(error_detail)
+                try:
+                    ragas_logger.error(
+                        "[RAGAS] evaluate_one_bulk fatal",
+                        extra={
+                            "component": "ragas",
+                            "endpoint": "bulk_evaluate",
+                            "job_id": job_id,
+                            "file_id": one.get("file_id"),
+                            "pdf_file_id": one.get("pdf_file_id"),
+                            "error": str(e),
+                            "error_detail": error_detail,
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 return {
                     "error": str(e),
                     "error_detail": error_detail,
@@ -1158,12 +1604,16 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
             "[進捗] bulk_evaluate APIが呼び出されました",
             extra={"component": "evaluation", "endpoint": "bulk_evaluate"},
         )
+        ragas_logger.info(
+            "[RAGAS] bulk_evaluate request received",
+            extra={"component": "ragas", "endpoint": "bulk_evaluate", "job_id": job_id},
+        )
         if isinstance(data, list):
             total = len(data)
             logger.info(
                 "[進捗] リストデータを処理します。データ数: %d, MAX_PARALLEL_CONFIGS=%d",
                 total,
-                MAX_PARALLEL_CONFIGS,
+                max(MAX_PARALLEL_CONFIGS_OPENAI, MAX_PARALLEL_CONFIGS_OLLAMA),
                 extra={"component": "evaluation", "endpoint": "bulk_evaluate"},
             )
 
@@ -1174,13 +1624,18 @@ async def bulk_evaluate(data: Any, job_id: str | None = None) -> Any:
 
             # 外側ループ（設定ごと）の並列実行。順序は元の data の順序を維持する。
             results_all: list[Any] = [None] * total
-            outer_semaphore = asyncio.Semaphore(MAX_PARALLEL_CONFIGS)
             completed = 0
             completed_lock = asyncio.Lock()
 
             async def _process_one(index: int, d: Any) -> None:
                 nonlocal completed
                 try:
+                    provider = _pick_provider_from_config(d, resolve_provider=_resolve_provider)
+                    if provider == "openai":
+                        outer_semaphore = outer_semaphore_openai
+                    else:
+                        outer_semaphore = outer_semaphore_ollama
+
                     async with outer_semaphore:
                         logger.info(
                             "[進捗] データ %d/%d を処理中...",

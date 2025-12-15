@@ -1154,11 +1154,24 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
             help="オンにすると質問ごとの生成回答と正解の類似度を追加で計算します。精度向上に役立ちますが計算コストが高くなります。",
         )
 
+        rag_prompt_styles = st.multiselect(
+            "RAG回答生成プロンプト（比較用に複数選択可）",
+            options=["chat_jp", "simple_en"],
+            default=["simple_en"],
+            key="bulk_rag_prompt_styles",
+            help=(
+                "chat_jp: チャット本番と同等の日本語制約プロンプト / "
+                "simple_en: 簡易英語プロンプト（比較用）"
+            ),
+        )
+        if not rag_prompt_styles:
+            rag_prompt_styles = ["simple_en"]
+
         job_limit = int(
             st.number_input(
                 "一括評価で許可する最大ジョブ数の上限",
                 min_value=1,
-                max_value=100,
+                max_value=1000,
                 value=int(st.session_state.get("bulk_eval_job_limit", 10) or 10),
                 step=1,
                 key="bulk_eval_job_limit",
@@ -1174,19 +1187,20 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
         if selected_llm_models and selected_embeddings and selected_chunk_methods:
             num_llm = len(selected_llm_models)
             num_embeddings = len(selected_embeddings)
+            num_prompt_styles = len(rag_prompt_styles) if rag_prompt_styles else 1
             num_sizes = max(len(chunk_sizes), 1)
             num_overlaps = max(len(chunk_overlaps), 1)
 
             for method in selected_chunk_methods:
                 if method == "semantic":
                     # semantic はサイズ・オーバーラップを持たない1組み合わせ扱い
-                    estimated_jobs += num_llm * num_embeddings
+                    estimated_jobs += num_llm * num_embeddings * num_prompt_styles
                 elif method in ("sentence", "paragraph"):
-                    estimated_jobs += num_llm * num_embeddings
+                    estimated_jobs += num_llm * num_embeddings * num_prompt_styles
                 elif method in ("recursive", "fixed"):
-                    estimated_jobs += num_llm * num_embeddings * num_sizes * num_overlaps
+                    estimated_jobs += num_llm * num_embeddings * num_prompt_styles * num_sizes * num_overlaps
                 else:
-                    estimated_jobs += num_llm * num_embeddings
+                    estimated_jobs += num_llm * num_embeddings * num_prompt_styles
 
         if estimated_jobs > 0:
             st.caption(
@@ -1281,58 +1295,62 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
             for llm_model in selected_llm_models:
                 for emb in selected_embeddings:
                     for method in selected_chunk_methods:
-                        if method == "semantic":
-                            job: Dict[str, Any] = {
-                                "llm_model": llm_model,
-                                "evaluation_llm_model": eval_llm_for_job,
-                                "embedding_model": emb,
-                                "chunk_methods": [method],
-                                "text": eval_text,
-                                "questions": questions_eval,
-                                "answers": answers_eval,
-                                "include_answer_similarity": include_answer_similarity,
-                                "force_llm_generation": force_llm_generation,
-                                "semantic_params": {
-                                    "similarity_threshold": float(similarity_threshold)
-                                },
-                            }
-                            if file_id:
-                                job["file_id"] = file_id
-                            jobs.append(job)
-                        elif method in ("sentence", "paragraph"):
-                            job = {
-                                "llm_model": llm_model,
-                                "evaluation_llm_model": eval_llm_for_job,
-                                "embedding_model": emb,
-                                "chunk_methods": [method],
-                                "text": eval_text,
-                                "questions": questions_eval,
-                                "answers": answers_eval,
-                                "include_answer_similarity": include_answer_similarity,
-                                "force_llm_generation": force_llm_generation,
-                            }
-                            if file_id:
-                                job["file_id"] = file_id
-                            jobs.append(job)
-                        else:
-                            for size in chunk_sizes:
-                                for ov in chunk_overlaps:
-                                    job = {
-                                        "llm_model": llm_model,
-                                        "evaluation_llm_model": eval_llm_for_job,
-                                        "embedding_model": emb,
-                                        "chunk_methods": [method],
-                                        "chunk_sizes": [int(size)],
-                                        "chunk_overlaps": [int(ov)],
-                                        "text": eval_text,
-                                        "questions": questions_eval,
-                                        "answers": answers_eval,
-                                        "include_answer_similarity": include_answer_similarity,
-                                        "force_llm_generation": force_llm_generation,
-                                    }
-                                    if file_id:
-                                        job["file_id"] = file_id
-                                    jobs.append(job)
+                        for rag_prompt_style in rag_prompt_styles:
+                            if method == "semantic":
+                                job: Dict[str, Any] = {
+                                    "llm_model": llm_model,
+                                    "evaluation_llm_model": eval_llm_for_job,
+                                    "embedding_model": emb,
+                                    "chunk_methods": [method],
+                                    "rag_prompt_style": rag_prompt_style,
+                                    "text": eval_text,
+                                    "questions": questions_eval,
+                                    "answers": answers_eval,
+                                    "include_answer_similarity": include_answer_similarity,
+                                    "force_llm_generation": force_llm_generation,
+                                    "semantic_params": {
+                                        "similarity_threshold": float(similarity_threshold)
+                                    },
+                                }
+                                if file_id:
+                                    job["file_id"] = file_id
+                                jobs.append(job)
+                            elif method in ("sentence", "paragraph"):
+                                job = {
+                                    "llm_model": llm_model,
+                                    "evaluation_llm_model": eval_llm_for_job,
+                                    "embedding_model": emb,
+                                    "chunk_methods": [method],
+                                    "rag_prompt_style": rag_prompt_style,
+                                    "text": eval_text,
+                                    "questions": questions_eval,
+                                    "answers": answers_eval,
+                                    "include_answer_similarity": include_answer_similarity,
+                                    "force_llm_generation": force_llm_generation,
+                                }
+                                if file_id:
+                                    job["file_id"] = file_id
+                                jobs.append(job)
+                            else:
+                                for size in chunk_sizes:
+                                    for ov in chunk_overlaps:
+                                        job = {
+                                            "llm_model": llm_model,
+                                            "evaluation_llm_model": eval_llm_for_job,
+                                            "embedding_model": emb,
+                                            "chunk_methods": [method],
+                                            "chunk_sizes": [int(size)],
+                                            "chunk_overlaps": [int(ov)],
+                                            "rag_prompt_style": rag_prompt_style,
+                                            "text": eval_text,
+                                            "questions": questions_eval,
+                                            "answers": answers_eval,
+                                            "include_answer_similarity": include_answer_similarity,
+                                            "force_llm_generation": force_llm_generation,
+                                        }
+                                        if file_id:
+                                            job["file_id"] = file_id
+                                        jobs.append(job)
 
                 if not jobs:
                     st.error("有効な評価ジョブが生成できませんでした。設定を見直してください。")
@@ -1368,6 +1386,7 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
                     "chunk_sizes": list(chunk_sizes),
                     "chunk_overlaps": list(chunk_overlaps),
                     "include_answer_similarity": bool(include_answer_similarity),
+                    "rag_prompt_styles": list(rag_prompt_styles),
                     "similarity_threshold": float(similarity_threshold) if "semantic" in selected_chunk_methods else None,
                     "estimated_jobs": job_count,
                 }
@@ -1425,6 +1444,8 @@ def render_bulk_evaluation_tab(tab_bulk: Any, BACKEND_URL: str) -> None:
             lines.append(f"- 使用Embeddingモデル: **{', '.join(map(str, emb_list)) or '-'}**")
             methods_list = confirm_summary.get("chunk_methods") or []
             lines.append(f"- チャンク方式: **{', '.join(map(str, methods_list)) or '-'}**")
+            prompt_list = confirm_summary.get("rag_prompt_styles") or []
+            lines.append(f"- RAG回答生成プロンプト: **{', '.join(map(str, prompt_list)) or '-'}**")
             size_list = confirm_summary.get("chunk_sizes") or []
             overlap_list = confirm_summary.get("chunk_overlaps") or []
             if size_list:

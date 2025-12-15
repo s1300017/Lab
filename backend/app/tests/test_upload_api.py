@@ -99,15 +99,76 @@ def test_get_extracted_uses_service(monkeypatch) -> None:
 
 
 def test_generate_qa_for_pdf_uses_service(monkeypatch) -> None:
-    def fake_generate_qa(file_id: str, question_llm_model: str, answer_llm_model: str) -> dict:
-        return {"file_id": file_id, "questions": ["Q"], "answers": ["A"]}
+    def fake_generate_qa(
+        file_id: str,
+        question_llm_model: str,
+        answer_llm_model: str,
+        question_count: int = 5,
+        min_qa_score: float = 0.0,
+    ) -> dict:
+        return {
+            "file_id": file_id,
+            "question_count": question_count,
+            "min_qa_score": min_qa_score,
+            "questions": ["Q"],
+            "answers": ["A"],
+        }
 
     monkeypatch.setattr(upload_api, "generate_qa_for_existing_pdf", fake_generate_qa)
 
     resp = client.post(
         "/pdf/abc/generate_qa",
-        data={"question_llm_model": "mistral", "answer_llm_model": "mistral"},
+        data={
+            "question_llm_model": "mistral",
+            "answer_llm_model": "mistral",
+            "question_count": "7",
+            "min_qa_score": "0.5",
+        },
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"file_id": "abc", "questions": ["Q"], "answers": ["A"]}
+    assert resp.json() == {
+        "file_id": "abc",
+        "question_count": 7,
+        "min_qa_score": 0.5,
+        "questions": ["Q"],
+        "answers": ["A"],
+    }
+
+
+def test_regenerate_qa_for_pdf_uses_service(monkeypatch) -> None:
+    def fake_regenerate_qa(
+        file_id: str,
+        question_llm_model: str,
+        answer_llm_model: str,
+        question_count: int = 5,
+        min_qa_score: float = 0.0,
+    ) -> dict:
+        return {
+            "file_id": file_id,
+            "question_count": question_count,
+            "min_qa_score": min_qa_score,
+            "questions": ["Q"],
+            "answers": ["A"],
+        }
+
+    monkeypatch.setattr(upload_api, "regenerate_qa_for_existing_pdf", fake_regenerate_qa)
+
+    resp = client.post(
+        "/pdf/abc/regenerate_qa",
+        data={
+            "question_llm_model": "mistral",
+            "answer_llm_model": "mistral",
+            "question_count": "9",
+            "min_qa_score": "0.4",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "file_id": "abc",
+        "question_count": 9,
+        "min_qa_score": 0.4,
+        "questions": ["Q"],
+        "answers": ["A"],
+    }

@@ -36,3 +36,4 @@ ollama_data/
 
 # Lab backup archives
 lab_backup_*.zip
+RAGAS_TODO.md

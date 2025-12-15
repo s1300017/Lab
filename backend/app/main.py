@@ -417,12 +417,18 @@ def init_db():
                         embedding_model TEXT,
                         scope TEXT,
                         request_id TEXT,
+                        context_source_pdfs TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """))
                 conn.execute(text("""
                     ALTER TABLE chat_logs
                     ADD COLUMN IF NOT EXISTS request_id TEXT
+                """))
+
+                conn.execute(text("""
+                    ALTER TABLE chat_logs
+                    ADD COLUMN IF NOT EXISTS context_source_pdfs TEXT
                 """))
 
                 conn.execute(text("""
@@ -1169,12 +1175,24 @@ def get_llm_generation(
         if not api_key:
             raise ValueError("OpenAIモデルを利用するにはOPENAI_API_KEYを設定してください。")
         logger.info("[INFO] generation LLM (OpenAI) = %s", entry["model"])
-        return ChatOpenAI(
-            model=entry["model"],
-            openai_api_key=api_key,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        model_id = str(entry["model"])
+        temp_value = float(temperature)
+        if model_id.lower().startswith("gpt-5"):
+            if temp_value != 1.0:
+                logger.warning(
+                    "[WARN] OpenAIモデル '%s' は temperature の変更をサポートしないため temperature=1.0 に固定します (requested=%.3f)",
+                    model_id,
+                    temp_value,
+                )
+            temp_value = 1.0
+        kwargs: dict[str, Any] = {
+            "model": model_id,
+            "openai_api_key": api_key,
+            "temperature": temp_value,
+        }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        return ChatOpenAI(**kwargs)
     raise ValueError(f"未知のLLMプロバイダ: {provider}")
 
 
@@ -1192,10 +1210,18 @@ def get_llm_eval(model_name: str | None = None):
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OpenAIモデルを評価に利用するにはOPENAI_API_KEYを設定してください。")
+        model_id = str(entry["model"])
+        temp_value = 0.0
+        if model_id.lower().startswith("gpt-5"):
+            logger.warning(
+                "[WARN] OpenAIモデル '%s' は temperature の変更をサポートしないため temperature=1.0 に固定します (eval)",
+                model_id,
+            )
+            temp_value = 1.0
         return ChatOpenAI(
-            model=entry["model"],
+            model=model_id,
             openai_api_key=api_key,
-            temperature=0.0,
+            temperature=temp_value,
             max_tokens=512,
         )
     raise ValueError(f"評価用LLMで未対応のプロバイダ: {provider}")

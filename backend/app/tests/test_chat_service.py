@@ -212,9 +212,14 @@ def test_query_rag_success(monkeypatch) -> None:
     monkeypatch.setattr(
         chat_service,
         "_persist_chat_log_and_contexts",
-        lambda scope, request, answer, contexts, resolved_llm: called.setdefault(  # noqa: ANN001
+        lambda scope, request, answer, contexts, resolved_llm, **kwargs: called.setdefault(  # noqa: ANN001
             "persist",
-            {"scope": scope, "answer": answer, "contexts": contexts},
+            {
+                "scope": scope,
+                "answer": answer,
+                "contexts": contexts,
+                "context_source_pdfs": kwargs.get("context_source_pdfs"),
+            },
         ),
     )
 
@@ -232,8 +237,68 @@ def test_query_rag_success(monkeypatch) -> None:
     assert result["contexts"]
     assert result["source_documents"]
     assert result["llm_model_used"] == "dummy-llm"
+    assert "Answer the question based only on the following context" in called.get("prompt", "")
     assert called["persist"]["scope"] == "single"
     assert called["persist"]["contexts"] == result["contexts"]
+
+
+def test_query_rag_success_chat_jp_prompt(monkeypatch) -> None:
+    """rag_prompt_style=chat_jp 指定時に日本語プロンプトが使われることを確認する。"""
+
+    called: dict[str, object] = {}
+
+    class DummyLLM:
+        def invoke(self, prompt):  # noqa: ANN001
+            called["prompt"] = prompt
+            return "最終回答です。"
+
+    def fake_init_llm(model_name: str, purpose: str = "/query"):  # noqa: ANN001
+        return DummyLLM(), "dummy-llm"
+
+    monkeypatch.setattr(chat_service, "_init_generation_llm", fake_init_llm)
+    monkeypatch.setattr(chat_service, "_get_embeddings", lambda name: "EMB")
+    monkeypatch.setattr(
+        chat_service,
+        "_build_collection_name_for_pdf",
+        lambda emb, scope, fid=None: "col-x",  # noqa: ANN001
+    )
+    monkeypatch.setattr(chat_service, "_extract_answer_text", lambda resp: resp)
+
+    class DummyRetriever:
+        def get_relevant_documents(self, query):  # noqa: ANN001
+            class Doc:
+                def __init__(self, text: str) -> None:
+                    self.page_content = text
+
+            return [Doc("コンテキスト1"), Doc("コンテキスト2")]
+
+    class DummyVS:
+        def __init__(self, **kwargs):  # noqa: ANN001
+            pass
+
+        def as_retriever(self) -> DummyRetriever:
+            return DummyRetriever()
+
+    monkeypatch.setattr(chat_service, "PGVector", DummyVS)
+    monkeypatch.setattr(
+        chat_service,
+        "_persist_chat_log_and_contexts",
+        lambda *a, **k: None,  # noqa: ANN001
+    )
+
+    req = SimpleNamespace(
+        query="テストの質問",
+        llm_model="llm-x",
+        embedding_model="emb-x",
+        scope="single",
+        pdf_file_id="fid1",
+        rag_prompt_style="chat_jp",
+    )
+
+    result = chat_service.query_rag(req)
+
+    assert result["answer"]
+    assert "あなたは日本語のRAGシステムにおける回答エンジンです" in str(called.get("prompt", ""))
 
 
 def test_query_rag_no_contexts_returns_general_chat(monkeypatch) -> None:

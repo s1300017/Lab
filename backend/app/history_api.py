@@ -474,6 +474,7 @@ def history_chat_logs(pdf_file_id: str | None = None, limit: int = 200) -> JSONR
                             embedding_model,
                             scope,
                             request_id,
+                            context_source_pdfs,
                             created_at
                         FROM chat_logs
                         WHERE pdf_file_id = :fid
@@ -496,6 +497,7 @@ def history_chat_logs(pdf_file_id: str | None = None, limit: int = 200) -> JSONR
                             embedding_model,
                             scope,
                             request_id,
+                            context_source_pdfs,
                             created_at
                         FROM chat_logs
                         ORDER BY created_at DESC, id DESC
@@ -508,6 +510,14 @@ def history_chat_logs(pdf_file_id: str | None = None, limit: int = 200) -> JSONR
             items: list[dict[str, Any]] = []
             for r in rows:
                 base = dict(r._mapping)
+                raw_sources = base.get("context_source_pdfs")
+                if isinstance(raw_sources, str) and raw_sources.strip():
+                    try:
+                        parsed_sources = json.loads(raw_sources)
+                        if isinstance(parsed_sources, list):
+                            base["context_source_pdfs"] = parsed_sources
+                    except Exception:  # noqa: BLE001
+                        pass
                 contexts_list: list[str] = []
                 try:
                     ctx_rows = conn.execute(

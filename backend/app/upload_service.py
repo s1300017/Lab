@@ -646,12 +646,67 @@ def get_extracted_data(file_id: str) -> dict:
     return data
 
 
+def clear_qa_for_existing_pdf(*, file_id: str) -> None:
+    """既存PDF(file_id)に紐づくQA（questions/answers/qa_meta）を削除する。"""
+
+    extracted_path = EXTRACTED_DIR / f"{file_id}.json"
+    if not extracted_path.exists():
+        raise HTTPException(status_code=404, detail=f"file_id={file_id}の抽出データが見つかりません")
+
+    with open(extracted_path, "r", encoding="utf-8") as f_json:
+        data = json.load(f_json)
+
+    data["questions"] = []
+    data["answers"] = []
+    data["qa_meta"] = []
+
+    with open(extracted_path, "w", encoding="utf-8") as f_json:
+        json.dump(data, f_json, ensure_ascii=False)
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM generated_questions WHERE pdf_file_id = :pdf_file_id"),
+                {"pdf_file_id": file_id},
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[警告] clear_qa: DBの既存QA削除に失敗しました: %s",
+            e,
+            extra={"file_id": file_id},
+        )
+
+    logger.info("[重要] clear_qa: 既存QAを削除しました", extra={"file_id": file_id})
+
+
+def regenerate_qa_for_existing_pdf(
+    *,
+    file_id: str,
+    question_llm_model: str,
+    answer_llm_model: str,
+    question_count: int = 5,
+    min_qa_score: float = 0.0,
+) -> dict:
+    """既存QAを削除してから、同一PDF(file_id)に対してQAを再生成する。"""
+
+    clear_qa_for_existing_pdf(file_id=file_id)
+    return generate_qa_for_existing_pdf(
+        file_id=file_id,
+        question_llm_model=question_llm_model,
+        answer_llm_model=answer_llm_model,
+        question_count=question_count,
+        min_qa_score=min_qa_score,
+    )
+
+
 def generate_qa_for_existing_pdf(
     *,
     file_id: str,
     question_llm_model: str,
     answer_llm_model: str,
     initial_warning: str = "",
+    question_count: int = 5,
+    min_qa_score: float = 0.0,
 ) -> dict:
     """抽出済みテキストを用いて既存PDFに対するQAを生成し、JSON/DBを更新するサービス関数。"""
 
@@ -695,6 +750,30 @@ def generate_qa_for_existing_pdf(
             sample_text[:100],
         )
 
+        try:
+            target_question_count = int(question_count)
+        except Exception:  # noqa: BLE001
+            target_question_count = 5
+        if target_question_count < 1:
+            target_question_count = 1
+        if target_question_count > 50:
+            target_question_count = 50
+
+        try:
+            min_qa_score_threshold = float(min_qa_score)
+        except Exception:  # noqa: BLE001
+            min_qa_score_threshold = 0.0
+        if min_qa_score_threshold < 0.0:
+            min_qa_score_threshold = 0.0
+        if min_qa_score_threshold > 1.0:
+            min_qa_score_threshold = 1.0
+
+        logger.info(
+            "[重要] generate_qa: question_count=%d min_qa_score=%.3f",
+            target_question_count,
+            min_qa_score_threshold,
+        )
+
         image_captions: list[dict] = []
         if generate_image_captions:
             try:
@@ -722,7 +801,7 @@ def generate_qa_for_existing_pdf(
         prompt_q = textwrap.dedent(
             f"""
             あなたはPDF文書の内容を確認する質問を生成する専門アシスタントです。
-            以下の制約を守り、日本語で代表的な質問を5件作成してください。
+            以下の制約を守り、日本語で代表的な質問を{target_question_count}件作成してください。
             - 質問は具体的かつ本文に直接基づく内容にすること。
             - 文書に記載がない推測的な質問は避けること。
             - 質問は箇条書きではなく、1行の文章形式で記述すること。
@@ -740,6 +819,16 @@ def generate_qa_for_existing_pdf(
             raw_questions_text = _extract_answer_text(questions_resp)
             logger.info("[重要] generate_qa: LLM質問生成レスポンス長=%d", len(raw_questions_text))
             questions = [q.strip() for q in raw_questions_text.split("\n") if q.strip()]
+            deduped_questions: list[str] = []
+            seen_questions: set[str] = set()
+            for q in questions:
+                if q in seen_questions:
+                    continue
+                seen_questions.add(q)
+                deduped_questions.append(q)
+                if len(deduped_questions) >= target_question_count:
+                    break
+            questions = deduped_questions
             logger.info("[重要] generate_qa: 質問リスト生成完了 件数=%d", len(questions))
         except Exception as e:  # noqa: BLE001
             logger.error("[重要] generate_qa: LLM質問生成例外: %s", e)
@@ -754,14 +843,14 @@ def generate_qa_for_existing_pdf(
             bullets = re.findall(r"^[\*\-\d\.]+\s*(.+)", text, re.MULTILINE)
             qas = re.findall(r"Q[\d：: ]*(.+?)\nA[\d：: ]*(.+?)(?=\nQ|\n\Z)", text, re.DOTALL)
             if qas:
-                questions = [q.strip() for q, a in qas]
-                answers = [a.strip() for q, a in qas]
+                questions = [q.strip() for q, a in qas][:target_question_count]
+                answers = [a.strip() for q, a in qas][:target_question_count]
             elif bullets:
-                questions = bullets[:5]
+                questions = bullets[:target_question_count]
                 answers = ["該当内容を本文から要約してください。"] * len(questions)
             else:
                 paras = [p.strip() for p in text.split("\n") if p.strip()]
-                questions = [f"{p[:20]}について説明してください。" for p in paras[:5]]
+                questions = [f"{p[:20]}について説明してください。" for p in paras[:target_question_count]]
                 answers = ["該当内容を本文から要約してください。"] * len(questions)
             resolved_answer_llm = resolved_question_llm
         else:
@@ -792,9 +881,12 @@ def generate_qa_for_existing_pdf(
                     traceback.print_exc()
                     answers.append("該当内容を本文から要約してください。")
 
-        if len(questions) < 5:
-            logger.warning("[警告] generate_qa: 質問数が不足 (%d件)。フォールバックで補完します。", len(questions))
-            fallback_needed = 5 - len(questions)
+        if len(questions) < target_question_count:
+            logger.warning(
+                "[警告] generate_qa: 質問数が不足 (%d件)。フォールバックで補完します。",
+                len(questions),
+            )
+            fallback_needed = target_question_count - len(questions)
             paras = [p.strip() for p in text.split("\n") if p.strip()]
             fallback_questions: list[str] = []
             for para in paras:
@@ -883,6 +975,36 @@ def generate_qa_for_existing_pdf(
                 }
                 for a in answers
             ]
+
+        if min_qa_score_threshold > 0.0 and questions and answers and qa_meta:
+            try:
+                before_count = len(questions)
+                combined = list(zip(questions, answers, qa_meta))
+                filtered = [
+                    (q, a, m)
+                    for q, a, m in combined
+                    if float((m or {}).get("score", 0.0)) >= min_qa_score_threshold
+                ]
+                if not filtered and combined:
+                    best = max(combined, key=lambda x: float((x[2] or {}).get("score", 0.0)))
+                    filtered = [best]
+
+                questions = [q for q, _, _ in filtered]
+                answers = [a for _, a, _ in filtered]
+                qa_meta = [m for _, _, m in filtered]
+
+                if len(questions) != before_count:
+                    logger.info(
+                        "[重要] generate_qa: min_qa_score=%.3f によりQAをフィルタしました %d→%d件",
+                        min_qa_score_threshold,
+                        before_count,
+                        len(questions),
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[警告] generate_qa: QAフィルタ中に例外: %s。フィルタなしで続行します。",
+                    e,
+                )
 
         combined_captions: list[str] = []
         if extracted_captions:
@@ -981,6 +1103,8 @@ def upload_and_generate_qa(
     generate_image_captions: bool,
     ocr_engine: str,
     ocr_image_compression: str = "balanced",
+    question_count: int = 5,
+    min_qa_score: float = 0.0,
 ) -> dict:
     """同期API用: アップロードとQA生成を一括で行う高レベルサービス。"""
 
@@ -1006,4 +1130,6 @@ def upload_and_generate_qa(
         question_llm_model=question_llm_model,
         answer_llm_model=answer_llm_model,
         initial_warning=initial_warning,
+        question_count=question_count,
+        min_qa_score=min_qa_score,
     )

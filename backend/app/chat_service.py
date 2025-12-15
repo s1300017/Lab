@@ -106,6 +106,7 @@ def _persist_chat_log_and_contexts(
     answer: str,
     contexts: list[str],
     resolved_llm: str,
+    context_source_pdfs: list[str] | None = None,
 ) -> None:
     """chat_logs および chat_contexts への永続化を行うヘルパー。"""
 
@@ -117,6 +118,12 @@ def _persist_chat_log_and_contexts(
             request_id = None
 
         with engine.begin() as conn:
+            context_source_pdfs_json: str | None = None
+            if context_source_pdfs:
+                try:
+                    context_source_pdfs_json = json.dumps(context_source_pdfs, ensure_ascii=False)
+                except Exception:  # noqa: BLE001
+                    context_source_pdfs_json = None
             result = conn.execute(
                 text(
                     """
@@ -127,7 +134,8 @@ def _persist_chat_log_and_contexts(
                         llm_model_used,
                         embedding_model,
                         scope,
-                        request_id
+                        request_id,
+                        context_source_pdfs
                     )
                     VALUES (
                         :pdf_file_id,
@@ -136,7 +144,8 @@ def _persist_chat_log_and_contexts(
                         :llm_model_used,
                         :embedding_model,
                         :scope,
-                        :request_id
+                        :request_id,
+                        :context_source_pdfs
                     )
                     RETURNING id
                     """
@@ -149,6 +158,7 @@ def _persist_chat_log_and_contexts(
                     "embedding_model": request.embedding_model,
                     "scope": scope,
                     "request_id": request_id,
+                    "context_source_pdfs": context_source_pdfs_json,
                 },
             )
             chat_log_id = result.scalar()
@@ -524,6 +534,10 @@ def query_rag(request: Any) -> dict[str, Any]:
     """事前に構築されたPDFベースのベクトルストアを用いてRAG応答を生成するサービスロジック。"""
 
     try:
+        rag_prompt_style = (getattr(request, "rag_prompt_style", None) or "simple_en").lower()
+        if rag_prompt_style not in {"chat_jp", "simple_en"}:
+            rag_prompt_style = "simple_en"
+
         llm_instance, resolved_llm = _init_generation_llm(
             request.llm_model,
             purpose="/query",
@@ -585,6 +599,7 @@ def query_rag(request: Any) -> dict[str, Any]:
         contexts = [doc.page_content for doc in retrieved_docs]
         context_notice: str | None = None
         pdf_name_map: dict[str, str] = {}
+        pdf_names: list[str] | None = None
         try:
             logger.debug(
                 "[DEBUG] /query retrieved_docs=%d, contexts_len=%d",
@@ -603,25 +618,57 @@ def query_rag(request: Any) -> dict[str, Any]:
             pass
 
         if contexts:
+            if scope == "single" and request.pdf_file_id:
+                resolved = _resolve_pdf_names({request.pdf_file_id})
+                pdf_names = [resolved.get(request.pdf_file_id, request.pdf_file_id)]
+            elif scope == "all" and retrieved_docs:
+                ids = {
+                    (getattr(doc, "metadata", {}) or {}).get("pdf_file_id")
+                    for doc in retrieved_docs
+                    if (getattr(doc, "metadata", {}) or {}).get("pdf_file_id")
+                }
+                ids = {pid for pid in ids if pid}
+                if ids:
+                    pdf_name_map = _resolve_pdf_names(ids)
+                    pdf_names = [
+                        pdf_name_map.get(
+                            (getattr(doc, "metadata", {}) or {}).get("pdf_file_id"),
+                            (getattr(doc, "metadata", {}) or {}).get("pdf_file_id"),
+                        )
+                        for doc in retrieved_docs
+                        if (getattr(doc, "metadata", {}) or {}).get("pdf_file_id")
+                    ] or None
+
+        if contexts:
             # LLM へ質問とコンテキストを渡して回答を生成
             context_text = "\n".join(contexts)
-            prompt = textwrap.dedent(
-                f"""
-                あなたは日本語のRAGシステムにおける回答エンジンです。以下の制約を厳密に守ってください。
-                - 提供されたコンテキストに含まれる事実のみを用いて回答すること。
-                - 文書内に記載が見つからない場合は「本文に該当記述がありません。」と明示すること。
-                - 回答は自然な日本語で2〜3文以内にまとめること。
-                - 重要な根拠がある場合はその文を要約して含めること。
+            if rag_prompt_style == "simple_en":
+                prompt = textwrap.dedent(
+                    f"""
+                    Answer the question based only on the following context:
+                    {context_text}
 
-                ### コンテキスト
-                {context_text}
+                    Question: {request.query}
+                    """
+                ).strip()
+            else:
+                prompt = textwrap.dedent(
+                    f"""
+                    あなたは日本語のRAGシステムにおける回答エンジンです。以下の制約を厳密に守ってください。
+                    - 提供されたコンテキストに含まれる事実のみを用いて回答すること。
+                    - 文書内に記載が見つからない場合は「本文に該当記述がありません。」と明示すること。
+                    - 回答は自然な日本語で2〜3文以内にまとめること。
+                    - 重要な根拠がある場合はその文を要約して含めること。
 
-                ### 質問
-                {request.query}
+                    ### コンテキスト
+                    {context_text}
 
-                ### 回答
-                """
-            ).strip()
+                    ### 質問
+                    {request.query}
+
+                    ### 回答
+                    """
+                ).strip()
         else:
             context_notice = (
                 "関連するコンテキストが見つからなかったため、一般的なチャット応答で回答しました。"
@@ -686,32 +733,14 @@ def query_rag(request: Any) -> dict[str, Any]:
         if not answer:
             answer = "本文に該当記述がありません。"
 
-        _persist_chat_log_and_contexts(scope, request, answer, contexts, resolved_llm)
-
-        pdf_names: list[str] | None = None
-        if contexts:
-            if scope == "single" and request.pdf_file_id:
-                resolved = _resolve_pdf_names({request.pdf_file_id})
-                pdf_names = [
-                    resolved.get(request.pdf_file_id, request.pdf_file_id)
-                ]
-            elif scope == "all" and retrieved_docs:
-                ids = {
-                    (getattr(doc, "metadata", {}) or {}).get("pdf_file_id")
-                    for doc in retrieved_docs
-                    if (getattr(doc, "metadata", {}) or {}).get("pdf_file_id")
-                }
-                ids = {pid for pid in ids if pid}
-                if ids:
-                    pdf_name_map = _resolve_pdf_names(ids)
-                    pdf_names = [
-                        pdf_name_map.get(
-                            (getattr(doc, "metadata", {}) or {}).get("pdf_file_id"),
-                            (getattr(doc, "metadata", {}) or {}).get("pdf_file_id"),
-                        )
-                        for doc in retrieved_docs
-                        if (getattr(doc, "metadata", {}) or {}).get("pdf_file_id")
-                    ] or None
+        _persist_chat_log_and_contexts(
+            scope,
+            request,
+            answer,
+            contexts,
+            resolved_llm,
+            context_source_pdfs=pdf_names,
+        )
 
         return {
             "answer": answer,

@@ -9,6 +9,7 @@ from .upload_service import (
     get_extracted_data,
     upload_and_generate_qa,
     generate_qa_for_existing_pdf,
+    regenerate_qa_for_existing_pdf,
 )
 
 
@@ -63,6 +64,8 @@ async def uploadfile(
     cleanse: bool = Form(False),
     question_llm_model: str = Form("mistral"),
     answer_llm_model: str = Form("mistral"),
+    question_count: int = Form(5),
+    min_qa_score: float = Form(0.0),
     generate_image_captions: bool = Form(True),
     ocr_engine: str = Form("auto"),
     ocr_image_compression: str = Form("balanced"),
@@ -79,6 +82,8 @@ async def uploadfile(
         cleanse=cleanse,
         question_llm_model=question_llm_model,
         answer_llm_model=answer_llm_model,
+        question_count=question_count,
+        min_qa_score=min_qa_score,
         generate_image_captions=generate_image_captions,
         ocr_engine=ocr_engine,
         ocr_image_compression=ocr_image_compression,
@@ -97,6 +102,8 @@ def generate_qa_for_pdf(
     file_id: str,
     question_llm_model: str = Form("mistral"),
     answer_llm_model: str = Form("mistral"),
+    question_count: int = Form(5),
+    min_qa_score: float = Form(0.0),
 ) -> dict:
     """既存PDF(file_id)に対してQA生成を実行するAPI。"""
 
@@ -104,4 +111,25 @@ def generate_qa_for_pdf(
         file_id=file_id,
         question_llm_model=question_llm_model,
         answer_llm_model=answer_llm_model,
+        question_count=question_count,
+        min_qa_score=min_qa_score,
+    )
+
+
+@router.post("/pdf/{file_id}/regenerate_qa")
+def regenerate_qa_for_pdf(
+    file_id: str,
+    question_llm_model: str = Form("mistral"),
+    answer_llm_model: str = Form("mistral"),
+    question_count: int = Form(5),
+    min_qa_score: float = Form(0.0),
+) -> dict:
+    """既存PDF(file_id)のQAを削除してからQA生成を再実行するAPI。"""
+
+    return regenerate_qa_for_existing_pdf(
+        file_id=file_id,
+        question_llm_model=question_llm_model,
+        answer_llm_model=answer_llm_model,
+        question_count=question_count,
+        min_qa_score=min_qa_score,
     )
